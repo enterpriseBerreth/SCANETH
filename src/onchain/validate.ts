@@ -19,6 +19,19 @@ const log = createLogger('validate');
 const univ2Factory = new Interface(UNIV2_FACTORY_ABI);
 const univ3Factory = new Interface(UNIV3_FACTORY_ABI);
 
+/**
+ * Solidly factories take a `bool stable` where UniV3 takes a `uint24 fee`.
+ * The selectors differ, so probing a Solidly factory with the V3 ABI reverts and
+ * the venue looks dead rather than mis-probed — which is exactly how Aerodrome
+ * ended up silently disabled.
+ */
+const solidlyFactory = new Interface([
+  'function getPool(address tokenA, address tokenB, bool stable) view returns (address)',
+]);
+
+/** Minimal Curve pool surface used to prove a configured pool is real. */
+const curvePool = new Interface(['function coins(uint256 i) view returns (address)']);
+
 export interface ChainValidation {
   chainOk: boolean;
   blockNumber?: number;
@@ -47,6 +60,43 @@ async function hasCode(ctx: ChainContext, address?: string): Promise<boolean> {
  * something.
  */
 async function validateVenue(ctx: ChainContext, venue: DexVenue): Promise<string | undefined> {
+  // Curve is validated against its configured pools, not a router or factory: it
+  // has neither. Requiring bytecode at a router address would permanently
+  // disable a venue that is working perfectly well.
+  if (venue.kind === 'curve') {
+    const pools = venue.curvePools ?? [];
+    if (pools.length === 0) return 'no curve pools configured';
+
+    const results = await multicall(
+      ctx,
+      pools.map((pool) => ({
+        target: pool,
+        callData: curvePool.encodeFunctionData('coins', [0]),
+      })),
+    );
+
+    const live = results.filter((r) => {
+      if (!r.success || r.returnData === '0x') return false;
+      try {
+        return !isZeroAddress(curvePool.decodeFunctionResult('coins', r.returnData)[0] as string);
+      } catch {
+        return false;
+      }
+    }).length;
+
+    if (live === 0) return `none of ${pools.length} configured curve pool(s) answered coins()`;
+    if (live < pools.length) {
+      // Partial liveness is usable, so the venue stays enabled — but say so,
+      // because a dead address in the list is a config error worth fixing.
+      log.warn('some curve pools did not answer', {
+        chain: ctx.chain.name,
+        live,
+        configured: pools.length,
+      });
+    }
+    return undefined;
+  }
+
   if (!(await hasCode(ctx, venue.router))) return 'router has no bytecode';
   if (!(await hasCode(ctx, venue.factory))) return 'factory has no bytecode';
   if (venue.kind === 'univ3' && !(await hasCode(ctx, venue.quoter))) {
@@ -77,6 +127,33 @@ async function validateVenue(ctx: ChainContext, venue: DexVenue): Promise<string
       const pair = univ2Factory.decodeFunctionResult('getPair', result.returnData)[0] as string;
       if (isZeroAddress(pair)) {
         return `no ${tokenA.symbol}/${tokenB.symbol} pair — wrong factory or dead venue`;
+      }
+    } else if (venue.kind === 'solidly') {
+      // Probe both curves: a pair may exist as volatile-only or stable-only, and
+      // demanding both would disable the venue over a pair that simply has one.
+      const results = await multicall(
+        ctx,
+        [true, false].map((stable) => ({
+          target: venue.factory as string,
+          callData: solidlyFactory.encodeFunctionData('getPool', [
+            tokenA.address,
+            tokenB.address,
+            stable,
+          ]),
+        })),
+      );
+
+      const anyPool = results.some((r) => {
+        if (!r.success || r.returnData === '0x') return false;
+        try {
+          const pool = solidlyFactory.decodeFunctionResult('getPool', r.returnData)[0] as string;
+          return !isZeroAddress(pool);
+        } catch {
+          return false;
+        }
+      });
+      if (!anyPool) {
+        return `no ${tokenA.symbol}/${tokenB.symbol} stable or volatile pool — wrong factory`;
       }
     } else {
       const tiers = venue.feeTiers ?? [500, 3000];

@@ -5,11 +5,15 @@
  * (see onchain/validate.ts) — a venue whose factory/quoter does not respond
  * correctly is disabled rather than allowed to produce phantom quotes.
  *
- * Scope note: only true Uniswap-V2 forks (constant product, fixed fee) and
- * Uniswap V3 are included. Solidly forks (Aerodrome, Velodrome) and dynamic-fee
- * forks (Camelot) use different router signatures and fee models — pricing them
- * with the V2 formula would invent profit that does not exist, so they are
- * deliberately excluded until they get purpose-built adapters.
+ * Scope note: pricing is per-family, not one-size-fits-all. Uniswap V2 forks
+ * (constant product, fixed fee), Uniswap V3, Solidly forks (Aerodrome — separate
+ * stable and volatile curves) and Curve stableswap each have a dedicated adapter.
+ * Dynamic-fee forks such as Camelot remain excluded: pricing them with the V2
+ * formula would invent profit that does not exist.
+ *
+ * Token addresses and decimals here are verified on-chain against `symbol()` and
+ * `decimals()`. This is not ceremony — cbBTC has 8 decimals, and assuming the
+ * usual 18 would misprice it by a factor of 10^10 without erroring.
  */
 
 import type { ChainConfig, ChainName, TokenInfo } from './types';
@@ -31,6 +35,18 @@ const BASE_TOKENS: TokenInfo[] = [
   { symbol: 'USDbC', address: '0xd9aAEc86B65D86f6A7B5B1b0c42FFA531710b6CA', decimals: 6, usdHint: 1, stable: true },
   { symbol: 'DAI', address: '0x50c5725949A6F0c72E6C4a641F24049A917DB0Cb', decimals: 18, usdHint: 1, stable: true },
   { symbol: 'cbETH', address: '0x2Ae3F1Ec7F1F5012CFEab0185bfc7aa3cf0DEc22', decimals: 18, usdHint: 3200 },
+  // Beyond the blue chips. Majors are the most efficiently arbitraged markets in
+  // crypto — professional searchers clear them in a single block — so the search
+  // space is deliberately widened into assets with fewer eyes on them.
+  { symbol: 'AERO', address: '0x940181a94A35A4569E4529A3CDfB74e38FD98631', decimals: 18, usdHint: 1 },
+  { symbol: 'wstETH', address: '0xc1CBa3fCea344f92D9239c08C0568f6F2F0ee452', decimals: 18, usdHint: 3600 },
+  { symbol: 'rETH', address: '0xB6fe221Fe9EeF5aBa221c348bA20A1Bf5e73624c', decimals: 18, usdHint: 3400 },
+  // 8 decimals, not 18 — verified on-chain.
+  { symbol: 'cbBTC', address: '0xcbB7C0000aB88B473b1f5aFd9ef808440eed33Bf', decimals: 8, usdHint: 95_000 },
+  { symbol: 'EURC', address: '0x60a3E35Cc302bFA44Cb288Bc5a4F316Fdb1adb42', decimals: 6, usdHint: 1.08 },
+  { symbol: 'VIRTUAL', address: '0x0b3e328455c4059EEb9e3f84b5543F74E24e7E1b', decimals: 18, usdHint: 1.5 },
+  { symbol: 'DEGEN', address: '0x4ed4E862860beD51a9570b96d89aF5E1B0Efefed', decimals: 18, usdHint: 0.01 },
+  { symbol: 'BRETT', address: '0x532f27101965dd16442E59d40670FaF5eBB142E4', decimals: 18, usdHint: 0.06 },
 ];
 
 const BASE: ChainConfig = {
@@ -117,6 +133,20 @@ const BASE: ChainConfig = {
     ['WETH', 'cbETH'],
     ['USDC', 'DAI'],
     ['USDC', 'USDbC'],
+    // Each new token is paired against both WETH and USDC on purpose: a token
+    // reachable through only one route can never form a triangle, and triangular
+    // cycles are where two-leg spreads that look dead often still pay.
+    ['WETH', 'AERO'],
+    ['USDC', 'AERO'],
+    ['WETH', 'wstETH'],
+    ['WETH', 'rETH'],
+    ['WETH', 'cbBTC'],
+    ['USDC', 'cbBTC'],
+    ['USDC', 'EURC'],
+    ['WETH', 'VIRTUAL'],
+    ['USDC', 'VIRTUAL'],
+    ['WETH', 'DEGEN'],
+    ['WETH', 'BRETT'],
   ],
 };
 
@@ -130,6 +160,12 @@ const ARBITRUM_TOKENS: TokenInfo[] = [
   { symbol: 'DAI', address: '0xDA10009cBd5D07dd0CeCc66161FC93D7c9000da1', decimals: 18, usdHint: 1, stable: true },
   { symbol: 'WBTC', address: '0x2f2a2543B76A4166549F7aaB2e75Bef0aefC5B0f', decimals: 8, usdHint: 60_000 },
   { symbol: 'ARB', address: '0x912CE59144191C1204E64559FE8253a0e49E6548', decimals: 18, usdHint: 0.8 },
+  { symbol: 'wstETH', address: '0x5979D7b546E38E414F7E9822514be443A4800529', decimals: 18, usdHint: 3600 },
+  { symbol: 'rETH', address: '0xEC70Dcb4A1EFa46b8F2D97C310C9c4790ba5ffA8', decimals: 18, usdHint: 3400 },
+  { symbol: 'GMX', address: '0xfc5A1A6EB076a2C7aD06eD22C90d7E710E35ad0a', decimals: 18, usdHint: 25 },
+  { symbol: 'LINK', address: '0xf97f4df75117a78c1A5a0DBb814Af92458539FB4', decimals: 18, usdHint: 15 },
+  { symbol: 'UNI', address: '0xFa7F8980b0f1E64A2062791cc3b0871572f1F7f0', decimals: 18, usdHint: 8 },
+  { symbol: 'PENDLE', address: '0x0c880f6761F1af8d9Aa9C466984b80DAb9a8c9e8', decimals: 18, usdHint: 4 },
 ];
 
 const ARBITRUM: ChainConfig = {
@@ -193,6 +229,15 @@ const ARBITRUM: ChainConfig = {
     ['USDC', 'USDT'],
     ['USDC', 'USDCe'],
     ['USDC', 'DAI'],
+    ['WETH', 'wstETH'],
+    ['WETH', 'rETH'],
+    ['WETH', 'GMX'],
+    ['USDC', 'GMX'],
+    ['WETH', 'LINK'],
+    ['USDC', 'LINK'],
+    ['WETH', 'UNI'],
+    ['WETH', 'PENDLE'],
+    ['USDC', 'ARB'],
   ],
 };
 

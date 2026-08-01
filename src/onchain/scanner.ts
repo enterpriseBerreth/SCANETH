@@ -724,20 +724,43 @@ async function scanPair(
     const probeAmountIn = toBigInt(scan.config.minTradeUsd / basePrice, baseToken.decimals);
     if (probeAmountIn <= 0n) continue;
 
+    const counterPrice = scan.oracle.usd(counterToken);
+    if (counterPrice <= 0) continue;
+    const probeCounterIn = toBigInt(scan.config.minTradeUsd / counterPrice, counterToken.decimals);
+    if (probeCounterIn <= 0n) continue;
+
     const v3Pools = candidates.filter((p): p is V3Pool => p.kind === 'univ3');
-    let v3Prices = new Map<string, number>();
+    const curvePools = candidates.filter((p): p is CurvePool => p.kind === 'curve');
+
+    // Both directions are quoted, never derived by reciprocal.
+    //
+    // The second leg of the cycle trades counter -> base, so it needs a real
+    // counter -> base quote. Using 1 / (base -> counter) instead is wrong in a
+    // consistently optimistic direction: in a thin pool the forward quote is
+    // heavily slipped, its reciprocal therefore looks like an excellent place to
+    // buy back, and the pool manufactures a large phantom edge. Measuring both
+    // directions costs one extra batched multicall per pair and removes an entire
+    // class of false positive that was consuming the whole confirmation budget.
+    let v3Fwd = new Map<string, number>();
+    let v3Rev = new Map<string, number>();
     try {
-      v3Prices = await v3ScreenPrices(scan, v3Pools, baseToken, probeAmountIn);
+      [v3Fwd, v3Rev] = await Promise.all([
+        v3ScreenPrices(scan, v3Pools, baseToken, probeAmountIn),
+        v3ScreenPrices(scan, v3Pools, counterToken, probeCounterIn),
+      ]);
     } catch (err) {
       diag.v3ScreenFailures += 1;
       log.debug('v3 screen failed', { pair: `${tokenX.symbol}/${tokenY.symbol}`, ...errMeta(err) });
     }
 
     // Curve has no local math we trust, so it is probed on-chain exactly like V3.
-    const curvePools = candidates.filter((p): p is CurvePool => p.kind === 'curve');
-    let curvePrices = new Map<string, number>();
+    let curveFwd = new Map<string, number>();
+    let curveRev = new Map<string, number>();
     try {
-      curvePrices = await curveScreenPrices(scan, curvePools, baseToken, probeAmountIn);
+      [curveFwd, curveRev] = await Promise.all([
+        curveScreenPrices(scan, curvePools, baseToken, probeAmountIn),
+        curveScreenPrices(scan, curvePools, counterToken, probeCounterIn),
+      ]);
     } catch (err) {
       diag.v3ScreenFailures += 1;
       log.debug('curve screen failed', {
@@ -746,55 +769,86 @@ async function scanPair(
       });
     }
 
-    // Price of counterToken per baseToken, net of fees, on each venue.
-    const counterPrice = scan.oracle.usd(counterToken);
-    const priced: Array<{ pool: Pool; price: number }> = [];
+    // `forward` is counter-per-base; `reverse` is base-per-counter. Both are
+    // measured, so their product is the true round-trip rate.
+    const priced: Array<{ pool: Pool; forward: number; reverse: number }> = [];
     for (const pool of candidates) {
       if (!poolHasToken(pool, baseToken)) continue;
-      let price: number;
+      let forward: number;
+      let reverse: number;
       if (pool.kind === 'univ2') {
-        price = v2ScreenPrice(pool, baseToken);
+        forward = v2ScreenPrice(pool, baseToken);
+        reverse = v2ScreenPrice(pool, counterToken);
       } else if (pool.kind === 'solidly') {
-        price = solidlyScreenPrice(pool, baseToken, probeAmountIn);
+        forward = solidlyScreenPrice(pool, baseToken, probeAmountIn);
+        reverse = solidlyScreenPrice(pool, counterToken, probeCounterIn);
       } else if (pool.kind === 'curve') {
-        price = curvePrices.get(poolId(pool)) ?? 0;
+        forward = curveFwd.get(poolId(pool)) ?? 0;
+        reverse = curveRev.get(poolId(pool)) ?? 0;
       } else {
-        price = v3Prices.get(poolId(pool)) ?? 0;
+        forward = v3Fwd.get(poolId(pool)) ?? 0;
+        reverse = v3Rev.get(poolId(pool)) ?? 0;
       }
-      if (price <= 0) continue;
+      if (forward <= 0 || reverse <= 0) continue;
 
       // Discard provably-broken quotes before they can masquerade as an edge.
-      if (!rateIsPlausible(price, basePrice, counterPrice)) {
+      if (
+        !rateIsPlausible(forward, basePrice, counterPrice) ||
+        !rateIsPlausible(reverse, counterPrice, basePrice)
+      ) {
         diag.quotesImplausible += 1;
         log.debug('discarding implausible quote', {
           pair: `${baseToken.symbol}/${counterToken.symbol}`,
           venue: pool.venueId,
           pool: pool.pool,
-          observed: price,
+          forward,
+          reverse,
           expected: counterPrice > 0 ? basePrice / counterPrice : null,
         });
         continue;
       }
 
-      priced.push({ pool, price });
+      priced.push({ pool, forward, reverse });
     }
     if (priced.length < 2) continue;
     diag.pairsComparable += 1;
 
-    // Sell where we receive the most counter token, buy back where it is dearest
-    // in base terms — i.e. the lowest counter-per-base price.
-    let sellVenue = priced[0];
-    let buyVenue = priced[0];
+    // Maximise forward(sell) * reverse(buy) over distinct pools. The two factors
+    // are independent, so the best pair is the best of each — unless that is the
+    // same pool, in which case the runner-up on one side must be considered.
+    let bestSell = priced[0];
+    let bestBuy = priced[0];
     for (const entry of priced) {
-      if (!sellVenue || entry.price > sellVenue.price) sellVenue = entry;
-      if (!buyVenue || entry.price < buyVenue.price) buyVenue = entry;
+      if (!bestSell || entry.forward > bestSell.forward) bestSell = entry;
+      if (!bestBuy || entry.reverse > bestBuy.reverse) bestBuy = entry;
     }
-    if (!sellVenue || !buyVenue) continue;
+    if (!bestSell || !bestBuy) continue;
+
+    let sellVenue = bestSell;
+    let buyVenue = bestBuy;
+    if (poolId(bestSell.pool) === poolId(bestBuy.pool)) {
+      let altSell: (typeof priced)[number] | undefined;
+      let altBuy: (typeof priced)[number] | undefined;
+      for (const entry of priced) {
+        if (poolId(entry.pool) === poolId(bestSell.pool)) continue;
+        if (!altSell || entry.forward > altSell.forward) altSell = entry;
+        if (!altBuy || entry.reverse > altBuy.reverse) altBuy = entry;
+      }
+      if (!altSell || !altBuy) continue;
+
+      // Whichever substitution loses less.
+      if (altSell.forward * bestBuy.reverse >= bestSell.forward * altBuy.reverse) {
+        sellVenue = altSell;
+        buyVenue = bestBuy;
+      } else {
+        sellVenue = bestSell;
+        buyVenue = altBuy;
+      }
+    }
     if (poolId(sellVenue.pool) === poolId(buyVenue.pool)) continue;
-    if (buyVenue.price <= 0) continue;
 
     diag.cyclesScreened += 1;
-    const edge = sellVenue.price / buyVenue.price;
+    const edge = sellVenue.forward * buyVenue.reverse;
     recordEdge(
       diag,
       edge,
