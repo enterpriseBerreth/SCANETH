@@ -78,6 +78,35 @@ interface IUniswapV3Router {
         returns (uint256 amountOut);
 }
 
+/**
+ * Solidly-family pool (Aerodrome, Velodrome).
+ *
+ * `getAmountOut` is queried rather than reimplemented: the pool applies its own
+ * stable-vs-volatile curve, so the caller cannot select the wrong one.
+ */
+interface ISolidlyPool {
+    function getAmountOut(uint256 amountIn, address tokenIn) external view returns (uint256);
+
+    function swap(
+        uint256 amount0Out,
+        uint256 amount1Out,
+        address to,
+        bytes calldata data
+    ) external;
+
+    function token0() external view returns (address);
+}
+
+/** Curve pools declaring coin indices as int128 (the original StableSwap ABI). */
+interface ICurveInt128 {
+    function exchange(int128 i, int128 j, uint256 dx, uint256 minDy) external returns (uint256);
+}
+
+/** Curve pools declaring coin indices as uint256 (crypto pools and -ng). */
+interface ICurveUint256 {
+    function exchange(uint256 i, uint256 j, uint256 dx, uint256 minDy) external returns (uint256);
+}
+
 contract ArboFlashArb {
     enum FlashProvider {
         Aave,
@@ -86,15 +115,39 @@ contract ArboFlashArb {
 
     enum SwapKind {
         UniV2,
-        UniV3
+        UniV3,
+        Solidly,
+        CurveInt128,
+        CurveUint256
     }
 
+    /**
+     * One hop.
+     *
+     * `router` is the contract the hop is sent to. For UniV2/UniV3 that is a
+     * router; for Solidly and Curve it is the **pool itself**, because both are
+     * swapped against directly:
+     *
+     *  - Solidly's router needs a `Route[]` carrying a `stable` flag and a
+     *    factory address. Encoding those off-chain and trusting them on-chain is
+     *    a silent-wrongness risk — a mis-set `stable` flag routes onto the wrong
+     *    curve and still succeeds. Calling `pool.getAmountOut` instead asks the
+     *    pool which curve it is, so the flag cannot be wrong.
+     *  - Curve has no common router across its pool variants.
+     *
+     * `curveI`/`curveJ` are coin indices, used only by the Curve kinds. Two Curve
+     * kinds exist because older pools declare `exchange(int128,...)` and newer
+     * ones `exchange(uint256,...)`; the selectors differ, so the variant has to
+     * be known rather than guessed.
+     */
     struct Swap {
         address router;
         uint8 kind;
         address tokenIn;
         address tokenOut;
         uint24 feeTier;
+        int128 curveI;
+        int128 curveJ;
     }
 
     address public immutable owner;
@@ -239,6 +292,30 @@ contract ArboFlashArb {
     }
 
     function _swap(Swap memory s, uint256 amountIn) internal returns (uint256) {
+        if (s.kind == uint8(SwapKind.Solidly)) {
+            // Direct pool swap: Solidly pools are paid by transfer, not pull, so
+            // no approval is involved. The pool is asked for its own quote, which
+            // means the stable/volatile curve is chosen by the pool rather than by
+            // a flag we passed in — the one place this could go silently wrong.
+            uint256 out = ISolidlyPool(s.router).getAmountOut(amountIn, s.tokenIn);
+            if (out == 0) revert UnsupportedSwapKind();
+
+            _safeTransfer(s.tokenIn, s.router, amountIn);
+
+            bool zeroIsIn = ISolidlyPool(s.router).token0() == s.tokenIn;
+            uint256 balBefore = _balanceOf(s.tokenOut);
+            ISolidlyPool(s.router).swap(
+                zeroIsIn ? 0 : out,
+                zeroIsIn ? out : 0,
+                address(this),
+                ""
+            );
+            // Measured rather than assumed: fee-on-transfer tokens deliver less
+            // than the pool reports, and repaying the loan on an assumed figure
+            // would revert the whole bundle at the final balance check anyway.
+            return _balanceOf(s.tokenOut) - balBefore;
+        }
+
         _safeApprove(s.tokenIn, s.router, amountIn);
 
         if (s.kind == uint8(SwapKind.UniV2)) {
@@ -268,6 +345,25 @@ contract ArboFlashArb {
                     sqrtPriceLimitX96: 0
                 })
             );
+        }
+
+        if (s.kind == uint8(SwapKind.CurveInt128) || s.kind == uint8(SwapKind.CurveUint256)) {
+            // Curve's `exchange` return value is unreliable across variants: some
+            // pools predate it, others return the pre-fee figure. Measure instead.
+            uint256 balBefore = _balanceOf(s.tokenOut);
+
+            if (s.kind == uint8(SwapKind.CurveInt128)) {
+                ICurveInt128(s.router).exchange(s.curveI, s.curveJ, amountIn, 0);
+            } else {
+                ICurveUint256(s.router).exchange(
+                    uint256(int256(s.curveI)),
+                    uint256(int256(s.curveJ)),
+                    amountIn,
+                    0
+                );
+            }
+
+            return _balanceOf(s.tokenOut) - balBefore;
         }
 
         revert UnsupportedSwapKind();
@@ -307,6 +403,10 @@ contract ArboFlashArb {
             abi.encodeWithSelector(0xa9059cbb, to, amount) // transfer(address,uint256)
         );
         if (!_isSuccess(ok, data)) revert TokenCallFailed();
+    }
+
+    function _balanceOf(address token) internal view returns (uint256) {
+        return IERC20(token).balanceOf(address(this));
     }
 
     function _isSuccess(bool ok, bytes memory data) private pure returns (bool) {

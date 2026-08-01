@@ -33,7 +33,59 @@ export interface V3Pool extends BasePool {
   probeDirectionAToB?: boolean;
 }
 
-export type Pool = V2Pool | V3Pool;
+/**
+ * Solidly-family pool (Aerodrome, Velodrome).
+ *
+ * `stable` selects between `x·y = k` and `x³y + y³x = k`. It is not a hint — the
+ * two curves produce very different quotes from identical reserves, and picking
+ * the wrong one returns a plausible number rather than an error.
+ */
+export interface SolidlyPool extends BasePool {
+  kind: 'solidly';
+  stable: boolean;
+  /** Read from the factory per pool, not assumed from the venue. */
+  feeBps: number;
+  reserveA: bigint;
+  reserveB: bigint;
+  /** 10**decimals, required to normalise the stable curve to 1e18. */
+  scaleA: bigint;
+  scaleB: bigint;
+}
+
+/**
+ * Curve StableSwap pool.
+ *
+ * Quoted on-chain via `get_dy`, so no reserves are cached — only what is needed
+ * to address the right pair of coins inside a multi-asset pool.
+ */
+export interface CurvePool extends BasePool {
+  kind: 'curve';
+  /** Coin index of tokenA within the pool. */
+  indexA: number;
+  /** Coin index of tokenB within the pool. */
+  indexB: number;
+  /** True when the pool declares indices as int128 rather than uint256. */
+  int128Indices: boolean;
+  feeBps: number;
+  /** Last observed probe quote, used for the cheap screening pass. */
+  probeAmountIn?: bigint;
+  probeAmountOut?: bigint;
+  probeDirectionAToB?: boolean;
+}
+
+export type Pool = V2Pool | V3Pool | SolidlyPool | CurvePool;
+
+/**
+ * Whether a pool's quotes can be recomputed in-process from cached state.
+ *
+ * This is the distinction that decides scan cost. Locally-priceable pools can be
+ * re-quoted hundreds of times during optimal-size search for free; the rest need
+ * a batched RPC round trip per candidate size, so they are screened first and
+ * confirmed on a size ladder instead.
+ */
+export function isPoolLocallyPriceable(pool: Pool): boolean {
+  return pool.kind === 'univ2' || pool.kind === 'solidly';
+}
 
 /**
  * Uniswap V2 factories store reserves against the address-sorted token pair,

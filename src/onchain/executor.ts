@@ -29,10 +29,13 @@ const log = createLogger('executor');
 const arboIface = new Interface(ARBO_FLASH_ARB_ABI);
 
 /** Must match the SwapKind enum in ArboFlashArb.sol. */
-const SWAP_KIND: Record<RouteLeg['kind'], number> = {
+const SWAP_KIND = {
   univ2: 0,
   univ3: 1,
-};
+  solidly: 2,
+  curveInt128: 3,
+  curveUint256: 4,
+} as const;
 
 interface EncodedSwap {
   router: string;
@@ -40,16 +43,54 @@ interface EncodedSwap {
   tokenIn: string;
   tokenOut: string;
   feeTier: number;
+  curveI: bigint;
+  curveJ: bigint;
 }
 
 function encodeSwaps(legs: RouteLeg[]): EncodedSwap[] {
-  return legs.map((leg) => ({
-    router: leg.router,
-    kind: SWAP_KIND[leg.kind],
-    tokenIn: leg.tokenIn.address,
-    tokenOut: leg.tokenOut.address,
-    feeTier: leg.kind === 'univ3' ? leg.feeTier : 0,
-  }));
+  return legs.map((leg) => {
+    if (leg.kind === 'curve') {
+      // The pool is the swap target; Curve has no shared router. Indices must be
+      // present — encoding a Curve hop without them would exchange coin 0 for
+      // coin 0 on-chain, which is not an error the contract can detect.
+      if (leg.curveIndexIn === undefined || leg.curveIndexOut === undefined) {
+        throw new Error(`curve leg on ${leg.venueId} is missing coin indices`);
+      }
+      return {
+        router: leg.pool ?? leg.router,
+        kind: leg.curveInt128 ? SWAP_KIND.curveInt128 : SWAP_KIND.curveUint256,
+        tokenIn: leg.tokenIn.address,
+        tokenOut: leg.tokenOut.address,
+        feeTier: 0,
+        curveI: BigInt(leg.curveIndexIn),
+        curveJ: BigInt(leg.curveIndexOut),
+      };
+    }
+
+    if (leg.kind === 'solidly') {
+      // Swapped directly against the pool so the pool selects its own curve.
+      if (!leg.pool) throw new Error(`solidly leg on ${leg.venueId} is missing its pool address`);
+      return {
+        router: leg.pool,
+        kind: SWAP_KIND.solidly,
+        tokenIn: leg.tokenIn.address,
+        tokenOut: leg.tokenOut.address,
+        feeTier: 0,
+        curveI: 0n,
+        curveJ: 0n,
+      };
+    }
+
+    return {
+      router: leg.router,
+      kind: leg.kind === 'univ3' ? SWAP_KIND.univ3 : SWAP_KIND.univ2,
+      tokenIn: leg.tokenIn.address,
+      tokenOut: leg.tokenOut.address,
+      feeTier: leg.kind === 'univ3' ? leg.feeTier : 0,
+      curveI: 0n,
+      curveJ: 0n,
+    };
+  });
 }
 
 /**

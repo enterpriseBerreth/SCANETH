@@ -49,7 +49,7 @@ function v2Pool(
 }
 
 function poolSet(v2: V2Pool[]): PoolSet {
-  return { v2, v3: [] };
+  return { v2, v3: [], solidly: [], curve: [] };
 }
 
 function v2LegWithPool(

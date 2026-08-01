@@ -23,6 +23,7 @@ import {
   discoverPools,
   filterV3ByDepth,
   refreshPools,
+  solidlyLiquidityUsd,
   v2LiquidityUsd,
   type PoolSet,
 } from './onchain/dex';
@@ -379,6 +380,15 @@ class Arbo {
           (p) => v2LiquidityUsd(p, (t) => runtime.oracle.usd(t)) >= floor,
         ),
         v3: runtime.pools.v3,
+        // Solidly pools carry reserves like V2, so the same depth floor applies.
+        solidly: runtime.pools.solidly.filter(
+          (p) => solidlyLiquidityUsd(p, (t) => runtime.oracle.usd(t)) >= floor,
+        ),
+        // Curve holds no cached reserves here — depth is only knowable from an
+        // on-chain read, so filtering locally would either be a guess or a lie.
+        // Shallow Curve pools are instead rejected downstream when the quoted
+        // output fails the profit check.
+        curve: runtime.pools.curve,
       };
 
       const scanCtx = {

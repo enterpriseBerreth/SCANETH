@@ -77,6 +77,38 @@ const BASE: ChainConfig = {
       factory: '0xFDa619b6d20975be80A10332cD39b9a4b0FAa8BB',
       feeBps: 30,
     },
+    {
+      // The largest venue on Base, and the reason stable-pool support exists.
+      // Registering this as 'univ2' would appear to work and return quietly wrong
+      // numbers for every stable pool, so the kind matters.
+      id: 'aerodrome',
+      label: 'Aerodrome',
+      kind: 'solidly',
+      router: '0xcF77a3Ba9A5CA399B7c97c74d54e5b1Beb874E43',
+      factory: '0x420DD381b31aEf6683db6B902084cB0FFECe40Da',
+      // Per-pool fees are read from the factory at discovery; this is only the
+      // fallback used if that read fails.
+      feeBps: 5,
+    },
+    {
+      id: 'curve',
+      label: 'Curve',
+      kind: 'curve',
+      // Curve has no shared router — each swap goes to its pool directly.
+      router: '0x0000000000000000000000000000000000000000',
+      factory: '0x0000000000000000000000000000000000000000',
+      feeBps: 4,
+      // Named explicitly rather than enumerated from a registry: Curve's
+      // registries disagree across deployments and list long-dead pools, so an
+      // enumerated list would mostly be noise. Each entry is verified to respond
+      // to `coins()` and `get_dy()` at startup and dropped if it does not.
+      curvePools: [
+        // USDC/USDbC — verified live via npm run verify:solidly.
+        // Other Base Curve pools were tried and did not resolve `coins()`, so
+        // they are omitted rather than left in as dead weight.
+        '0xf6C5F01C7F3148891ad0e19DF78743D31E390D1f',
+      ],
+    },
   ],
   pairs: [
     ['WETH', 'USDC'],
@@ -135,6 +167,21 @@ const ARBITRUM: ChainConfig = {
       router: '0x4752ba5DBc23f44D87826276BF6Fd6b1C372aD24',
       factory: '0xf1D7CC64Fb4452F05c498126312eBE29f30Fbcf9',
       feeBps: 30,
+    },
+    {
+      id: 'curve',
+      label: 'Curve',
+      kind: 'curve',
+      router: '0x0000000000000000000000000000000000000000',
+      factory: '0x0000000000000000000000000000000000000000',
+      feeBps: 4,
+      curvePools: [
+        // 2pool: USDC.e/USDT — the deepest stable pool on Arbitrum, and the one
+        // most likely to hold a peg different from the Uniswap pools.
+        '0x7f90122BF0700F9E7e1F688fe926940E8839F353',
+        // tricrypto: USDT/WBTC/WETH
+        '0x960ea3e3C7FB317332d990873d354E18d7645590',
+      ],
     },
   ],
   pairs: [

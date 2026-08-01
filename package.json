@@ -14,6 +14,7 @@
     "typecheck": "tsc --noEmit",
     "doctor": "tsx src/tools/doctor.ts",
     "telegram:test": "tsx src/tools/telegram-test.ts",
+    "verify:solidly": "tsx src/tools/verify-solidly.ts",
     "test": "tsx src/onchain/profit.test.ts && tsx src/paper.test.ts",
     "test:profit": "tsx src/onchain/profit.test.ts",
     "test:paper": "tsx src/paper.test.ts",

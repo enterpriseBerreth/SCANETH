@@ -20,9 +20,11 @@ import type { ArboConfig } from '../config';
 import { AAVE_FLASH_FEE_BPS, BALANCER_FLASH_FEE_BPS, tokenBySymbol } from '../chains';
 import { FlashProvider, type ArbOpportunity, type RouteLeg, type TokenInfo } from '../types';
 import type { ChainContext } from './provider';
-import type { Pool, PoolSet, V2Pool, V3Pool } from './dex';
+import type { CurvePool, Pool, PoolSet, SolidlyPool, V2Pool, V3Pool } from './dex';
 import { poolsForPair } from './dex';
 import { quoteV3Batch, type V3QuoteRequest } from './dex/univ3';
+import { getAmountOutSolidly } from './dex/solidly';
+import { quoteCurveBatch } from './dex/curve';
 import { PriceOracle } from './prices';
 import {
   bestFromLadder,
@@ -175,6 +177,43 @@ function buildLeg(pool: Pool, tokenIn: TokenInfo): RouteLeg {
     };
   }
 
+  if (pool.kind === 'solidly') {
+    return {
+      venueId: pool.venueId,
+      kind: 'solidly',
+      router: pool.router,
+      tokenIn,
+      tokenOut,
+      feeTier: 0,
+      feeBps: pool.feeBps,
+      pool: pool.pool,
+      reserveIn: aIsIn ? pool.reserveA : pool.reserveB,
+      reserveOut: aIsIn ? pool.reserveB : pool.reserveA,
+      // Carried explicitly rather than looked up later: the stable flag and the
+      // decimal scales are what select the curve, and a leg that loses them
+      // would price on the wrong one without erroring.
+      stable: pool.stable,
+      scaleIn: aIsIn ? pool.scaleA : pool.scaleB,
+      scaleOut: aIsIn ? pool.scaleB : pool.scaleA,
+    };
+  }
+
+  if (pool.kind === 'curve') {
+    return {
+      venueId: pool.venueId,
+      kind: 'curve',
+      router: pool.router,
+      tokenIn,
+      tokenOut,
+      feeTier: 0,
+      feeBps: pool.feeBps,
+      pool: pool.pool,
+      curveIndexIn: aIsIn ? pool.indexA : pool.indexB,
+      curveIndexOut: aIsIn ? pool.indexB : pool.indexA,
+      curveInt128: pool.int128Indices,
+    };
+  }
+
   return {
     venueId: pool.venueId,
     kind: 'univ3',
@@ -205,6 +244,30 @@ function isBorrowable(chainWrappedNative: string, token: TokenInfo): boolean {
  */
 function legSpotRate(leg: RouteLeg): number {
   if (leg.reserveIn === undefined || leg.reserveOut === undefined) return 0;
+
+  if (leg.kind === 'solidly' && leg.stable) {
+    // The reserve ratio is a bad proxy for marginal price on the stable curve —
+    // its flatness near the peg is exactly the property being traded, so a ratio
+    // would rank these pools by the wrong number and discard the useful ones.
+    // Quote a 1% probe through the real curve instead; still free, still local.
+    const scaleIn = leg.scaleIn ?? 10n ** BigInt(leg.tokenIn.decimals);
+    const scaleOut = leg.scaleOut ?? 10n ** BigInt(leg.tokenOut.decimals);
+    const probe = scaleIn / 100n > 0n ? scaleIn / 100n : 1n;
+    const out = getAmountOutSolidly(
+      probe,
+      leg.reserveIn,
+      leg.reserveOut,
+      scaleIn,
+      scaleOut,
+      leg.feeBps,
+      true,
+    );
+    if (out <= 0n) return 0;
+    const inFloat = Number(probe) / Number(scaleIn);
+    const outFloat = Number(out) / Number(scaleOut);
+    return inFloat > 0 ? outFloat / inFloat : 0;
+  }
+
   const inFloat = Number(leg.reserveIn) / 10 ** leg.tokenIn.decimals;
   const outFloat = Number(leg.reserveOut) / 10 ** leg.tokenOut.decimals;
   if (!(inFloat > 0) || !(outFloat > 0)) return 0;
@@ -277,6 +340,81 @@ async function v3ScreenPrices(
   return prices;
 }
 
+/**
+ * Screening price for a Solidly pool, from the local integer curve math.
+ *
+ * Deliberately quotes a real probe trade rather than reading the reserve ratio.
+ * On the stable curve the ratio is nearly useless — the curve is flat by design
+ * near the peg — so ranking pools by ratio would discard exactly the pools worth
+ * trading. This is still free: no RPC, same fast path as V2.
+ */
+function solidlyScreenPrice(pool: SolidlyPool, tokenIn: TokenInfo, probeAmountIn: bigint): number {
+  if (probeAmountIn <= 0n) return 0;
+  const aIsIn = sameToken(pool.tokenA, tokenIn);
+  const reserveIn = aIsIn ? pool.reserveA : pool.reserveB;
+  const reserveOut = aIsIn ? pool.reserveB : pool.reserveA;
+  if (reserveIn <= 0n || reserveOut <= 0n) return 0;
+
+  const scaleIn = aIsIn ? pool.scaleA : pool.scaleB;
+  const scaleOut = aIsIn ? pool.scaleB : pool.scaleA;
+  const amountOut = getAmountOutSolidly(
+    probeAmountIn,
+    reserveIn,
+    reserveOut,
+    scaleIn,
+    scaleOut,
+    pool.feeBps,
+    pool.stable,
+  );
+  if (amountOut <= 0n) return 0;
+
+  const tokenOut = otherToken(pool, tokenIn);
+  const inFloat = Number(probeAmountIn) / 10 ** tokenIn.decimals;
+  const outFloat = Number(amountOut) / 10 ** tokenOut.decimals;
+  if (inFloat <= 0 || outFloat <= 0) return 0;
+  return outFloat / inFloat;
+}
+
+/**
+ * Probe every Curve pool for a pair in one batched call.
+ *
+ * Curve's `get_dy` already nets the pool fee, so unlike V2 no fee adjustment is
+ * applied here — doing so would double-charge it.
+ */
+async function curveScreenPrices(
+  scan: ScanContext,
+  pools: CurvePool[],
+  tokenIn: TokenInfo,
+  probeAmountIn: bigint,
+): Promise<Map<string, number>> {
+  const prices = new Map<string, number>();
+  if (pools.length === 0 || probeAmountIn <= 0n) return prices;
+
+  const quotes = await quoteCurveBatch(
+    scan.ctx,
+    pools.map((pool) => ({
+      pool,
+      aToB: sameToken(pool.tokenA, tokenIn),
+      amountIn: probeAmountIn,
+    })),
+  );
+
+  for (let i = 0; i < pools.length; i += 1) {
+    const pool = pools[i];
+    const amountOut = quotes[i];
+    if (!pool || amountOut === undefined || amountOut <= 0n) continue;
+
+    const tokenOut = otherToken(pool, tokenIn);
+    const inFloat = Number(probeAmountIn) / 10 ** tokenIn.decimals;
+    const outFloat = Number(amountOut) / 10 ** tokenOut.decimals;
+    if (inFloat <= 0 || outFloat <= 0) continue;
+
+    prices.set(`${pool.venueId}:${pool.pool.toLowerCase()}`, outFloat / inFloat);
+  }
+
+  return prices;
+}
+
 function poolId(pool: Pool): string {
   return pool.kind === 'univ3'
     ? `${pool.venueId}:${pool.pool.toLowerCase()}:${pool.feeTier}`
@@ -285,7 +423,7 @@ function poolId(pool: Pool): string {
 
 // ── phase 2: sizing ─────────────────────────────────────────────────────────
 
-/** Quote one leg for many input amounts, batching V3 and computing V2 locally. */
+/** Quote one leg for many input amounts, computing locally where possible. */
 async function quoteLegBatch(
   scan: ScanContext,
   leg: RouteLeg,
@@ -298,6 +436,45 @@ async function quoteLegBatch(
     return amountsIn.map((amountIn) =>
       getAmountOutV2(amountIn, leg.reserveIn as bigint, leg.reserveOut as bigint, leg.feeBps),
     );
+  }
+
+  if (leg.kind === 'solidly') {
+    if (leg.reserveIn === undefined || leg.reserveOut === undefined) {
+      return amountsIn.map(() => 0n);
+    }
+    const scaleIn = leg.scaleIn ?? 10n ** BigInt(leg.tokenIn.decimals);
+    const scaleOut = leg.scaleOut ?? 10n ** BigInt(leg.tokenOut.decimals);
+    return amountsIn.map((amountIn) =>
+      getAmountOutSolidly(
+        amountIn,
+        leg.reserveIn as bigint,
+        leg.reserveOut as bigint,
+        scaleIn,
+        scaleOut,
+        leg.feeBps,
+        leg.stable === true,
+      ),
+    );
+  }
+
+  if (leg.kind === 'curve') {
+    if (leg.pool === undefined || leg.curveIndexIn === undefined || leg.curveIndexOut === undefined) {
+      return amountsIn.map(() => 0n);
+    }
+    const pool = scan.pools.curve.find(
+      (p) => p.pool.toLowerCase() === (leg.pool as string).toLowerCase(),
+    );
+    if (!pool) return amountsIn.map(() => 0n);
+
+    const quotes = await quoteCurveBatch(
+      scan.ctx,
+      amountsIn.map((amountIn) => ({
+        pool,
+        aToB: sameToken(pool.tokenA, leg.tokenIn),
+        amountIn,
+      })),
+    );
+    return quotes.map((q) => q ?? 0n);
   }
 
   const requests: V3QuoteRequest[] = amountsIn.map((amountIn) => ({
@@ -350,7 +527,10 @@ function sizeBounds(
   // Borrowing a large fraction of a shallow pool guarantees the price impact
   // eats the spread, so clamp to the depth actually available.
   const firstLeg = legs[0];
-  if (firstLeg?.kind === 'univ2' && firstLeg.reserveIn !== undefined) {
+  if (
+    (firstLeg?.kind === 'univ2' || firstLeg?.kind === 'solidly') &&
+    firstLeg.reserveIn !== undefined
+  ) {
     const depthCap = (firstLeg.reserveIn * BigInt(MAX_RESERVE_FRACTION_BPS)) / 10_000n;
     if (depthCap < max) max = depthCap;
   }
@@ -395,18 +575,38 @@ export async function requoteCycle(
  * as dead and the ledger would report a 0% fill rate that meant nothing.
  */
 export function rebindReserves(pools: PoolSet, legs: RouteLeg[]): RouteLeg[] | undefined {
-  const byAddress = new Map<string, V2Pool>();
-  for (const pool of pools.v2) byAddress.set(pool.pool.toLowerCase(), pool);
+  const v2ByAddress = new Map<string, V2Pool>();
+  for (const pool of pools.v2) v2ByAddress.set(pool.pool.toLowerCase(), pool);
+  const solidlyByAddress = new Map<string, SolidlyPool>();
+  for (const pool of pools.solidly) solidlyByAddress.set(pool.pool.toLowerCase(), pool);
 
   const rebound: RouteLeg[] = [];
   for (const leg of legs) {
-    if (leg.kind !== 'univ2') {
-      // V3 is quoted live against the pool contract, so nothing to refresh.
+    if (leg.kind === 'univ3' || leg.kind === 'curve') {
+      // Quoted live against the pool contract, so there is nothing to refresh.
       rebound.push(leg);
       continue;
     }
 
-    const fresh = leg.pool ? byAddress.get(leg.pool.toLowerCase()) : undefined;
+    if (leg.kind === 'solidly') {
+      const fresh = leg.pool ? solidlyByAddress.get(leg.pool.toLowerCase()) : undefined;
+      if (!fresh) return undefined;
+      const aIsIn = sameToken(fresh.tokenA, leg.tokenIn);
+      rebound.push({
+        ...leg,
+        reserveIn: aIsIn ? fresh.reserveA : fresh.reserveB,
+        reserveOut: aIsIn ? fresh.reserveB : fresh.reserveA,
+        // Re-read from the live pool: a governance fee change between detection
+        // and settlement would otherwise be priced at the stale rate.
+        feeBps: fresh.feeBps,
+        stable: fresh.stable,
+        scaleIn: aIsIn ? fresh.scaleA : fresh.scaleB,
+        scaleOut: aIsIn ? fresh.scaleB : fresh.scaleA,
+      });
+      continue;
+    }
+
+    const fresh = leg.pool ? v2ByAddress.get(leg.pool.toLowerCase()) : undefined;
     if (!fresh) return undefined;
 
     const aIsIn = sameToken(fresh.tokenA, leg.tokenIn);
@@ -533,15 +733,34 @@ async function scanPair(
       log.debug('v3 screen failed', { pair: `${tokenX.symbol}/${tokenY.symbol}`, ...errMeta(err) });
     }
 
+    // Curve has no local math we trust, so it is probed on-chain exactly like V3.
+    const curvePools = candidates.filter((p): p is CurvePool => p.kind === 'curve');
+    let curvePrices = new Map<string, number>();
+    try {
+      curvePrices = await curveScreenPrices(scan, curvePools, baseToken, probeAmountIn);
+    } catch (err) {
+      diag.v3ScreenFailures += 1;
+      log.debug('curve screen failed', {
+        pair: `${tokenX.symbol}/${tokenY.symbol}`,
+        ...errMeta(err),
+      });
+    }
+
     // Price of counterToken per baseToken, net of fees, on each venue.
     const counterPrice = scan.oracle.usd(counterToken);
     const priced: Array<{ pool: Pool; price: number }> = [];
     for (const pool of candidates) {
       if (!poolHasToken(pool, baseToken)) continue;
-      const price =
-        pool.kind === 'univ2'
-          ? v2ScreenPrice(pool, baseToken)
-          : (v3Prices.get(poolId(pool)) ?? 0);
+      let price: number;
+      if (pool.kind === 'univ2') {
+        price = v2ScreenPrice(pool, baseToken);
+      } else if (pool.kind === 'solidly') {
+        price = solidlyScreenPrice(pool, baseToken, probeAmountIn);
+      } else if (pool.kind === 'curve') {
+        price = curvePrices.get(poolId(pool)) ?? 0;
+      } else {
+        price = v3Prices.get(poolId(pool)) ?? 0;
+      }
       if (price <= 0) continue;
 
       // Discard provably-broken quotes before they can masquerade as an edge.
@@ -617,11 +836,16 @@ async function scanTriangular(
   baseToken: TokenInfo,
   diag: ScanDiagnostics,
 ): Promise<ArbOpportunity[]> {
-  const v2 = scan.pools.v2;
-  if (v2.length < 3) return [];
+  // Triangular enumeration is cubic in pool count, so it is restricted to pools
+  // that can be priced in-process for free. Solidly qualifies alongside V2: both
+  // are exact local integer math. V3 and Curve are excluded on purpose — each
+  // triple would cost an RPC round-trip just to be screened, and at cubic volume
+  // that would consume the entire scan budget before finding anything.
+  const local: Array<V2Pool | SolidlyPool> = [...scan.pools.v2, ...scan.pools.solidly];
+  if (local.length < 3) return [];
 
   const opportunities: ArbOpportunity[] = [];
-  const firstHops = v2.filter((p) => poolHasToken(p, baseToken));
+  const firstHops = local.filter((p) => poolHasToken(p, baseToken));
   const { feeBps: flashFeeBps } = chooseFlashProvider(scan);
   const requiredEdge = 1 + (flashFeeBps + SCREEN_MARGIN_BPS) / 10_000;
 
@@ -629,14 +853,14 @@ async function scanTriangular(
     const mid = otherToken(firstPool, baseToken);
     if (sameToken(mid, baseToken)) continue;
 
-    for (const secondPool of v2) {
+    for (const secondPool of local) {
       if (poolId(secondPool) === poolId(firstPool)) continue;
       if (!poolHasToken(secondPool, mid)) continue;
 
       const far = otherToken(secondPool, mid);
       if (sameToken(far, baseToken) || sameToken(far, mid)) continue;
 
-      for (const thirdPool of v2) {
+      for (const thirdPool of local) {
         if (poolId(thirdPool) === poolId(firstPool)) continue;
         if (poolId(thirdPool) === poolId(secondPool)) continue;
         if (!poolHasToken(thirdPool, far) || !poolHasToken(thirdPool, baseToken)) continue;

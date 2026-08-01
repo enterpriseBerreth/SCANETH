@@ -15,6 +15,7 @@
  */
 
 import { formatUnits, parseUnits } from 'ethers';
+import { getAmountOutSolidly } from './dex/solidly';
 import type { RouteLeg, TokenInfo } from '../types';
 
 const BPS_DENOMINATOR = 10_000n;
@@ -71,12 +72,13 @@ export function flashFee(amount: bigint, feeBps: number): bigint {
 }
 
 /**
- * Walk a route locally using captured V2 reserves.
+ * Walk a route locally using captured pool state.
  *
- * Only valid when every leg is univ2 and no pool appears twice — which holds
- * for cross-venue cycles, since each leg is a different pool. V3 legs cannot be
- * repriced locally (tick maths needs pool state), so those cycles are sized via
- * an on-chain quote ladder instead. See `bestFromLadder`.
+ * Valid when every leg is locally priceable — `univ2`, or `solidly` where the
+ * exact integer port of the Solidly curve stands in for the pool's own quote.
+ * `univ3` and `curve` legs cannot be repriced in process (V3 needs tick state,
+ * Curve's invariant varies by pool implementation), so cycles containing them are
+ * sized against an on-chain quote ladder instead. See `bestFromLadder`.
  */
 export function simulateV2Cycle(legs: RouteLeg[], amountIn: bigint): bigint {
   let amount = amountIn;
@@ -84,7 +86,24 @@ export function simulateV2Cycle(legs: RouteLeg[], amountIn: bigint): bigint {
     if (leg.reserveIn === undefined || leg.reserveOut === undefined) {
       throw new Error(`simulateV2Cycle: leg on ${leg.venueId} is missing reserves`);
     }
-    amount = getAmountOutV2(amount, leg.reserveIn, leg.reserveOut, leg.feeBps);
+
+    if (leg.kind === 'solidly') {
+      // Fall back to the volatile branch only if scales are absent, which would
+      // mean the leg was built without them — better to be visibly wrong here in
+      // the price than silently wrong in the curve.
+      amount = getAmountOutSolidly(
+        amount,
+        leg.reserveIn,
+        leg.reserveOut,
+        leg.scaleIn ?? 10n ** BigInt(leg.tokenIn.decimals),
+        leg.scaleOut ?? 10n ** BigInt(leg.tokenOut.decimals),
+        leg.feeBps,
+        leg.stable === true,
+      );
+    } else {
+      amount = getAmountOutV2(amount, leg.reserveIn, leg.reserveOut, leg.feeBps);
+    }
+
     if (amount === 0n) return 0n;
   }
   return amount;
@@ -93,7 +112,10 @@ export function simulateV2Cycle(legs: RouteLeg[], amountIn: bigint): bigint {
 /** True when every leg can be priced locally. */
 export function isLocallyPriceable(legs: RouteLeg[]): boolean {
   return legs.every(
-    (l) => l.kind === 'univ2' && l.reserveIn !== undefined && l.reserveOut !== undefined,
+    (l) =>
+      (l.kind === 'univ2' || l.kind === 'solidly') &&
+      l.reserveIn !== undefined &&
+      l.reserveOut !== undefined,
   );
 }
 

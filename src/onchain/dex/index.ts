@@ -5,7 +5,13 @@
 import { Interface } from 'ethers';
 import { discoverV2Pools, refreshV2Reserves, v2LiquidityUsd } from './univ2';
 import { discoverV3Pools } from './univ3';
-import type { Pool, V2Pool, V3Pool } from './pools';
+import {
+  discoverSolidlyPools,
+  refreshSolidlyReserves,
+  solidlyLiquidityUsd,
+} from './solidly';
+import { discoverCurvePools } from './curve';
+import type { CurvePool, Pool, SolidlyPool, V2Pool, V3Pool } from './pools';
 import { multicall, type Call, type ChainContext } from '../provider';
 import { ERC20_ABI } from '../abi';
 import { tokenBySymbol } from '../../chains';
@@ -17,10 +23,25 @@ const log = createLogger('dex');
 export * from './pools';
 export * from './univ2';
 export * from './univ3';
+export * from './solidly';
+export * from './curve';
 
 export interface PoolSet {
   v2: V2Pool[];
   v3: V3Pool[];
+  /** Aerodrome / Velodrome. Locally priceable, like v2. */
+  solidly: SolidlyPool[];
+  /** Curve StableSwap. Quoted on-chain, like v3. */
+  curve: CurvePool[];
+}
+
+export function emptyPoolSet(): PoolSet {
+  return { v2: [], v3: [], solidly: [], curve: [] };
+}
+
+/** Every pool in the set, regardless of family. */
+export function allPools(pools: PoolSet): Pool[] {
+  return [...pools.v2, ...pools.v3, ...pools.solidly, ...pools.curve];
 }
 
 /** Resolve the chain's configured symbol pairs into token pairs. */
@@ -45,15 +66,31 @@ export async function discoverPools(ctx: ChainContext, enabledVenueIds?: Set<str
   const pairs = resolvePairs(ctx);
   const v2: V2Pool[] = [];
   const v3: V3Pool[] = [];
+  const solidly: SolidlyPool[] = [];
+  const curve: CurvePool[] = [];
+
+  // Curve pools are multi-asset, so discovery needs the whole token universe
+  // rather than the configured pairs — a 3pool contributes pairs that were never
+  // enumerated in config.
+  const tokens = ctx.chain.tokens;
 
   for (const venue of ctx.chain.venues) {
     if (enabledVenueIds && !enabledVenueIds.has(venue.id)) continue;
 
     try {
-      if (venue.kind === 'univ2') {
-        v2.push(...(await discoverV2Pools(ctx, venue, pairs)));
-      } else {
-        v3.push(...(await discoverV3Pools(ctx, venue, pairs)));
+      switch (venue.kind) {
+        case 'univ2':
+          v2.push(...(await discoverV2Pools(ctx, venue, pairs)));
+          break;
+        case 'univ3':
+          v3.push(...(await discoverV3Pools(ctx, venue, pairs)));
+          break;
+        case 'solidly':
+          solidly.push(...(await discoverSolidlyPools(ctx, venue, pairs)));
+          break;
+        case 'curve':
+          curve.push(...(await discoverCurvePools(ctx, venue, tokens)));
+          break;
       }
     } catch (err) {
       log.warn('pool discovery failed for venue', { venue: venue.id, ...errMeta(err) });
@@ -64,14 +101,19 @@ export async function discoverPools(ctx: ChainContext, enabledVenueIds?: Set<str
     chain: ctx.chain.name,
     v2Pools: v2.length,
     v3Pools: v3.length,
+    solidlyPools: solidly.length,
+    solidlyStable: solidly.filter((p) => p.stable).length,
+    curvePools: curve.length,
   });
 
-  return { v2, v3 };
+  return { v2, v3, solidly, curve };
 }
 
 /**
- * Refresh mutable state. Only V2 needs this — V3 is priced on demand via the
- * quoter, so there is nothing to cache.
+ * Refresh mutable state for the locally-priceable families.
+ *
+ * V3 and Curve are priced on demand through their own quoters, so they have
+ * nothing to cache and are passed through untouched.
  */
 export async function refreshPools(
   ctx: ChainContext,
@@ -79,11 +121,20 @@ export async function refreshPools(
   minLiquidityUsd = 0,
   priceOf?: (token: TokenInfo) => number,
 ): Promise<PoolSet> {
-  const refreshed = await refreshV2Reserves(ctx, pools.v2);
-  const live = refreshed.filter(
+  const [refreshedV2, refreshedSolidly] = await Promise.all([
+    refreshV2Reserves(ctx, pools.v2),
+    refreshSolidlyReserves(ctx, pools.solidly),
+  ]);
+
+  const liveV2 = refreshedV2.filter(
     (p) => p.reserveA > 0n && p.reserveB > 0n && v2LiquidityUsd(p, priceOf) >= minLiquidityUsd,
   );
-  return { v2: live, v3: pools.v3 };
+  const liveSolidly = refreshedSolidly.filter(
+    (p) =>
+      p.reserveA > 0n && p.reserveB > 0n && solidlyLiquidityUsd(p, priceOf) >= minLiquidityUsd,
+  );
+
+  return { v2: liveV2, v3: pools.v3, solidly: liveSolidly, curve: pools.curve };
 }
 
 /**
@@ -177,5 +228,5 @@ export function poolsForPair(pools: PoolSet, tokenA: TokenInfo, tokenB: TokenInf
     const pb = pool.tokenB.address.toLowerCase();
     return (pa === a && pb === b) || (pa === b && pb === a);
   };
-  return [...pools.v2.filter(matches), ...pools.v3.filter(matches)];
+  return allPools(pools).filter(matches);
 }
