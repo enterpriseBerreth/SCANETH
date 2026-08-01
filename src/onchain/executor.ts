@@ -124,8 +124,10 @@ export async function executeOpportunity(
     };
   }
 
-  // Re-cost with a real gas estimate rather than the configured guess.
-  let gasLimit = config.gasLimitEstimate;
+  // Re-cost with a real gas estimate. The fallback is this route's modelled
+  // gas rather than a flat config constant, so a failed estimate still costs
+  // the trade according to its own shape.
+  let gasLimit = opportunity.gasUnits > 0n ? opportunity.gasUnits : config.gasLimitEstimate;
   try {
     const executeArb = contract.getFunction('executeArb');
     const estimated = await executeArb.estimateGas(...args, { from: ctx.wallet.address });

@@ -99,6 +99,8 @@ export interface ArbOpportunity {
   flashProvider: FlashProvider;
   notionalUsd: number;
   grossProfitUsd: number;
+  /** Gas units modelled from this route's actual shape, not a flat constant. */
+  gasUnits: bigint;
   gasCostUsd: number;
   /** The number that actually matters. */
   netProfitUsd: number;

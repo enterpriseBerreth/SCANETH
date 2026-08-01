@@ -224,6 +224,56 @@ export function gasCostUsd(gasUnits: bigint, gasPriceWei: bigint, nativeUsdPrice
   return toFloat(weiCost, 18) * nativeUsdPrice;
 }
 
+// ── route gas modelling ─────────────────────────────────────────────────────
+//
+// A single flat gas constant applied to every route is one of the quieter ways
+// an arbitrage bot loses money. A two-leg V2 cycle and a three-leg V3 cycle
+// differ by roughly 2x, so one number is necessarily wrong for most routes:
+// too high rejects trades that were genuinely profitable, too low accepts
+// trades that were not. Neither error announces itself — they surface only as
+// results that never match what the maths promised.
+//
+// These are conservative central estimates. In live mode the executor still
+// replaces them with a real `estimateGas` before sending; this model exists so
+// that *screening* decisions are made on something defensible.
+
+/** Base transaction cost, paid regardless of route shape. */
+const GAS_TX_OVERHEAD = 21_000n;
+/** Aave V3 flashLoanSimple: borrow, callback, repay, plus aToken accounting. */
+const GAS_FLASH_AAVE = 180_000n;
+/** Balancer V2 is materially cheaper — no interest-bearing token bookkeeping. */
+const GAS_FLASH_BALANCER = 110_000n;
+/** Constant-product swap: transferFrom, swap, sync. */
+const GAS_SWAP_V2 = 90_000n;
+/**
+ * Concentrated-liquidity swap. Genuinely variable: crossing initialised ticks
+ * costs more, so a volatile pair in a thin fee tier can exceed this. Set at the
+ * upper end of typical rather than at the average, because underestimating gas
+ * is what turns a correctly-rejected loser into an accepted one.
+ */
+const GAS_SWAP_V3 = 130_000n;
+/** Router approval per hop; the contract re-approves rather than tracking state. */
+const GAS_APPROVE = 26_000n;
+/** Applied last, to absorb tick-crossing and cold-storage variance. */
+const GAS_SAFETY_BPS = 1_500n; // 15%
+
+/**
+ * Estimated gas to execute `legs` inside a flash loan.
+ *
+ * `balancer` should be true when the 0-premium Balancer path is used, which is
+ * cheaper both in fee and in gas.
+ */
+export function estimateRouteGas(legs: RouteLeg[], balancer: boolean): bigint {
+  let gas = GAS_TX_OVERHEAD + (balancer ? GAS_FLASH_BALANCER : GAS_FLASH_AAVE);
+
+  for (const leg of legs) {
+    gas += GAS_APPROVE;
+    gas += leg.kind === 'univ3' ? GAS_SWAP_V3 : GAS_SWAP_V2;
+  }
+
+  return gas + (gas * GAS_SAFETY_BPS) / 10_000n;
+}
+
 /** Value a token amount in USD. */
 export function valueUsd(amount: bigint, token: TokenInfo, tokenUsdPrice: number): number {
   return toFloat(amount, token.decimals) * tokenUsdPrice;

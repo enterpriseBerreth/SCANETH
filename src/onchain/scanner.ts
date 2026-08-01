@@ -27,6 +27,7 @@ import { PriceOracle } from './prices';
 import {
   bestFromLadder,
   gasCostUsd,
+  estimateRouteGas,
   getAmountOutV2,
   isLocallyPriceable,
   optimalSize,
@@ -461,7 +462,10 @@ async function assembleOpportunity(
   if (basePrice <= 0 || nativePrice <= 0) return undefined;
 
   const grossProfitUsd = valueUsd(sized.profit, baseToken, basePrice);
-  const gasUsd = gasCostUsd(scan.config.gasLimitEstimate, scan.gasPriceWei, nativePrice);
+  // Costed on the actual shape of this route rather than one flat constant —
+  // a 2-leg V2 cycle and a 3-leg V3 cycle are not the same trade.
+  const gasUnits = estimateRouteGas(legs, provider === FlashProvider.Balancer);
+  const gasUsd = gasCostUsd(gasUnits, scan.gasPriceWei, nativePrice);
   const netProfitUsd = grossProfitUsd - gasUsd;
 
   const flashFeeAmount =
@@ -479,6 +483,7 @@ async function assembleOpportunity(
     flashProvider: provider,
     notionalUsd: valueUsd(sized.amountIn, baseToken, basePrice),
     grossProfitUsd,
+    gasUnits,
     gasCostUsd: gasUsd,
     netProfitUsd,
     discoveredAt: Date.now(),

@@ -29,7 +29,7 @@ import {
 import { PriceOracle } from './onchain/prices';
 import { scanChainVerbose, requoteCycle, type ScanDiagnostics } from './onchain/scanner';
 import { describeRoute, executeOpportunity } from './onchain/executor';
-import { flashFee, gasCostUsd, valueUsd } from './onchain/profit';
+import { estimateRouteGas, flashFee, gasCostUsd, valueUsd } from './onchain/profit';
 import { PaperLedger, type PendingPaperTrade } from './paper';
 import { CexFeeds } from './cex/feeds';
 import { scanCexSpreads } from './cex/scanner';
@@ -530,7 +530,11 @@ class Arbo {
         // a real outcome, and silently dropping it would bias the fill rate up.
         await this.paper.settle(entry, {
           actualGrossUsd: 0,
-          gasCostUsd: gasCostUsd(this.config.gasLimitEstimate, runtime.lastGasPriceWei, nativeUsd),
+          gasCostUsd: gasCostUsd(
+            estimateRouteGas(entry.legs, !!runtime.ctx.chain.balancerVault),
+            runtime.lastGasPriceWei,
+            nativeUsd,
+          ),
           quoted: false,
         });
       }
@@ -544,7 +548,11 @@ class Arbo {
     nativeUsd: number,
   ): Promise<void> {
     const baseToken = entry.legs[0]?.tokenIn;
-    const gasUsd = gasCostUsd(this.config.gasLimitEstimate, runtime.lastGasPriceWei, nativeUsd);
+    const gasUsd = gasCostUsd(
+      estimateRouteGas(entry.legs, !!runtime.ctx.chain.balancerVault),
+      runtime.lastGasPriceWei,
+      nativeUsd,
+    );
 
     if (!baseToken) {
       await this.paper.settle(entry, { actualGrossUsd: 0, gasCostUsd: gasUsd, quoted: false });

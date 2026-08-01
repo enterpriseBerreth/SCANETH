@@ -12,6 +12,7 @@ import assert from 'node:assert/strict';
 import {
   bestFromLadder,
   cycleProfit,
+  estimateRouteGas,
   flashFee,
   getAmountOutV2,
   optimalSize,
@@ -236,6 +237,65 @@ check('price impact grows with trade size', () => {
 check('toBigInt / toFloat round-trip cleanly', () => {
   assert.equal(toFloat(toBigInt(1234.5678, 6), 6), 1234.5678);
   assert.equal(toFloat(toBigInt(0.000001, 18), 18), 0.000001);
+});
+
+// ── 8. Route gas modelling ──────────────────────────────────────────────────
+//
+// A flat gas constant is wrong for every route that isn't the one it was tuned
+// for. These checks pin the ordering relationships that make the model useful;
+// the absolute constants are estimates and are allowed to be retuned, but a
+// change that inverts any of these orderings is a bug.
+
+function v3Leg(tokenIn: TokenInfo, tokenOut: TokenInfo, venueId: string): RouteLeg {
+  return {
+    venueId,
+    kind: 'univ3',
+    router: '0x' + '4'.repeat(40),
+    tokenIn,
+    tokenOut,
+    feeTier: 500,
+    feeBps: 5,
+  };
+}
+
+const twoLegV2 = [v2Leg(WETH, USDC, 1n, 1n, 'a'), v2Leg(USDC, WETH, 1n, 1n, 'b')];
+const twoLegV3 = [v3Leg(WETH, USDC, 'a'), v3Leg(USDC, WETH, 'b')];
+const threeLegV2 = [...twoLegV2, v2Leg(WETH, USDC, 1n, 1n, 'c')];
+
+check('a longer route costs more gas than a shorter one', () => {
+  assert.ok(
+    estimateRouteGas(threeLegV2, true) > estimateRouteGas(twoLegV2, true),
+    'three legs must cost more than two',
+  );
+});
+
+check('a V3 leg costs more gas than a V2 leg', () => {
+  assert.ok(
+    estimateRouteGas(twoLegV3, true) > estimateRouteGas(twoLegV2, true),
+    'concentrated liquidity crosses ticks and must be priced above constant-product',
+  );
+});
+
+check('Balancer is modelled cheaper than Aave', () => {
+  assert.ok(
+    estimateRouteGas(twoLegV2, true) < estimateRouteGas(twoLegV2, false),
+    'Balancer avoids aToken accounting and must cost less',
+  );
+});
+
+check('estimates stay in a physically plausible band', () => {
+  // If either bound trips, the model has drifted somewhere unrealistic and the
+  // profit filter is being fed nonsense.
+  const cheapest = estimateRouteGas(twoLegV2, true);
+  const dearest = estimateRouteGas([...twoLegV3, v3Leg(WETH, USDC, 'c')], false);
+  assert.ok(cheapest > 300_000n, `2-leg V2 floor too low: ${cheapest}`);
+  assert.ok(dearest < 1_200_000n, `3-leg V3 ceiling too high: ${dearest}`);
+});
+
+check('the safety margin is actually applied', () => {
+  // Raw sum for 2-leg V2 over Balancer: 21k + 110k + 2*(26k + 90k) = 363k.
+  // With 15% headroom: 417,450.
+  assert.equal(estimateRouteGas(twoLegV2, true), 417_450n);
 });
 
 console.log(
