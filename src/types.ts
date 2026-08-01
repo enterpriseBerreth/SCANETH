@@ -2,7 +2,13 @@
  * ARBO shared types.
  */
 
-export type Mode = 'simulate' | 'live';
+/**
+ * `simulate` — scan and score only, nothing recorded.
+ * `paper`    — scan, then settle each candidate against fresh on-chain state
+ *              after a delay and book the result to a persistent ledger.
+ * `live`     — real transactions.
+ */
+export type Mode = 'simulate' | 'paper' | 'live';
 
 export type ChainName = 'base' | 'arbitrum' | 'ethereum';
 

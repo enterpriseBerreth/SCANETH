@@ -6,6 +6,7 @@
 import { createLogger, errMeta } from './logger';
 import type { ArboConfig } from './config';
 import type { ArbOpportunity, CexSpread, ExecutionResult } from './types';
+import type { PaperTrade } from './paper';
 
 const log = createLogger('telegram');
 
@@ -86,6 +87,22 @@ export class Notifier {
         `realised: $${profit.toFixed(2)}\n` +
         `gas: $${(result.gasSpentUsd ?? 0).toFixed(2)}\n` +
         (result.txHash ? `tx: <code>${result.txHash}</code>` : ''),
+    );
+  }
+
+  /**
+   * A paper fill that survived re-quoting. Only sent for genuine fills, so the
+   * alert stream stays a signal rather than a running commentary.
+   */
+  async paperFill(trade: PaperTrade): Promise<void> {
+    await this.send(
+      `<b>Paper fill</b> — ${trade.chain}\n` +
+        `route: <code>${trade.route}</code>\n` +
+        `size: $${trade.notionalUsd.toFixed(0)}\n` +
+        `expected: $${trade.expectedNetUsd.toFixed(2)}\n` +
+        `<b>realised: $${trade.actualNetUsd.toFixed(2)}</b>\n` +
+        `decay: ${trade.decayBps.toFixed(2)} bps over ${trade.settleDelayMs} ms\n` +
+        `<i>${trade.wouldExecuteLive ? 'would have been sent live' : 'below live profit floor'}</i>`,
     );
   }
 

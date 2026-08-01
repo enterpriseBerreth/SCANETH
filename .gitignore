@@ -8,4 +8,7 @@ build/
 logs/
 contracts/out/
 artifacts/
+# Paper-trading ledger. Local runs only — on Railway this lives on a mounted
+# volume at /data so the track record survives redeploys.
+data/
 .DS_Store

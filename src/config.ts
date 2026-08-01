@@ -66,6 +66,13 @@ export interface ArboConfig {
   /** Pools holding less than this are treated as dead and excluded entirely. */
   minPoolLiquidityUsd: number;
 
+  /** Where the paper-trading ledger is appended, as newline-delimited JSON. */
+  paperLedgerPath: string;
+  /** How long a paper candidate is held before being re-quoted and booked. */
+  paperSettleDelayMs: number;
+  /** Cadence for the cumulative report and market-conditions rollup. */
+  paperReportIntervalMs: number;
+
   maxDailyLossUsd: number;
   maxConsecutiveFailures: number;
   failureCooldownMs: number;
@@ -89,9 +96,12 @@ export interface ArboConfig {
 }
 
 export function loadConfig(): ArboConfig {
-  const mode = str('MODE', 'simulate').toLowerCase();
-  if (mode !== 'simulate' && mode !== 'live') {
-    throw new Error(`MODE must be "simulate" or "live", got "${mode}"`);
+  // Defaults to paper rather than simulate: the point of running this is to build
+  // a track record, and a mode that records nothing cannot produce one.
+  const mode = str('MODE', 'paper').toLowerCase();
+  const modes: Mode[] = ['simulate', 'paper', 'live'];
+  if (!modes.includes(mode as Mode)) {
+    throw new Error(`MODE must be one of ${modes.join(', ')} — got "${mode}"`);
   }
 
   const chains = list('ENABLED_CHAINS', ['base', 'arbitrum']).map((c) => c.toLowerCase());
@@ -142,6 +152,13 @@ export function loadConfig(): ArboConfig {
     // them costs more than they hold, so they sit at arbitrary prices and generate
     // phantom edges of 100%+. Excluding them is what makes the edge numbers real.
     minPoolLiquidityUsd: num('MIN_POOL_LIQUIDITY_USD', 25_000),
+
+    paperLedgerPath: str('PAPER_LEDGER_PATH', './data/paper-trades.jsonl'),
+    // Held long enough to capture real edge decay. Detection to inclusion in
+    // practice spans signing, propagation and at least one block, so settling
+    // instantly would measure nothing and report a fill rate near 100%.
+    paperSettleDelayMs: num('PAPER_SETTLE_DELAY_MS', 3_000),
+    paperReportIntervalMs: num('PAPER_REPORT_INTERVAL_MS', 300_000),
 
     maxDailyLossUsd: num('MAX_DAILY_LOSS_USD', 100),
     maxConsecutiveFailures: num('MAX_CONSECUTIVE_FAILURES', 5),

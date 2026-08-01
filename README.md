@@ -9,13 +9,58 @@ The two are separate for a reason that is worth stating plainly: **a flash loan 
 
 ## Status
 
-Ships in `MODE=simulate`, which scores and logs opportunities and **never sends a transaction**. Going live is a config change, not a rewrite:
+Ships in `MODE=paper`. No transaction is ever sent; every candidate is measured instead. Going live is a config change, not a rewrite:
 
 1. Deploy the contract — `npm run deploy:contract`
 2. Set `ARB_CONTRACT_<CHAIN>` and `EXECUTOR_PRIVATE_KEY`
 3. Set `MODE=live`
 
 The config layer refuses to start in `live` mode if either value is missing, so it cannot be half-enabled by accident.
+
+## Paper trading
+
+The purpose is to answer one question honestly: **would this have made money?**
+
+That is harder than it sounds, because the natural way to build a paper trader is to book the profit you predicted at detection time — which measures your own optimism, not the market. Arbitrage edges decay in seconds, and between spotting a cycle and landing a transaction the pools move.
+
+So a paper fill here is **never** the detected number:
+
+1. A candidate is detected and queued, with its predicted profit recorded.
+2. It is held for `PAPER_SETTLE_DELAY_MS`.
+3. The identical route is re-quoted on-chain at the identical size against fresh state.
+4. **That second number is booked**, net of gas at the current price.
+
+| Outcome | Meaning | Booked |
+|---|---|---|
+| `filled` | Edge survived and cleared cost | realised gross − gas |
+| `decayed` | Edge no longer covers cost | −gas (a live attempt would revert) |
+| `dead` | Route stopped quoting entirely | −gas |
+
+A decayed edge is deliberately recorded as a **loss, not a skip**. In live mode that transaction gets broadcast and reverts, and the gas is really gone. Ignoring those would flatter the record exactly where it matters most.
+
+Paper mode books every cycle that is genuinely profitable, not only those clearing `MIN_PROFIT_USD` — otherwise the ledger stays empty whenever the floor is not met, which proves nothing either way. Each trade carries `wouldExecuteLive` so the live-threshold subset is still recoverable.
+
+### What it does not model
+
+- **Competition.** If an edge survives the delay it is booked as a win. In reality a faster searcher may have taken it. Real fill rates are therefore **lower** than reported, never higher.
+- **Inclusion risk** — a live transaction can be dropped or reordered.
+- **Intra-block ordering** — settlement quotes at the head of a block; a real transaction lands inside it.
+
+All three bias the report *optimistically*, which is the right direction for a measurement whose job is to decide whether to risk money: if it does not clear here, it will not clear live.
+
+### Reading the record
+
+`GET /paper` returns cumulative stats plus recent trades. The number that matters is `netUsd`. Also watch:
+
+- `fillRate` — how often an edge survived the delay.
+- `avgDecayBps` — how fast edges evaporate. Large decay means latency is the binding constraint.
+- `liveEligible` / `liveEligibleNetUsd` — the subset that would actually have been sent live.
+
+**Zero trades is itself a result.** A market-conditions rollup is written on a timer so that stays interpretable: it records how close the market came even when nothing qualified. Without it, "no trades" is indistinguishable from a broken scanner.
+
+### Persistence
+
+Newline-delimited JSON at `PAPER_LEDGER_PATH`; totals are recomputed from the file on boot so there is exactly one source of truth. On Railway it **must** live on a mounted volume (`/data`), or every redeploy silently resets the track record. A truncated final line from an unclean shutdown is skipped rather than fatal, and an unwritable disk logs once and continues in memory rather than killing the bot.
 
 ## Quick start
 

@@ -11,7 +11,7 @@
  */
 
 import { loadConfig, type ArboConfig } from './config';
-import { getChain } from './chains';
+import { AAVE_FLASH_FEE_BPS, BALANCER_FLASH_FEE_BPS, getChain } from './chains';
 import { createLogger, errMeta } from './logger';
 import { BotState } from './state';
 import { Notifier } from './telegram';
@@ -27,8 +27,10 @@ import {
   type PoolSet,
 } from './onchain/dex';
 import { PriceOracle } from './onchain/prices';
-import { scanChainVerbose, type ScanDiagnostics } from './onchain/scanner';
+import { scanChainVerbose, requoteCycle, type ScanDiagnostics } from './onchain/scanner';
 import { describeRoute, executeOpportunity } from './onchain/executor';
+import { flashFee, gasCostUsd, valueUsd } from './onchain/profit';
+import { PaperLedger, type PendingPaperTrade } from './paper';
 import { CexFeeds } from './cex/feeds';
 import { scanCexSpreads } from './cex/scanner';
 import type { ChainName, TokenInfo } from './types';
@@ -51,6 +53,7 @@ interface ChainRuntime {
 class Arbo {
   private readonly state = new BotState();
   private readonly notifier: Notifier;
+  private readonly paper: PaperLedger;
   private readonly runtimes: ChainRuntime[] = [];
   private cexFeeds?: CexFeeds;
   private httpServer?: Server;
@@ -60,6 +63,7 @@ class Arbo {
 
   constructor(private readonly config: ArboConfig) {
     this.notifier = new Notifier(config);
+    this.paper = new PaperLedger(config.paperLedgerPath, config.minProfitUsd);
   }
 
   // ── startup ───────────────────────────────────────────────────────────────
@@ -71,7 +75,15 @@ class Arbo {
       config: this.config,
       state: this.state,
       describeChains: () => this.describeChains(),
+      paperStats: () => this.paper.stats(),
+      paperTrades: () => this.paper.recentTrades(),
+      paperDurable: () => this.paper.isWritable,
+      paperLedgerPath: () => this.paper.ledgerPath,
     });
+
+    if (this.config.mode === 'paper') {
+      await this.paper.load();
+    }
 
     await this.initChains();
 
@@ -105,6 +117,9 @@ class Arbo {
     if (this.cexFeeds) {
       this.scheduleCex(2_000);
     }
+    if (this.config.mode === 'paper') {
+      this.schedulePaperReport(this.config.paperReportIntervalMs);
+    }
   }
 
   private banner(): void {
@@ -120,6 +135,20 @@ class Arbo {
     if (this.config.mode === 'simulate') {
       log.info(
         'SIMULATE MODE — opportunities will be scored and logged, but no transaction will ever be sent',
+      );
+    } else if (this.config.mode === 'paper') {
+      log.info(
+        'PAPER MODE — no transaction will ever be sent. Every candidate is re-quoted ' +
+          'on-chain after a delay and booked at that second price, net of gas.',
+        {
+          settleDelayMs: this.config.paperSettleDelayMs,
+          ledger: this.config.paperLedgerPath,
+          reportIntervalMs: this.config.paperReportIntervalMs,
+        },
+      );
+      log.info(
+        'Paper results do NOT model competition or inclusion risk, so real fill rates ' +
+          'would be lower than reported, never higher.',
       );
     } else {
       log.warn('LIVE MODE — real transactions will be broadcast with real funds');
@@ -248,6 +277,44 @@ class Arbo {
     this.timers.push(timer);
   }
 
+  private schedulePaperReport(delayMs: number): void {
+    if (this.stopping) return;
+    const timer = setTimeout(async () => {
+      await this.reportPaper();
+      this.schedulePaperReport(this.config.paperReportIntervalMs);
+    }, delayMs);
+    this.timers.push(timer);
+  }
+
+  /**
+   * Persist the market-conditions rollup and log cumulative performance.
+   *
+   * The rollup is what makes a zero-trade result mean something: without a record
+   * of how close the market actually came, an empty ledger is indistinguishable
+   * from a broken scanner.
+   */
+  private async reportPaper(): Promise<void> {
+    await this.paper.flushMarketSamples();
+    const stats = this.paper.stats();
+
+    log.info('paper trading report', {
+      trades: stats.trades,
+      filled: stats.filled,
+      decayed: stats.decayed,
+      dead: stats.dead,
+      fillRate: stats.fillRate,
+      netUsd: stats.netUsd,
+      grossUsd: stats.grossUsd,
+      gasUsd: stats.gasUsd,
+      avgNetUsd: stats.avgNetUsd,
+      avgDecayBps: stats.avgDecayBps,
+      liveEligible: stats.liveEligible,
+      liveEligibleNetUsd: stats.liveEligibleNetUsd,
+      pending: this.paper.pendingCount,
+      durable: this.paper.isWritable,
+    });
+  }
+
   // ── on-chain engine ───────────────────────────────────────────────────────
 
   private async scanOnchain(runtime: ChainRuntime): Promise<void> {
@@ -289,19 +356,62 @@ class Arbo {
         v3: runtime.pools.v3,
       };
 
-      const { actionable, nearMisses, diagnostics } = await scanChainVerbose({
+      const scanCtx = {
         ctx: runtime.ctx,
         pools: scanPools,
         oracle: runtime.oracle,
         config: this.config,
         gasPriceWei: runtime.lastGasPriceWei,
-      });
+      };
+
+      // Settle before scanning. Pool state was just refreshed, so this is the
+      // freshest view available, and settling first means a candidate re-detected
+      // in this same pass cannot overwrite the pending entry it is about to be
+      // measured against.
+      if (this.config.mode === 'paper') {
+        await this.settlePaperTrades(runtime, scanCtx);
+      }
+
+      const { actionable, nearMisses, diagnostics } = await scanChainVerbose(scanCtx);
 
       this.state.scansCompleted += 1;
       this.state.lastScanAt = Date.now();
       runtime.lastScanDurationMs = Date.now() - startedAt;
       runtime.lastScanError = undefined;
       runtime.lastDiagnostics = diagnostics;
+
+      // Paper mode books every genuinely profitable cycle, not only those
+      // clearing MIN_PROFIT_USD. Recording just the ones above the live floor
+      // would leave the ledger empty whenever the floor is not met, which proves
+      // nothing either way — the point of paper trading is to gather evidence.
+      const paperCandidates =
+        this.config.mode === 'paper'
+          ? [...actionable, ...nearMisses].filter((o) => o.netProfitUsd > 0)
+          : [];
+
+      if (this.config.mode === 'paper') {
+        this.paper.noteScan(
+          runtime.name,
+          // Results are sorted by net descending, so the best is the head of
+          // `actionable` when non-empty and otherwise the head of `nearMisses`.
+          actionable[0]?.netProfitUsd ?? nearMisses[0]?.netProfitUsd ?? null,
+          diagnostics.bestEdgeBps,
+          paperCandidates.length,
+        );
+
+        for (const candidate of paperCandidates) {
+          const route = describeRoute(candidate);
+          if (this.paper.open(candidate, route, this.config.paperSettleDelayMs)) {
+            log.info('paper candidate queued', {
+              chain: runtime.name,
+              route,
+              notionalUsd: Number(candidate.notionalUsd.toFixed(2)),
+              expectedNetUsd: Number(candidate.netProfitUsd.toFixed(4)),
+              settlesInMs: this.config.paperSettleDelayMs,
+            });
+          }
+        }
+      }
 
       if (actionable.length === 0) {
         // Near misses plus stage counters are what make a quiet scan
@@ -353,6 +463,12 @@ class Arbo {
 
         await this.notifier.opportunity(opportunity, route);
 
+        // In paper mode the candidate is already queued for honest settlement, so
+        // there is nothing more to do here. Falling through to the executor would
+        // be harmless — it refuses to send outside live mode — but it would log a
+        // misleading "not executed" line for a trade that is being measured.
+        if (this.config.mode === 'paper') continue;
+
         const verdict = assessRisk(this.config, this.state, opportunity);
         if (!verdict.allowed) {
           log.info('opportunity blocked by risk engine', { route, reason: verdict.reason });
@@ -381,6 +497,102 @@ class Arbo {
       this.state.lastError = message;
       log.error('scan failed', { chain: runtime.name, ...errMeta(err) });
     }
+  }
+
+  // ── paper settlement ──────────────────────────────────────────────────────
+
+  /**
+   * Re-price every due candidate against current state and book the result.
+   *
+   * This is where the honesty lives. The detected profit is treated purely as a
+   * prediction; the number recorded comes from re-quoting the same route at the
+   * same size now, with gas at the current price. Anything that no longer clears
+   * cost is booked as a loss of exactly the gas — which is what a live attempt
+   * would have cost, since the contract reverts rather than completing a losing
+   * trade.
+   */
+  private async settlePaperTrades(
+    runtime: ChainRuntime,
+    scanCtx: Parameters<typeof requoteCycle>[0],
+  ): Promise<void> {
+    const due = this.paper.due(runtime.name);
+    if (due.length === 0) return;
+
+    const nativeUsd = runtime.oracle.nativeUsd();
+
+    for (const entry of due) {
+      if (this.stopping) return;
+      try {
+        await this.settleOne(entry, runtime, scanCtx, nativeUsd);
+      } catch (err) {
+        log.warn('paper settlement failed', { route: entry.route, ...errMeta(err) });
+        // Book it rather than leaking the pending entry; an unquotable route is
+        // a real outcome, and silently dropping it would bias the fill rate up.
+        await this.paper.settle(entry, {
+          actualGrossUsd: 0,
+          gasCostUsd: gasCostUsd(this.config.gasLimitEstimate, runtime.lastGasPriceWei, nativeUsd),
+          quoted: false,
+        });
+      }
+    }
+  }
+
+  private async settleOne(
+    entry: PendingPaperTrade,
+    runtime: ChainRuntime,
+    scanCtx: Parameters<typeof requoteCycle>[0],
+    nativeUsd: number,
+  ): Promise<void> {
+    const baseToken = entry.legs[0]?.tokenIn;
+    const gasUsd = gasCostUsd(this.config.gasLimitEstimate, runtime.lastGasPriceWei, nativeUsd);
+
+    if (!baseToken) {
+      await this.paper.settle(entry, { actualGrossUsd: 0, gasCostUsd: gasUsd, quoted: false });
+      return;
+    }
+
+    const { amountOut, quoted } = await requoteCycle(scanCtx, entry.legs, entry.amountIn);
+
+    let actualGrossUsd = 0;
+    if (quoted) {
+      // Repay the loan and its premium out of the proceeds; whatever remains is
+      // the realised edge. Signed, because the re-quote can come back worse than
+      // the borrow and that must be recorded as such.
+      const owed = entry.amountIn + flashFee(entry.amountIn, this.paperFlashFeeBps(runtime));
+      const profit = amountOut - owed;
+      const basePrice = runtime.oracle.usd(baseToken);
+      actualGrossUsd = basePrice > 0 ? valueUsd(profit, baseToken, basePrice) : 0;
+    }
+
+    const trade = await this.paper.settle(entry, {
+      actualGrossUsd,
+      gasCostUsd: gasUsd,
+      quoted,
+    });
+
+    const level = trade.outcome === 'filled' ? 'info' : 'debug';
+    const payload = {
+      chain: trade.chain,
+      route: trade.route,
+      outcome: trade.outcome,
+      notionalUsd: trade.notionalUsd,
+      expectedNetUsd: trade.expectedNetUsd,
+      actualNetUsd: trade.actualNetUsd,
+      decayBps: trade.decayBps,
+      heldMs: trade.settleDelayMs,
+      wouldExecuteLive: trade.wouldExecuteLive,
+    };
+    if (level === 'info') log.info('paper trade settled', payload);
+    else log.debug('paper trade settled', payload);
+
+    if (trade.outcome === 'filled') {
+      await this.notifier.paperFill(trade);
+    }
+  }
+
+  /** Flash premium the settled route would have paid. Balancer is free; Aave is not. */
+  private paperFlashFeeBps(runtime: ChainRuntime): number {
+    return runtime.ctx.chain.balancerVault ? BALANCER_FLASH_FEE_BPS : AAVE_FLASH_FEE_BPS;
   }
 
   // ── CEX engine ────────────────────────────────────────────────────────────
@@ -447,6 +659,18 @@ class Arbo {
 
     for (const timer of this.timers) clearTimeout(timer);
     this.timers = [];
+
+    // Persist the in-flight rollup window. Railway redeploys are routine, and
+    // losing the market record on every restart would leave gaps precisely when
+    // a long-running measurement needs continuity.
+    if (this.config.mode === 'paper') {
+      try {
+        await this.paper.flushMarketSamples();
+        log.info('final paper summary', { ...this.paper.stats() });
+      } catch (err) {
+        log.warn('could not flush paper ledger on shutdown', errMeta(err));
+      }
+    }
 
     await this.cexFeeds?.close();
 

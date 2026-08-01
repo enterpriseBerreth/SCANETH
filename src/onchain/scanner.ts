@@ -358,6 +358,66 @@ function sizeBounds(
   return { min, max };
 }
 
+/**
+ * Re-price an existing route at a fixed size against current state.
+ *
+ * This is the settlement primitive for paper trading. It deliberately takes the
+ * size as given rather than re-optimising it: the question being asked is "what
+ * would the trade I already decided on have actually returned", and re-sizing
+ * would quietly answer a different, more flattering question.
+ *
+ * V2 legs must have their reserves rebound to the live pool set first — the leg
+ * objects carry a snapshot from discovery time, and re-quoting against a stale
+ * snapshot would report zero decay by construction.
+ */
+export async function requoteCycle(
+  scan: ScanContext,
+  legs: RouteLeg[],
+  amountIn: bigint,
+): Promise<{ amountOut: bigint; quoted: boolean }> {
+  if (amountIn <= 0n) return { amountOut: 0n, quoted: false };
+
+  const rebound = rebindReserves(scan.pools, legs);
+  if (!rebound) return { amountOut: 0n, quoted: false };
+
+  const outs = await quoteCycleLadder(scan, rebound, [amountIn]);
+  const amountOut = outs[0] ?? 0n;
+  return { amountOut, quoted: amountOut > 0n };
+}
+
+/**
+ * Replace cached V2 reserves with current ones, by pool address.
+ * Returns undefined if any V2 leg's pool has left the working set, which means
+ * the route is no longer tradeable and should settle as dead.
+ *
+ * Exported for testing: if this silently failed, every paper trade would settle
+ * as dead and the ledger would report a 0% fill rate that meant nothing.
+ */
+export function rebindReserves(pools: PoolSet, legs: RouteLeg[]): RouteLeg[] | undefined {
+  const byAddress = new Map<string, V2Pool>();
+  for (const pool of pools.v2) byAddress.set(pool.pool.toLowerCase(), pool);
+
+  const rebound: RouteLeg[] = [];
+  for (const leg of legs) {
+    if (leg.kind !== 'univ2') {
+      // V3 is quoted live against the pool contract, so nothing to refresh.
+      rebound.push(leg);
+      continue;
+    }
+
+    const fresh = leg.pool ? byAddress.get(leg.pool.toLowerCase()) : undefined;
+    if (!fresh) return undefined;
+
+    const aIsIn = sameToken(fresh.tokenA, leg.tokenIn);
+    rebound.push({
+      ...leg,
+      reserveIn: aIsIn ? fresh.reserveA : fresh.reserveB,
+      reserveOut: aIsIn ? fresh.reserveB : fresh.reserveA,
+    });
+  }
+  return rebound;
+}
+
 // ── opportunity assembly ────────────────────────────────────────────────────
 
 function chooseFlashProvider(scan: ScanContext): { provider: FlashProvider; feeBps: number } {
