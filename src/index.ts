@@ -28,6 +28,7 @@ import {
   type PoolSet,
 } from './onchain/dex';
 import { PriceOracle } from './onchain/prices';
+import { BlockWatcher } from './onchain/blocks';
 import { scanChainVerbose, requoteCycle, type ScanDiagnostics } from './onchain/scanner';
 import { describeRoute, executeOpportunity } from './onchain/executor';
 import { estimateRouteGas, flashFee, gasCostUsd, valueUsd } from './onchain/profit';
@@ -49,6 +50,14 @@ interface ChainRuntime {
   lastScanDurationMs: number;
   lastScanError?: string;
   lastDiagnostics?: ScanDiagnostics;
+  /** Set while a scan is in flight, so block events cannot stack up scans. */
+  scanning?: boolean;
+  /** Most recent block that triggered a scan, for observability. */
+  lastScanBlock?: number;
+  /** How scans are currently being triggered. */
+  trigger?: 'block' | 'poll';
+  /** Live block subscription, torn down on shutdown. */
+  blockWatcher?: BlockWatcher;
 }
 
 class Arbo {
@@ -138,7 +147,9 @@ class Arbo {
     }
 
     for (const runtime of this.runtimes) {
+      // The timer chain remains as a safety net; block events are the fast path.
       this.scheduleOnchain(runtime, 0);
+      this.startOnchainTriggers(runtime);
     }
     if (this.cexFeeds) {
       this.scheduleCex(2_000);
@@ -285,10 +296,42 @@ class Arbo {
 
   // ── scheduling ────────────────────────────────────────────────────────────
 
+  /**
+   * Drive scans from block arrivals rather than a fixed timer.
+   *
+   * A block event means the state every quote depends on has just changed, which
+   * is the only moment a rescan is actually informative. Two guards matter:
+   *
+   *  - `scanning` drops overlapping triggers instead of queueing them. On a 2s
+   *    chain with a 2.2s scan, queueing would build an unbounded backlog of
+   *    scans each describing an older block than the last.
+   *  - a slow safety-net timer still runs, so if the chain stalls or every block
+   *    trigger is dropped the bot keeps scanning rather than going silent.
+   */
+  private startOnchainTriggers(runtime: ChainRuntime): void {
+    const watcher = new BlockWatcher({
+      chainName: runtime.name,
+      wsUrl: this.config.wsUrls[runtime.name],
+      httpProvider: runtime.ctx.provider,
+      pollIntervalMs: this.config.blockPollIntervalMs,
+      onBlock: (blockNumber) => {
+        if (this.stopping) return;
+        if (runtime.scanning) return;
+        runtime.lastScanBlock = blockNumber;
+        runtime.trigger = watcher.triggerMode;
+        void this.scanOnchain(runtime);
+      },
+    });
+
+    runtime.blockWatcher = watcher;
+    watcher.start();
+  }
+
   private scheduleOnchain(runtime: ChainRuntime, delayMs: number): void {
     if (this.stopping) return;
     const timer = setTimeout(async () => {
-      await this.scanOnchain(runtime);
+      // Skipped when block triggers are keeping the chain fresh on their own.
+      if (!runtime.scanning) await this.scanOnchain(runtime);
       this.scheduleOnchain(runtime, this.config.scanIntervalMs);
     }, delayMs);
     this.timers.push(timer);
@@ -345,6 +388,9 @@ class Arbo {
 
   private async scanOnchain(runtime: ChainRuntime): Promise<void> {
     if (this.stopping) return;
+    // Overlapping scans are dropped, not queued: a backlog would only ever
+    // produce results describing progressively staler blocks.
+    if (runtime.scanning) return;
 
     const haltReason = shouldHalt(this.config, this.state);
     if (haltReason) {
@@ -356,6 +402,7 @@ class Arbo {
       return;
     }
 
+    runtime.scanning = true;
     const startedAt = Date.now();
 
     try {
@@ -462,6 +509,8 @@ class Arbo {
           solidlyPools: scanPools.solidly.length,
           curvePools: scanPools.curve.length,
           durationMs: runtime.lastScanDurationMs,
+          block: runtime.lastScanBlock ?? null,
+          trigger: runtime.trigger ?? 'poll',
           cyclesScreened: diagnostics.cyclesScreened,
           trianglesEnumerated: diagnostics.trianglesEnumerated,
           cyclesConfirmed: diagnostics.cyclesConfirmed,
@@ -539,6 +588,11 @@ class Arbo {
       runtime.lastScanError = message;
       this.state.lastError = message;
       log.error('scan failed', { chain: runtime.name, ...errMeta(err) });
+    } finally {
+      // Must be cleared on every path, including the early returns above. Leaving
+      // it set would permanently wedge the chain: every future block trigger and
+      // every safety-net tick would see a scan "in progress" and skip.
+      runtime.scanning = false;
     }
   }
 
@@ -710,6 +764,8 @@ class Arbo {
         v3Pools: runtime.pools.v3.length,
         solidlyPools: runtime.pools.solidly.length,
         curvePools: runtime.pools.curve.length,
+        scanTrigger: runtime.trigger ?? 'poll',
+        lastScanBlock: runtime.lastScanBlock ?? null,
         gasPriceGwei: Number(runtime.lastGasPriceWei) / 1e9,
         prices: runtime.oracle.snapshot(),
         lastScanDurationMs: runtime.lastScanDurationMs,
@@ -729,6 +785,13 @@ class Arbo {
 
     for (const timer of this.timers) clearTimeout(timer);
     this.timers = [];
+
+    // Close block subscriptions explicitly: an open WebSocket keeps the event
+    // loop alive and the process would not exit on SIGTERM.
+    for (const runtime of this.runtimes) {
+      runtime.blockWatcher?.stop();
+      runtime.blockWatcher = undefined;
+    }
 
     // Persist the in-flight rollup window. Railway redeploys are routine, and
     // losing the market record on every restart would leave gaps precisely when

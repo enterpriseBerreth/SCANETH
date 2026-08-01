@@ -55,6 +55,10 @@ export interface ArboConfig {
   mode: Mode;
   chains: ChainName[];
   rpcUrls: Record<ChainName, string>;
+  /** Optional wss:// endpoints; enables block-triggered scanning per chain. */
+  wsUrls: Partial<Record<ChainName, string>>;
+  /** Fallback block-polling cadence, used when a chain has no WebSocket URL. */
+  blockPollIntervalMs: number;
   privateSubmitRpcUrl?: string;
   contractAddresses: Partial<Record<ChainName, string>>;
   executorPrivateKey?: string;
@@ -134,6 +138,18 @@ export function loadConfig(): ArboConfig {
     ethereum: str('ETHEREUM_RPC_URL', 'https://ethereum-rpc.publicnode.com'),
   };
 
+  // WebSocket endpoints are optional. When present, scans are triggered by new
+  // heads instead of a timer, which is the difference between quoting the current
+  // block and quoting a block that has already been replaced. Absent one, the bot
+  // polls block numbers — still block-aligned, just a little later.
+  const wsUrls: Partial<Record<ChainName, string>> = {};
+  const baseWs = optionalStr('BASE_WS_URL');
+  const arbWs = optionalStr('ARBITRUM_WS_URL');
+  const ethWs = optionalStr('ETHEREUM_WS_URL');
+  if (baseWs) wsUrls.base = baseWs;
+  if (arbWs) wsUrls.arbitrum = arbWs;
+  if (ethWs) wsUrls.ethereum = ethWs;
+
   const contractAddresses: Partial<Record<ChainName, string>> = {};
   const baseContract = optionalStr('ARB_CONTRACT_BASE');
   const arbContract = optionalStr('ARB_CONTRACT_ARBITRUM');
@@ -148,6 +164,11 @@ export function loadConfig(): ArboConfig {
     mode: mode as Mode,
     chains: chains as ChainName[],
     rpcUrls,
+    wsUrls,
+    // Base and Arbitrum both produce blocks faster than this, but polling harder
+    // burns request budget on public endpoints for little gain. A WebSocket URL
+    // is the real fix; this is the floor.
+    blockPollIntervalMs: num('BLOCK_POLL_INTERVAL_MS', 2_000),
     privateSubmitRpcUrl: optionalStr('PRIVATE_SUBMIT_RPC_URL'),
     contractAddresses,
     executorPrivateKey,
