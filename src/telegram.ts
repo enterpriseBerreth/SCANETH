@@ -27,7 +27,12 @@ export class Notifier {
   }
 
   private async send(text: string): Promise<void> {
-    if (!this.enabled) return;
+    await this.sendChecked(text);
+  }
+
+  /** As `send`, but reports whether Telegram actually accepted the message. */
+  private async sendChecked(text: string): Promise<boolean> {
+    if (!this.enabled) return false;
 
     // Crude spacing so a burst of opportunities cannot trip rate limits.
     const sinceLast = Date.now() - this.lastSentAt;
@@ -52,12 +57,27 @@ export class Notifier {
       });
 
       if (!response.ok) {
-        log.warn('telegram rejected message', { status: response.status });
+        // Telegram explains refusals in the body, and the reason is almost always
+        // actionable (bad token, wrong chat id, bot never started by the user).
+        let detail = '';
+        try {
+          detail = (await response.text()).slice(0, 300);
+        } catch {
+          // Body already consumed or unreadable; status alone still tells us enough.
+        }
+        log.warn('telegram rejected message', { status: response.status, detail });
+        return false;
       }
+      return true;
     } catch (err) {
       // Never let a messaging failure disturb trading.
       log.warn('telegram send failed', errMeta(err));
+      return false;
     }
+  }
+
+  get isEnabled(): boolean {
+    return this.enabled;
   }
 
   async startup(chains: string[], mode: string): Promise<void> {
@@ -91,18 +111,42 @@ export class Notifier {
   }
 
   /**
-   * A paper fill that survived re-quoting. Only sent for genuine fills, so the
-   * alert stream stays a signal rather than a running commentary.
+   * Sent after every settled paper trade — wins and losses alike.
+   *
+   * Losses are included deliberately. An alert stream showing only fills would
+   * misrepresent the strategy, since gas on a decayed edge is a real debit
+   * against the balance and is exactly what a live account would have paid.
    */
-  async paperFill(trade: PaperTrade): Promise<void> {
+  async paperTrade(trade: PaperTrade): Promise<void> {
+    const win = trade.actualNetUsd >= 0;
+    const heading = win ? 'Paper trade — PROFIT' : 'Paper trade — LOSS';
+    const sign = win ? '+' : '-';
+    const magnitude = Math.abs(trade.actualNetUsd);
+    const pct = Math.abs(trade.pnlPct);
+
     await this.send(
-      `<b>Paper fill</b> — ${trade.chain}\n` +
-        `route: <code>${trade.route}</code>\n` +
-        `size: $${trade.notionalUsd.toFixed(0)}\n` +
-        `expected: $${trade.expectedNetUsd.toFixed(2)}\n` +
-        `<b>realised: $${trade.actualNetUsd.toFixed(2)}</b>\n` +
-        `decay: ${trade.decayBps.toFixed(2)} bps over ${trade.settleDelayMs} ms\n` +
-        `<i>${trade.wouldExecuteLive ? 'would have been sent live' : 'below live profit floor'}</i>`,
+      `<b>${heading}</b>\n\n` +
+        `Token: <b>${escapeHtml(trade.tokenPath)}</b>\n` +
+        `PNL: <b>${sign}$${magnitude.toFixed(2)}</b>\n` +
+        `PNL %: <b>${sign}${pct.toFixed(2)}%</b>\n` +
+        `Capital before: $${trade.capitalBeforeUsd.toFixed(2)}\n` +
+        `Capital after: <b>$${trade.capitalAfterUsd.toFixed(2)}</b>\n\n` +
+        `<i>${trade.chain} · ${trade.outcome} · size $${trade.notionalUsd.toFixed(0)} · ` +
+        `gas $${trade.gasCostUsd.toFixed(2)}</i>`,
+    );
+  }
+
+  /**
+   * Connectivity check. Returns whether Telegram accepted the message, so a
+   * misconfigured token surfaces at boot rather than at the first trade.
+   */
+  async test(mode: string, capitalUsd: number): Promise<boolean> {
+    return this.sendChecked(
+      `<b>ARBO — Telegram test</b>\n\n` +
+        `Connection verified. Trade alerts will arrive here.\n\n` +
+        `Mode: <code>${escapeHtml(mode)}</code>\n` +
+        `Starting capital: <b>$${capitalUsd.toFixed(2)}</b>\n\n` +
+        `<i>Each alert reports token, PNL $, PNL %, and capital before and after.</i>`,
     );
   }
 
@@ -121,6 +165,15 @@ export class Notifier {
   }
 
   async error(scope: string, message: string): Promise<void> {
-    await this.send(`<b>ARBO error</b> [${scope}]\n<code>${message.slice(0, 500)}</code>`);
+    await this.send(`<b>ARBO error</b> [${scope}]\n<code>${escapeHtml(message.slice(0, 500))}</code>`);
   }
+}
+
+/**
+ * Telegram parses these three characters as markup in HTML mode, so any value
+ * interpolated from chain data has to be escaped or the whole message is
+ * rejected with a 400 and the alert is silently lost.
+ */
+function escapeHtml(value: string): string {
+  return value.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 }

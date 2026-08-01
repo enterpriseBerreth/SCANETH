@@ -68,6 +68,8 @@ export interface ArboConfig {
 
   /** Where the paper-trading ledger is appended, as newline-delimited JSON. */
   paperLedgerPath: string;
+  /** Simulated starting balance. Paper P&L compounds against this. */
+  paperStartingCapitalUsd: number;
   /** How long a paper candidate is held before being re-quoted and booked. */
   paperSettleDelayMs: number;
   /** Cadence for the cumulative report and market-conditions rollup. */
@@ -154,6 +156,7 @@ export function loadConfig(): ArboConfig {
     minPoolLiquidityUsd: num('MIN_POOL_LIQUIDITY_USD', 25_000),
 
     paperLedgerPath: str('PAPER_LEDGER_PATH', './data/paper-trades.jsonl'),
+    paperStartingCapitalUsd: num('PAPER_STARTING_CAPITAL_USD', 1_000),
     // Held long enough to capture real edge decay. Detection to inclusion in
     // practice spans signing, propagation and at least one block, so settling
     // instantly would measure nothing and report a fill rate near 100%.

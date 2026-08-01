@@ -48,9 +48,15 @@ Paper mode books every cycle that is genuinely profitable, not only those cleari
 
 All three bias the report *optimistically*, which is the right direction for a measurement whose job is to decide whether to risk money: if it does not clear here, it will not clear live.
 
+### The capital account
+
+Paper trading opens with `PAPER_STARTING_CAPITAL_USD` (default **$1,000**) and every settled trade moves that balance — credits on wins, debits on losses. Each trade records `capitalBeforeUsd` and `capitalAfterUsd`, so the account compounds and P&L percent is measured against the capital actually at risk at that moment rather than against the opening balance forever.
+
+Worth being clear about what the balance is and is not. Flash loans are uncollateralised, so **it is not a cap on trade size** — an $8,000 notional cycle on a $1,000 account is entirely normal, because the loan is borrowed and repaid inside one transaction. What the balance really represents is the **gas warchest**: the money that pays for transactions, including the ones that revert. That is what runs out, and when it hits zero the bot stops opening candidates instead of continuing to report fills it could never have afforded.
+
 ### Reading the record
 
-`GET /paper` returns cumulative stats plus recent trades. The number that matters is `netUsd`. Also watch:
+`GET /paper` returns cumulative stats plus recent trades. The numbers that matter are `capitalUsd` and `returnPct`. Also watch:
 
 - `fillRate` — how often an edge survived the delay.
 - `avgDecayBps` — how fast edges evaporate. Large decay means latency is the binding constraint.
@@ -58,9 +64,21 @@ All three bias the report *optimistically*, which is the right direction for a m
 
 **Zero trades is itself a result.** A market-conditions rollup is written on a timer so that stays interpretable: it records how close the market came even when nothing qualified. Without it, "no trades" is indistinguishable from a broken scanner.
 
+### Alerts
+
+With `TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID` set, an alert is sent after **every settled trade** — reporting token, PNL $, PNL %, and capital before and after.
+
+Losses are included on purpose. An alert stream showing only fills would misstate the strategy, because gas on a decayed edge is a real debit that a live account would genuinely have paid. Verify delivery before relying on it:
+
+```bash
+npm run telegram:test
+```
+
+That sends a connectivity check followed by a sample trade alert in the exact production format, and exits non-zero if Telegram refused either. Note that Telegram will not deliver to a chat that has never contacted the bot, so send it `/start` once first.
+
 ### Persistence
 
-Newline-delimited JSON at `PAPER_LEDGER_PATH`; totals are recomputed from the file on boot so there is exactly one source of truth. On Railway it **must** live on a mounted volume (`/data`), or every redeploy silently resets the track record. A truncated final line from an unclean shutdown is skipped rather than fatal, and an unwritable disk logs once and continues in memory rather than killing the bot.
+Newline-delimited JSON at `PAPER_LEDGER_PATH`; totals *and the balance* are recomputed from the file on boot so there is exactly one source of truth and a restart cannot diverge from recorded history. On Railway it **must** live on a mounted volume (`/data`), or every redeploy silently resets the track record. A truncated final line from an unclean shutdown is skipped rather than fatal, and an unwritable disk logs once and continues in memory rather than killing the bot.
 
 ## Quick start
 
@@ -79,12 +97,13 @@ npm start                   # continuous
 | `npm start` | Run continuously |
 | `npm run scan:once` | Single scan pass, then exit cleanly |
 | `npm run doctor` | Validate chains, venues, lenders and pool prices against live RPCs |
-| `npm test` | Profit-engine verification (19 checks) |
+| `npm run telegram:test` | Verify Telegram delivery and preview the trade-alert format |
+| `npm test` | Profit engine, paper ledger and settlement checks (52 checks) |
 | `npm run typecheck` | `tsc --noEmit` |
 | `npm run bench:rpc` | Benchmark candidate RPC endpoints |
 | `npm run deploy:contract` | Compile and deploy `ArboFlashArb.sol` |
 
-Health endpoints: `/health` (liveness) and `/stats` (full run state, per-chain diagnostics, prices).
+Health endpoints: `/health` (liveness), `/stats` (full run state, per-chain diagnostics, prices) and `/paper` (balance, cumulative P&L, recent trades).
 
 ## How it decides
 

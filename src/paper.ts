@@ -48,6 +48,8 @@ export interface PaperTrade {
   chain: ChainName;
   route: string;
   baseSymbol: string;
+  /** Human-readable token cycle, e.g. `WETH -> USDC -> WETH`. */
+  tokenPath: string;
   notionalUsd: number;
 
   detectedAt: number;
@@ -66,6 +68,13 @@ export interface PaperTrade {
   outcome: PaperOutcome;
   /** Whether this would have cleared MIN_PROFIT_USD and actually been sent live. */
   wouldExecuteLive: boolean;
+
+  /** Simulated account balance immediately before this trade. */
+  capitalBeforeUsd: number;
+  /** Balance after applying `actualNetUsd`. This is what compounds. */
+  capitalAfterUsd: number;
+  /** Return on the account for this trade, as a percentage of capital before. */
+  pnlPct: number;
 }
 
 /**
@@ -99,6 +108,12 @@ export interface PaperStats {
   gasUsd: number;
   /** Cumulative paper P&L. This is the proven-profitability number. */
   netUsd: number;
+  /** Balance the account opened with. */
+  startingCapitalUsd: number;
+  /** Current simulated balance: starting capital plus cumulative net P&L. */
+  capitalUsd: number;
+  /** Total return on the account since inception, as a percentage. */
+  returnPct: number;
   bestUsd: number | null;
   worstUsd: number | null;
   avgNetUsd: number | null;
@@ -117,6 +132,7 @@ export interface PendingPaperTrade {
   chain: ChainName;
   route: string;
   baseSymbol: string;
+  tokenPath: string;
   legs: RouteLeg[];
   amountIn: bigint;
   notionalUsd: number;
@@ -131,6 +147,14 @@ const RECENT_LIMIT = 25;
 export class PaperLedger {
   private readonly path: string;
   private readonly minProfitUsd: number;
+  private readonly startingCapitalUsd: number;
+  /**
+   * Simulated balance. Every settled trade moves this, including losses, so the
+   * account compounds exactly as a real one would. Gas on a decayed trade is a
+   * real debit here — that is the whole point of tracking a balance rather than
+   * a bare sum of wins.
+   */
+  private capitalUsd: number;
   private recent: PaperTrade[] = [];
   private totals = emptyTotals();
   private perChain = new Map<string, { trades: number; netUsd: number }>();
@@ -142,13 +166,27 @@ export class PaperLedger {
     { scans: number; bestNetUsd: number | null; bestEdgeBps: number | null; candidates: number }
   >();
 
-  constructor(path: string, minProfitUsd: number) {
+  constructor(path: string, minProfitUsd: number, startingCapitalUsd: number) {
     this.path = path;
     this.minProfitUsd = minProfitUsd;
+    this.startingCapitalUsd = startingCapitalUsd;
+    this.capitalUsd = startingCapitalUsd;
   }
 
   get ledgerPath(): string {
     return this.path;
+  }
+
+  get capital(): number {
+    return this.capitalUsd;
+  }
+
+  /**
+   * A real account with no money cannot pay gas, so it cannot trade. Reporting
+   * fills past this point would be fiction.
+   */
+  get solvent(): boolean {
+    return this.capitalUsd > 0;
   }
 
   get isWritable(): boolean {
@@ -201,6 +239,7 @@ export class PaperLedger {
       trades,
       skippedLines: skipped,
       netUsd: Number(this.totals.netUsd.toFixed(4)),
+      capitalUsd: Number(this.capitalUsd.toFixed(4)),
     });
   }
 
@@ -222,6 +261,7 @@ export class PaperLedger {
       chain: opportunity.chain,
       route,
       baseSymbol: opportunity.baseToken.symbol,
+      tokenPath: describeTokenPath(opportunity.legs, opportunity.baseToken.symbol),
       legs: opportunity.legs,
       amountIn: opportunity.amountIn,
       notionalUsd: opportunity.notionalUsd,
@@ -272,12 +312,20 @@ export class PaperLedger {
     const decayUsd = entry.expectedGrossUsd - result.actualGrossUsd;
     const decayBps = entry.notionalUsd > 0 ? (decayUsd / entry.notionalUsd) * 10_000 : 0;
 
+    // The balance moves by the realised number, win or lose. P&L percent is taken
+    // against capital before the trade — the standard convention, and the one
+    // that stays meaningful as the account compounds.
+    const capitalBeforeUsd = this.capitalUsd;
+    const capitalAfterUsd = capitalBeforeUsd + actualNetUsd;
+    const pnlPct = capitalBeforeUsd > 0 ? (actualNetUsd / capitalBeforeUsd) * 100 : 0;
+
     const trade: PaperTrade = {
       kind: 'trade',
       id: entry.id,
       chain: entry.chain,
       route: entry.route,
       baseSymbol: entry.baseSymbol,
+      tokenPath: entry.tokenPath,
       notionalUsd: round(entry.notionalUsd, 2),
       detectedAt: entry.detectedAt,
       expectedGrossUsd: round(entry.expectedGrossUsd, 6),
@@ -290,6 +338,9 @@ export class PaperLedger {
       decayBps: round(decayBps, 3),
       outcome,
       wouldExecuteLive: actualNetUsd >= this.minProfitUsd,
+      capitalBeforeUsd: round(capitalBeforeUsd, 4),
+      capitalAfterUsd: round(capitalAfterUsd, 4),
+      pnlPct: round(pnlPct, 4),
     };
 
     this.accumulate(trade);
@@ -358,6 +409,12 @@ export class PaperLedger {
       grossUsd: round(t.grossUsd, 4),
       gasUsd: round(t.gasUsd, 4),
       netUsd: round(t.netUsd, 4),
+      startingCapitalUsd: round(this.startingCapitalUsd, 2),
+      capitalUsd: round(this.capitalUsd, 4),
+      returnPct:
+        this.startingCapitalUsd > 0
+          ? round(((this.capitalUsd - this.startingCapitalUsd) / this.startingCapitalUsd) * 100, 4)
+          : 0,
       bestUsd: t.bestUsd === null ? null : round(t.bestUsd, 4),
       worstUsd: t.worstUsd === null ? null : round(t.worstUsd, 4),
       avgNetUsd: t.trades > 0 ? round(t.netUsd / t.trades, 4) : null,
@@ -382,6 +439,13 @@ export class PaperLedger {
     t.grossUsd += trade.actualGrossUsd;
     t.gasUsd += trade.gasCostUsd;
     t.netUsd += trade.actualNetUsd;
+
+    // Replay the balance from the recorded value so a reload lands on exactly the
+    // number that was written, with no drift from re-deriving it. Ledgers written
+    // before capital tracking existed are tolerated by falling back to the delta.
+    this.capitalUsd = Number.isFinite(trade.capitalAfterUsd)
+      ? trade.capitalAfterUsd
+      : this.capitalUsd + trade.actualNetUsd;
 
     if (trade.outcome === 'filled') t.filled += 1;
     else if (trade.outcome === 'decayed') t.decayed += 1;
@@ -427,6 +491,16 @@ export class PaperLedger {
       });
     }
   }
+}
+
+/**
+ * The token cycle as a readable path. Falls back to the base symbol alone if the
+ * legs are empty, so an alert never renders as a blank token name.
+ */
+export function describeTokenPath(legs: RouteLeg[], baseSymbol: string): string {
+  if (legs.length === 0) return baseSymbol;
+  const symbols = [legs[0]!.tokenIn.symbol, ...legs.map((leg) => leg.tokenOut.symbol)];
+  return symbols.join(' -> ');
 }
 
 function emptyTotals() {

@@ -60,10 +60,16 @@ class Arbo {
   private stopping = false;
   private halted = false;
   private timers: NodeJS.Timeout[] = [];
+  /** Ensures the insolvency alert fires once, not on every subsequent settlement. */
+  private paperInsolvencyReported = false;
 
   constructor(private readonly config: ArboConfig) {
     this.notifier = new Notifier(config);
-    this.paper = new PaperLedger(config.paperLedgerPath, config.minProfitUsd);
+    this.paper = new PaperLedger(
+      config.paperLedgerPath,
+      config.minProfitUsd,
+      config.paperStartingCapitalUsd,
+    );
   }
 
   // ── startup ───────────────────────────────────────────────────────────────
@@ -101,6 +107,21 @@ class Arbo {
       this.runtimes.map((r) => r.name),
       this.config.mode,
     );
+
+    // Verify messaging before trading rather than discovering at the first fill
+    // that alerts were never arriving. A failure here is logged loudly but is
+    // deliberately not fatal — the bot's job is to trade, not to message.
+    if (this.notifier.isEnabled) {
+      const ok = await this.notifier.test(this.config.mode, this.paper.capital);
+      if (ok) {
+        log.info('telegram connected — test alert delivered');
+      } else {
+        log.error(
+          'telegram test alert was NOT delivered — check TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID, ' +
+            'and make sure the chat has been started with the bot',
+        );
+      }
+    }
 
     if (this.config.runOnce) {
       log.info('running a single scan pass (--once)');
@@ -400,6 +421,9 @@ class Arbo {
         );
 
         for (const candidate of paperCandidates) {
+          // An account with no money cannot pay gas, so it cannot open a trade.
+          // Continuing to book fills past this point would be fiction.
+          if (!this.paper.solvent) break;
           const route = describeRoute(candidate);
           if (this.paper.open(candidate, route, this.config.paperSettleDelayMs)) {
             log.info('paper candidate queued', {
@@ -582,10 +606,14 @@ class Arbo {
     const payload = {
       chain: trade.chain,
       route: trade.route,
+      token: trade.tokenPath,
       outcome: trade.outcome,
       notionalUsd: trade.notionalUsd,
       expectedNetUsd: trade.expectedNetUsd,
       actualNetUsd: trade.actualNetUsd,
+      pnlPct: trade.pnlPct,
+      capitalBeforeUsd: trade.capitalBeforeUsd,
+      capitalAfterUsd: trade.capitalAfterUsd,
       decayBps: trade.decayBps,
       heldMs: trade.settleDelayMs,
       wouldExecuteLive: trade.wouldExecuteLive,
@@ -593,8 +621,19 @@ class Arbo {
     if (level === 'info') log.info('paper trade settled', payload);
     else log.debug('paper trade settled', payload);
 
-    if (trade.outcome === 'filled') {
-      await this.notifier.paperFill(trade);
+    // Every settled trade is reported, not just the winners. A stream of fills
+    // only would misstate the strategy, since the gas on a decayed edge is a
+    // real debit that a live account would genuinely have paid.
+    await this.notifier.paperTrade(trade);
+
+    if (!this.paper.solvent && !this.paperInsolvencyReported) {
+      this.paperInsolvencyReported = true;
+      log.error('paper account insolvent — no further candidates will be opened', {
+        capitalUsd: trade.capitalAfterUsd,
+      });
+      await this.notifier.halted(
+        `paper capital exhausted at $${trade.capitalAfterUsd.toFixed(2)}`,
+      );
     }
   }
 

@@ -15,7 +15,7 @@ import assert from 'node:assert/strict';
 import { mkdtemp, rm, readFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { PaperLedger } from './paper';
+import { PaperLedger, describeTokenPath } from './paper';
 import { rebindReserves } from './onchain/scanner';
 import type { PoolSet } from './onchain/dex';
 import type { V2Pool } from './onchain/dex/pools';
@@ -124,14 +124,18 @@ function opportunity(overrides: Partial<ArbOpportunity> = {}): ArbOpportunity {
   } as ArbOpportunity;
 }
 
+/** Every test account opens with this, so capital assertions read plainly. */
+const START_CAPITAL = 1_000;
+
 async function withLedger(
   minProfitUsd: number,
   fn: (ledger: PaperLedger, path: string) => Promise<void>,
+  startingCapitalUsd = START_CAPITAL,
 ): Promise<void> {
   const dir = await mkdtemp(join(tmpdir(), 'arbo-paper-'));
   const path = join(dir, 'ledger.jsonl');
   try {
-    await fn(new PaperLedger(path, minProfitUsd), path);
+    await fn(new PaperLedger(path, minProfitUsd, startingCapitalUsd), path);
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
@@ -300,7 +304,7 @@ async function main(): Promise<void> {
       // (9-2) + (0.5-2) + (20-2) = 7 - 1.5 + 18 = 23.5
       assert.equal(before.netUsd, 23.5);
 
-      const reloaded = new PaperLedger(path, 5);
+      const reloaded = new PaperLedger(path, 5, START_CAPITAL);
       await reloaded.load();
       const after = reloaded.stats();
 
@@ -323,7 +327,7 @@ async function main(): Promise<void> {
       const { appendFile } = await import('node:fs/promises');
       await appendFile(path, '{"kind":"trade","id":"trunc', 'utf8');
 
-      const reloaded = new PaperLedger(path, 5);
+      const reloaded = new PaperLedger(path, 5, START_CAPITAL);
       await reloaded.load();
       assert.equal(reloaded.stats().trades, 1, 'the intact record must still load');
       assert.equal(reloaded.stats().netUsd, 7);
@@ -348,7 +352,7 @@ async function main(): Promise<void> {
 
       assert.equal(ledger.stats().trades, 0, 'samples must not appear as trades');
 
-      const reloaded = new PaperLedger(path, 5);
+      const reloaded = new PaperLedger(path, 5, START_CAPITAL);
       await reloaded.load();
       assert.equal(reloaded.stats().trades, 0);
     });
@@ -358,7 +362,7 @@ async function main(): Promise<void> {
     // A directory path can never be opened for append.
     const dir = await mkdtemp(join(tmpdir(), 'arbo-paper-ro-'));
     try {
-      const ledger = new PaperLedger(dir, 5);
+      const ledger = new PaperLedger(dir, 5, START_CAPITAL);
       ledger.open(opportunity(), 'r', 0);
       const [entry] = ledger.due('base');
       assert.ok(entry);
@@ -375,6 +379,179 @@ async function main(): Promise<void> {
     } finally {
       await rm(dir, { recursive: true, force: true });
     }
+  });
+
+  // ── capital account ───────────────────────────────────────────────────────
+  //
+  // The balance is what makes the result legible. A sum of wins says nothing;
+  // a balance that started at $1,000 and either grew or shrank says everything.
+  // These checks pin that the account behaves like a real one: it debits losses,
+  // compounds, reports percentages against the balance at risk, and survives a
+  // restart on exactly the number that was written.
+
+  console.log('\nCapital account\n');
+
+  await check('the account opens at the configured starting balance', async () => {
+    await withLedger(5, async (ledger) => {
+      assert.equal(ledger.capital, START_CAPITAL);
+      assert.equal(ledger.stats().capitalUsd, START_CAPITAL);
+      assert.equal(ledger.stats().startingCapitalUsd, START_CAPITAL);
+      assert.equal(ledger.stats().returnPct, 0);
+      assert.equal(ledger.solvent, true);
+    });
+  });
+
+  await check('a win credits the balance and a loss debits it', async () => {
+    await withLedger(5, async (ledger) => {
+      ledger.open(opportunity({ id: 'w' }), 'win', 0);
+      let due = ledger.due('base');
+      const win = due[due.length - 1];
+      assert.ok(win);
+      const winTrade = await ledger.settle(win, {
+        actualGrossUsd: 9,
+        gasCostUsd: 2,
+        quoted: true,
+      });
+
+      assert.equal(winTrade.capitalBeforeUsd, 1_000);
+      assert.equal(winTrade.capitalAfterUsd, 1_007, 'net +7 must land in the balance');
+
+      ledger.open(opportunity({ id: 'l' }), 'loss', 0);
+      due = ledger.due('base');
+      const loss = due[due.length - 1];
+      assert.ok(loss);
+      const lossTrade = await ledger.settle(loss, {
+        actualGrossUsd: 0,
+        gasCostUsd: 3,
+        quoted: false,
+      });
+
+      // Compounding: the second trade opens where the first closed.
+      assert.equal(lossTrade.capitalBeforeUsd, 1_007, 'the balance must carry forward');
+      assert.equal(lossTrade.capitalAfterUsd, 1_004, 'gas on a dead route is a real debit');
+      assert.equal(ledger.capital, 1_004);
+    });
+  });
+
+  await check('pnl percent is measured against capital before the trade', async () => {
+    await withLedger(5, async (ledger) => {
+      ledger.open(opportunity(), 'r', 0);
+      const [entry] = ledger.due('base');
+      assert.ok(entry);
+      const trade = await ledger.settle(entry, {
+        actualGrossUsd: 52,
+        gasCostUsd: 2,
+        quoted: true,
+      });
+
+      // net = 50 on a 1,000 balance = 5%.
+      assert.equal(trade.actualNetUsd, 50);
+      assert.equal(trade.pnlPct, 5);
+    });
+  });
+
+  await check('a loss produces a negative pnl percent', async () => {
+    await withLedger(5, async (ledger) => {
+      ledger.open(opportunity(), 'r', 0);
+      const [entry] = ledger.due('base');
+      assert.ok(entry);
+      const trade = await ledger.settle(entry, {
+        actualGrossUsd: 0,
+        gasCostUsd: 10,
+        quoted: true,
+      });
+
+      assert.equal(trade.actualNetUsd, -10);
+      assert.equal(trade.pnlPct, -1, 'a $10 loss on $1,000 is -1%');
+      assert.equal(trade.outcome, 'decayed');
+    });
+  });
+
+  await check('total return tracks the balance, not the win count', async () => {
+    await withLedger(5, async (ledger) => {
+      for (const [id, gross, gas] of [
+        ['a', 30, 2],
+        ['b', 0, 5],
+        ['c', 27, 2],
+      ] as const) {
+        ledger.open(opportunity({ id }), `route-${id}`, 0);
+        const due = ledger.due('base');
+        const entry = due[due.length - 1];
+        assert.ok(entry);
+        await ledger.settle(entry, { actualGrossUsd: gross, gasCostUsd: gas, quoted: true });
+      }
+
+      // 28 - 5 + 25 = 48 on 1,000 = 4.8%.
+      const stats = ledger.stats();
+      assert.equal(stats.netUsd, 48);
+      assert.equal(stats.capitalUsd, 1_048);
+      assert.equal(stats.returnPct, 4.8);
+    });
+  });
+
+  await check('the balance survives a restart exactly', async () => {
+    await withLedger(5, async (ledger, path) => {
+      for (const [id, gross] of [
+        ['a', 9],
+        ['b', 0.5],
+        ['c', 20],
+      ] as const) {
+        ledger.open(opportunity({ id }), `route-${id}`, 0);
+        const due = ledger.due('base');
+        const entry = due[due.length - 1];
+        assert.ok(entry);
+        await ledger.settle(entry, { actualGrossUsd: gross, gasCostUsd: 2, quoted: true });
+      }
+
+      const before = ledger.stats();
+      const reloaded = new PaperLedger(path, 5, START_CAPITAL);
+      await reloaded.load();
+
+      assert.equal(reloaded.capital, before.capitalUsd, 'balance must reload identically');
+      assert.equal(reloaded.stats().returnPct, before.returnPct);
+      assert.equal(reloaded.stats().capitalUsd, 1_023.5);
+    });
+  });
+
+  await check('an exhausted account reports insolvency', async () => {
+    // A $20 account cannot absorb a $25 loss.
+    await withLedger(
+      5,
+      async (ledger) => {
+        ledger.open(opportunity(), 'r', 0);
+        const [entry] = ledger.due('base');
+        assert.ok(entry);
+        const trade = await ledger.settle(entry, {
+          actualGrossUsd: 0,
+          gasCostUsd: 25,
+          quoted: false,
+        });
+
+        assert.equal(trade.capitalAfterUsd, -5);
+        assert.equal(ledger.solvent, false, 'a negative balance cannot pay gas');
+      },
+      20,
+    );
+  });
+
+  await check('every trade carries the token path for alerting', async () => {
+    await withLedger(5, async (ledger) => {
+      ledger.open(opportunity(), 'r', 0);
+      const [entry] = ledger.due('base');
+      assert.ok(entry);
+      const trade = await ledger.settle(entry, {
+        actualGrossUsd: 9,
+        gasCostUsd: 2,
+        quoted: true,
+      });
+
+      // The fixture route is USDC -> WETH -> USDC.
+      assert.equal(trade.tokenPath, 'USDC -> WETH -> USDC');
+    });
+  });
+
+  await check('an empty leg list still yields a usable token label', () => {
+    assert.equal(describeTokenPath([], 'WETH'), 'WETH');
   });
 
   // ── settlement primitive ──────────────────────────────────────────────────
