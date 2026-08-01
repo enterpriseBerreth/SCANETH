@@ -103,15 +103,19 @@ class Arbo {
       return;
     }
 
-    await this.notifier.startup(
-      this.runtimes.map((r) => r.name),
-      this.config.mode,
-    );
+    // Startup is logged, not alerted. Every message in the Telegram stream is
+    // meant to be a settled trade with a realised P&L, so a redeploy must not
+    // inject a message that has no trade behind it.
+    log.info('engines started', {
+      chains: this.runtimes.map((r) => r.name),
+      mode: this.config.mode,
+      telegram: this.notifier.isEnabled ? 'enabled' : 'disabled',
+    });
 
-    // Verify messaging before trading rather than discovering at the first fill
-    // that alerts were never arriving. A failure here is logged loudly but is
-    // deliberately not fatal — the bot's job is to trade, not to message.
-    if (this.notifier.isEnabled) {
+    // Boot-time connectivity probe is opt-in for the same reason. Redeploys are
+    // frequent and this would otherwise be the most common message in the chat.
+    // `npm run telegram:test` is the intended way to verify delivery.
+    if (this.notifier.isEnabled && this.config.telegramTestOnBoot) {
       const ok = await this.notifier.test(this.config.mode, this.paper.capital);
       if (ok) {
         log.info('telegram connected — test alert delivered');
@@ -485,7 +489,10 @@ class Arbo {
           netUsd: Number(opportunity.netProfitUsd.toFixed(4)),
         });
 
-        await this.notifier.opportunity(opportunity, route);
+        // Deliberately not alerted. An alert fires only once a trade has actually
+        // been settled and has a realised P&L attached, so the Telegram stream
+        // stays a record of results rather than a feed of intentions. Detection
+        // is a log-level event.
 
         // In paper mode the candidate is already queued for honest settlement, so
         // there is nothing more to do here. Falling through to the executor would
@@ -667,7 +674,9 @@ class Arbo {
           availableUsd: Number(spread.availableUsd.toFixed(0)),
           note: 'requires pre-funded inventory on both venues — not flash-loanable',
         });
-        await this.notifier.cexSpread(spread);
+        // Not alerted. Engine B never executes, so a CEX spread has no realised
+        // P&L to report; pushing it to Telegram would dilute a stream whose value
+        // depends on every message being a completed trade.
       }
     } catch (err) {
       log.error('cex scan failed', errMeta(err));

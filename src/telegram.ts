@@ -5,7 +5,7 @@
 
 import { createLogger, errMeta } from './logger';
 import type { ArboConfig } from './config';
-import type { ArbOpportunity, CexSpread, ExecutionResult } from './types';
+import type { ExecutionResult } from './types';
 import type { PaperTrade } from './paper';
 
 const log = createLogger('telegram');
@@ -80,30 +80,17 @@ export class Notifier {
     return this.enabled;
   }
 
-  async startup(chains: string[], mode: string): Promise<void> {
-    await this.send(
-      `<b>ARBO online</b>\nmode: <code>${mode}</code>\nchains: <code>${chains.join(', ')}</code>`,
-    );
-  }
-
-  async opportunity(opportunity: ArbOpportunity, route: string): Promise<void> {
-    await this.send(
-      `<b>Arb opportunity</b> — ${opportunity.chain}\n` +
-        `route: <code>${route}</code>\n` +
-        `size: $${opportunity.notionalUsd.toFixed(0)}\n` +
-        `gross: $${opportunity.grossProfitUsd.toFixed(2)}\n` +
-        `gas: $${opportunity.gasCostUsd.toFixed(2)}\n` +
-        `<b>net: $${opportunity.netProfitUsd.toFixed(2)}</b>`,
-    );
-  }
-
+  /**
+   * A completed live trade. Kept deliberately parallel to `paperTrade` so the
+   * alert stream reads identically once real capital is switched on.
+   */
   async executed(result: ExecutionResult, route: string): Promise<void> {
     if (!result.submitted) return;
     const profit = result.realisedProfitUsd ?? 0;
     const heading = profit >= 0 ? 'Arb filled' : 'Arb lost money';
     await this.send(
       `<b>${heading}</b>\n` +
-        `route: <code>${route}</code>\n` +
+        `route: <code>${escapeHtml(route)}</code>\n` +
         `realised: $${profit.toFixed(2)}\n` +
         `gas: $${(result.gasSpentUsd ?? 0).toFixed(2)}\n` +
         (result.txHash ? `tx: <code>${result.txHash}</code>` : ''),
@@ -150,22 +137,19 @@ export class Notifier {
     );
   }
 
-  async cexSpread(spread: CexSpread): Promise<void> {
-    await this.send(
-      `<b>CEX spread</b> — ${spread.symbol}\n` +
-        `buy ${spread.buyVenue} @ ${spread.buyPrice}\n` +
-        `sell ${spread.sellVenue} @ ${spread.sellPrice}\n` +
-        `net: <b>${spread.netBps.toFixed(1)} bps</b> on ~$${spread.availableUsd.toFixed(0)}\n` +
-        `<i>requires pre-funded inventory on both venues</i>`,
-    );
-  }
-
+  /**
+   * Operational failure. Not a trade, but the one exception worth interrupting
+   * for: a bot that has stopped trading looks identical to a quiet market, and
+   * silently discovering that days later is worse than one extra message.
+   */
   async halted(reason: string): Promise<void> {
-    await this.send(`<b>ARBO halted</b>\nreason: <code>${reason}</code>`);
+    await this.send(`<b>ARBO halted</b>\nreason: <code>${escapeHtml(reason)}</code>`);
   }
 
   async error(scope: string, message: string): Promise<void> {
-    await this.send(`<b>ARBO error</b> [${scope}]\n<code>${escapeHtml(message.slice(0, 500))}</code>`);
+    await this.send(
+      `<b>ARBO error</b> [${escapeHtml(scope)}]\n<code>${escapeHtml(message.slice(0, 500))}</code>`,
+    );
   }
 }
 

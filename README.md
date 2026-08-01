@@ -66,15 +66,17 @@ Worth being clear about what the balance is and is not. Flash loans are uncollat
 
 ### Alerts
 
-With `TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID` set, an alert is sent after **every settled trade** — reporting token, PNL $, PNL %, and capital before and after.
+With `TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID` set, **exactly one alert is sent per settled trade** — token, PNL $, PNL %, and capital before and after.
 
-Losses are included on purpose. An alert stream showing only fills would misstate the strategy, because gas on a decayed edge is a real debit that a live account would genuinely have paid. Verify delivery before relying on it:
+Nothing else is alerted. Startup, detected opportunities and CEX spreads are logs, not messages, because the stream is only useful if every entry is a completed trade with a realised P&L behind it. The single exception is an operational halt: a bot that has stopped trading looks exactly like a quiet market, and finding that out days later is worse than one extra message.
+
+Losses are included on purpose. Gas on a decayed edge is a real debit a live account would genuinely have paid, and a feed of wins only would misstate the strategy. Verify delivery before relying on it:
 
 ```bash
 npm run telegram:test
 ```
 
-That sends a connectivity check followed by a sample trade alert in the exact production format, and exits non-zero if Telegram refused either. Note that Telegram will not deliver to a chat that has never contacted the bot, so send it `/start` once first.
+That sends a connectivity check followed by a sample trade in the exact production format, and exits non-zero if Telegram refused either. Note that Telegram will not deliver to a chat that has never contacted the bot, so send it `/start` once first.
 
 ### Persistence
 

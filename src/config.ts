@@ -70,6 +70,12 @@ export interface ArboConfig {
   paperLedgerPath: string;
   /** Simulated starting balance. Paper P&L compounds against this. */
   paperStartingCapitalUsd: number;
+  /**
+   * Send a connectivity probe on boot. Off by default: the alert stream is meant
+   * to contain settled trades only, and redeploys are frequent enough that this
+   * would otherwise dominate it. Use `npm run telegram:test` instead.
+   */
+  telegramTestOnBoot: boolean;
   /** How long a paper candidate is held before being re-quoted and booked. */
   paperSettleDelayMs: number;
   /** Cadence for the cumulative report and market-conditions rollup. */
@@ -157,6 +163,7 @@ export function loadConfig(): ArboConfig {
 
     paperLedgerPath: str('PAPER_LEDGER_PATH', './data/paper-trades.jsonl'),
     paperStartingCapitalUsd: num('PAPER_STARTING_CAPITAL_USD', 1_000),
+    telegramTestOnBoot: bool('TELEGRAM_TEST_ON_BOOT', false),
     // Held long enough to capture real edge decay. Detection to inclusion in
     // practice spans signing, propagation and at least one block, so settling
     // instantly would measure nothing and report a fill rate near 100%.
