@@ -95,6 +95,20 @@ export interface ArboConfig {
   slippageBps: number;
   /** Pools holding less than this are treated as dead and excluded entirely. */
   minPoolLiquidityUsd: number;
+  /**
+   * The same floor, for pools whose invariant is flat near the peg: Curve
+   * stableswap and Solidly stable pools.
+   *
+   * The floor exists to bound price impact, and price impact is a property of
+   * the curve, not of the TVL. A constant-product pool moves roughly `size/
+   * reserves`, so a $200 trade needs ~$20k of depth to stay inside 100 bps. A
+   * stableswap pool at the peg is about an order of magnitude flatter for the
+   * same notional, so holding it to the volatile number deletes pools that are
+   * in fact deep enough — which is exactly what was happening: production
+   * enumerated zero triangles while a local run with the same code enumerated
+   * 576.
+   */
+  minStablePoolLiquidityUsd: number;
 
   /** Where the paper-trading ledger is appended, as newline-delimited JSON. */
   paperLedgerPath: string;
@@ -247,6 +261,7 @@ export function loadConfig(): ArboConfig {
     // them costs more than they hold, so they sit at arbitrary prices and generate
     // phantom edges of 100%+. Excluding them is what makes the edge numbers real.
     minPoolLiquidityUsd: num('MIN_POOL_LIQUIDITY_USD', 25_000),
+    minStablePoolLiquidityUsd: num('MIN_STABLE_POOL_LIQUIDITY_USD', 2_500),
 
     paperLedgerPath: str('PAPER_LEDGER_PATH', './data/paper-trades.jsonl'),
     paperStartingCapitalUsd: num('PAPER_STARTING_CAPITAL_USD', 1_000),

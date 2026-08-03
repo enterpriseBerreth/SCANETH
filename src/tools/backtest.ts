@@ -40,6 +40,7 @@ import {
   filterV3ByDepth,
   v2LiquidityUsd,
   solidlyLiquidityUsd,
+  liquidityFloorFor,
   type PoolSet,
 } from '../onchain/dex';
 import { PriceOracle } from '../onchain/prices';
@@ -222,11 +223,16 @@ async function runSample(
     // quotes an enormous phantom edge that live would never have seen, and the
     // report ends up describing a bot that does not exist.
     const priceOf = (t: TokenInfo): number => oracle.usd(t);
-    const floor = config.minPoolLiquidityUsd;
+    const floors = {
+      volatileUsd: config.minPoolLiquidityUsd,
+      stableUsd: config.minStablePoolLiquidityUsd,
+    };
     const scanPools: PoolSet = {
-      v2: pools.v2.filter((p) => v2LiquidityUsd(p, priceOf) >= floor),
+      v2: pools.v2.filter((p) => v2LiquidityUsd(p, priceOf) >= liquidityFloorFor(p, floors)),
       v3: pools.v3,
-      solidly: pools.solidly.filter((p) => solidlyLiquidityUsd(p, priceOf) >= floor),
+      solidly: pools.solidly.filter(
+        (p) => solidlyLiquidityUsd(p, priceOf) >= liquidityFloorFor(p, floors),
+      ),
       curve: pools.curve,
     };
 

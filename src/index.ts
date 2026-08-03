@@ -26,6 +26,7 @@ import {
   solidlyLiquidityUsd,
   v2LiquidityUsd,
   allPools,
+  liquidityFloorFor,
   type PoolSet,
 } from './onchain/dex';
 import { PriceOracle } from './onchain/prices';
@@ -252,19 +253,28 @@ class Arbo {
 
         // V2 depth is re-evaluated every scan from fresh reserves, so the master
         // list is left intact here and only reported.
+        const startupFloors = {
+          volatileUsd: this.config.minPoolLiquidityUsd,
+          stableUsd: this.config.minStablePoolLiquidityUsd,
+        };
         const v2Active = pools.v2.filter(
-          (p) => v2LiquidityUsd(p, priceOf) >= this.config.minPoolLiquidityUsd,
+          (p) => v2LiquidityUsd(p, priceOf) >= liquidityFloorFor(p, startupFloors),
+        ).length;
+        const solidlyActive = pools.solidly.filter(
+          (p) => solidlyLiquidityUsd(p, priceOf) >= liquidityFloorFor(p, startupFloors),
         ).length;
 
         log.info('liquidity filter applied', {
           chain: chainName,
           minLiquidityUsd: this.config.minPoolLiquidityUsd,
+          minStableLiquidityUsd: this.config.minStablePoolLiquidityUsd,
           v2Active: `${v2Active}/${pools.v2.length}`,
+          solidlyActive: `${solidlyActive}/${pools.solidly.length}`,
           v3Kept: `${pools.v3.length}/${pools.v3.length + dropped}`,
           nativeUsd: Number(oracle.nativeUsd().toFixed(2)),
         });
 
-        if (v2Active + pools.v3.length === 0) {
+        if (v2Active + solidlyActive + pools.v3.length + pools.curve.length === 0) {
           log.warn('every pool was below the liquidity floor, skipping chain', {
             chain: chainName,
             minLiquidityUsd: this.config.minPoolLiquidityUsd,
@@ -449,15 +459,25 @@ class Arbo {
       // Derive this pass's working set from live prices. Dead pools are excluded
       // per-scan rather than destroyed, so they rejoin automatically if depth
       // returns.
-      const floor = this.config.minPoolLiquidityUsd;
+      //
+      // The floor is per-curve, not global. A flat-invariant pool absorbs the
+      // same notional on roughly a tenth of the depth, and holding it to the
+      // constant-product number was deleting the stable pools that the cheapest
+      // cycles are built from.
+      const floors = {
+        volatileUsd: this.config.minPoolLiquidityUsd,
+        stableUsd: this.config.minStablePoolLiquidityUsd,
+      };
+      const priceOf = (t: TokenInfo): number => runtime.oracle.usd(t);
       const scanPools: PoolSet = {
         v2: runtime.pools.v2.filter(
-          (p) => v2LiquidityUsd(p, (t) => runtime.oracle.usd(t)) >= floor,
+          (p) => v2LiquidityUsd(p, priceOf) >= liquidityFloorFor(p, floors),
         ),
         v3: runtime.pools.v3,
-        // Solidly pools carry reserves like V2, so the same depth floor applies.
+        // Solidly pools carry reserves like V2, so the same measurement applies —
+        // but a stable pool is held to the stable floor.
         solidly: runtime.pools.solidly.filter(
-          (p) => solidlyLiquidityUsd(p, (t) => runtime.oracle.usd(t)) >= floor,
+          (p) => solidlyLiquidityUsd(p, priceOf) >= liquidityFloorFor(p, floors),
         ),
         // Curve holds no cached reserves here — depth is only knowable from an
         // on-chain read, so filtering locally would either be a guess or a lie.

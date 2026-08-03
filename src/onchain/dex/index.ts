@@ -44,6 +44,34 @@ export function allPools(pools: PoolSet): Pool[] {
   return [...pools.v2, ...pools.v3, ...pools.solidly, ...pools.curve];
 }
 
+/** Depth floors, split by how steeply the pool's curve responds to size. */
+export interface LiquidityFloors {
+  /** Constant-product and concentrated pools. */
+  volatileUsd: number;
+  /** Stableswap and Solidly stable pools, whose curve is flat near the peg. */
+  stableUsd: number;
+}
+
+/**
+ * True when a pool prices on a flat invariant rather than a constant product.
+ *
+ * This is deliberately a property of the *curve*, not of the token symbols. A
+ * Uniswap V2 USDC/DAI pool holds two stablecoins but still prices on x*y=k, so
+ * it slips exactly like a volatile pool and gets no discount. A Solidly stable
+ * pool or a Curve stableswap pool uses an invariant engineered to stay flat
+ * near parity, which is precisely the property that lets a smaller pool absorb
+ * the same notional without generating a phantom edge.
+ */
+export function isFlatCurvePool(pool: Pool): boolean {
+  if (pool.kind === 'curve') return true;
+  return pool.kind === 'solidly' && pool.stable;
+}
+
+/** The depth a given pool must hold to be worth quoting this pass. */
+export function liquidityFloorFor(pool: Pool, floors: LiquidityFloors): number {
+  return isFlatCurvePool(pool) ? floors.stableUsd : floors.volatileUsd;
+}
+
 /** Resolve the chain's configured symbol pairs into token pairs. */
 function resolvePairs(ctx: ChainContext): Array<[TokenInfo, TokenInfo]> {
   const pairs: Array<[TokenInfo, TokenInfo]> = [];
