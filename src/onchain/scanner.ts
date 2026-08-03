@@ -144,6 +144,8 @@ export interface ScanDiagnostics {
   quotesFetched: number;
   bestEdgeBps: number | null;
   bestEdgeRoute: string | null;
+  /** Best edge seen per route this pass, so quiet pairs stay visible. */
+  edgeByRoute: Map<string, number>;
 }
 
 function newDiagnostics(): ScanDiagnostics {
@@ -160,6 +162,7 @@ function newDiagnostics(): ScanDiagnostics {
     quotesFetched: 0,
     bestEdgeBps: null,
     bestEdgeRoute: null,
+    edgeByRoute: new Map(),
   };
 }
 
@@ -191,6 +194,13 @@ function recordEdge(diag: ScanDiagnostics, edge: number, route: string): void {
     diag.bestEdgeBps = bps;
     diag.bestEdgeRoute = route;
   }
+
+  // Per-route bests as well as the chain-wide best. Without this a single busy
+  // pair owns the headline number on every block and every other pair is
+  // invisible — which is exactly how a thin-but-profitable stable route would
+  // get overlooked in favour of a WETH pair that is merely the most active.
+  const prior = diag.edgeByRoute.get(route);
+  if (prior === undefined || bps > prior) diag.edgeByRoute.set(route, bps);
 }
 
 // ── leg construction ────────────────────────────────────────────────────────
@@ -324,10 +334,19 @@ function legSpotRate(leg: RouteLeg): number {
 }
 
 /** Product of spot rates around a cycle. Above 1 means a spot-level edge exists. */
-function cycleSpotEdge(legs: RouteLeg[]): number {
+function cycleSpotEdge(legs: RouteLeg[], curveRates?: Map<string, number>): number {
   let edge = 1;
   for (const leg of legs) {
-    const rate = legSpotRate(leg);
+    // Curve has no local pricing model we trust, so its rate comes from the
+    // pre-quoted batch rather than from reserves. A curve leg with no entry is
+    // unpriceable this pass and kills the cycle rather than defaulting to
+    // something optimistic.
+    const rate =
+      leg.kind === 'curve'
+        ? leg.pool
+          ? (curveRates?.get(curveLegKey(leg.pool, leg.tokenIn)) ?? 0)
+          : 0
+        : legSpotRate(leg);
     if (rate <= 0) return 0;
     edge *= rate;
   }
@@ -335,6 +354,72 @@ function cycleSpotEdge(legs: RouteLeg[]): number {
 }
 
 // ── phase 1: screening prices ───────────────────────────────────────────────
+
+/** Directional key for a pre-quoted Curve rate: one pool, one input token. */
+function curveLegKey(poolAddress: string, tokenIn: TokenInfo): string {
+  return `${poolAddress.toLowerCase()}|${tokenIn.address.toLowerCase()}`;
+}
+
+/**
+ * Quote every Curve pool in both directions in a single batched call.
+ *
+ * This exists to let Curve participate in triangular search. That search is
+ * cubic in pool count, so anything needing a round-trip per candidate leg is
+ * unaffordable — which is why Curve was excluded from it originally. Paying for
+ * all directions up front turns that per-candidate RPC cost into one fixed
+ * multicall per scan, after which Curve legs price from memory exactly like V2
+ * reserves do.
+ *
+ * The economics justify the extra call: Curve stable pools charge 1-4 bps
+ * against the 30 bps a V2 pool takes, and a three-leg cycle pays its fee three
+ * times. That is the difference between a round trip that needs a 90 bps
+ * dislocation to break even and one that needs about 10.
+ */
+async function curveSpotRates(
+  scan: ScanContext,
+  pools: CurvePool[],
+): Promise<Map<string, number>> {
+  const rates = new Map<string, number>();
+  if (pools.length === 0) return rates;
+
+  const requests: Array<{
+    pool: CurvePool;
+    aToB: boolean;
+    amountIn: bigint;
+    tokenIn: TokenInfo;
+    tokenOut: TokenInfo;
+  }> = [];
+
+  for (const pool of pools) {
+    for (const aToB of [true, false]) {
+      const tokenIn = aToB ? pool.tokenA : pool.tokenB;
+      const tokenOut = aToB ? pool.tokenB : pool.tokenA;
+      const price = scan.oracle.usd(tokenIn);
+      if (price <= 0) continue;
+      const amountIn = toBigInt(scan.config.minTradeUsd / price, tokenIn.decimals);
+      if (amountIn <= 0n) continue;
+      requests.push({ pool, aToB, amountIn, tokenIn, tokenOut });
+    }
+  }
+  if (requests.length === 0) return rates;
+
+  const quotes = await quoteCurveBatch(
+    scan.ctx,
+    requests.map((r) => ({ pool: r.pool, aToB: r.aToB, amountIn: r.amountIn })),
+  );
+
+  for (let i = 0; i < requests.length; i += 1) {
+    const req = requests[i];
+    const amountOut = quotes[i];
+    if (!req || amountOut === undefined || amountOut <= 0n) continue;
+    const inFloat = Number(req.amountIn) / 10 ** req.tokenIn.decimals;
+    const outFloat = Number(amountOut) / 10 ** req.tokenOut.decimals;
+    if (inFloat <= 0 || outFloat <= 0) continue;
+    rates.set(curveLegKey(req.pool.pool, req.tokenIn), outFloat / inFloat);
+  }
+
+  return rates;
+}
 
 /** Fee-adjusted units of tokenOut per unit of tokenIn, from cached V2 reserves. */
 function v2ScreenPrice(pool: V2Pool, tokenIn: TokenInfo): number {
@@ -1002,27 +1087,45 @@ async function scanPair(
   return opportunities;
 }
 
-// ── triangular scanning (V2 only, fully local) ──────────────────────────────
+// ── triangular scanning (locally-priced venues) ─────────────────────────────
 
 /**
- * Triangular cycles across V2 pools: base -> mid -> far -> base.
+ * Triangular cycles: base -> mid -> far -> base.
  *
- * Restricted to V2 because those are priced from cached reserves, making the
- * whole search free. Extending it to V3 would multiply quote traffic by the
- * number of triples, which is not worth it at this stage.
+ * Enumeration is cubic in pool count, so it is restricted to pools that can be
+ * priced in-process. V2 and Solidly qualify natively — both are exact local
+ * integer math. Curve qualifies by proxy: its pools are few enough that every
+ * direction can be quoted in one batched call before the loops start, after
+ * which its legs cost nothing to screen. V3 is still excluded; there are far
+ * too many pools for that trick to stay cheap.
+ *
+ * Including Curve matters because a triangle pays three fees. Three V2 legs
+ * need a 90 bps dislocation before they break even, which effectively never
+ * happens on a liquid pair. Three stable-pool legs need roughly 10.
  */
 async function scanTriangular(
   scan: ScanContext,
   baseToken: TokenInfo,
   diag: ScanDiagnostics,
 ): Promise<ArbOpportunity[]> {
-  // Triangular enumeration is cubic in pool count, so it is restricted to pools
-  // that can be priced in-process for free. Solidly qualifies alongside V2: both
-  // are exact local integer math. V3 and Curve are excluded on purpose — each
-  // triple would cost an RPC round-trip just to be screened, and at cubic volume
-  // that would consume the entire scan budget before finding anything.
-  const local: Array<V2Pool | SolidlyPool> = [...scan.pools.v2, ...scan.pools.solidly];
+  const local: Array<V2Pool | SolidlyPool | CurvePool> = [
+    ...scan.pools.v2,
+    ...scan.pools.solidly,
+    ...scan.pools.curve,
+  ];
   if (local.length < 3) return [];
+
+  // One batched call, before any enumeration, so Curve legs price from memory.
+  // Failing here degrades to the previous behaviour rather than the scan: with
+  // an empty map every Curve leg scores zero and its cycles drop out.
+  let curveRates = new Map<string, number>();
+  if (scan.pools.curve.length > 0) {
+    try {
+      curveRates = await curveSpotRates(scan, scan.pools.curve);
+    } catch (err) {
+      log.debug('curve spot pre-quote failed', { anchor: baseToken.symbol, ...errMeta(err) });
+    }
+  }
 
   const opportunities: ArbOpportunity[] = [];
   const firstHops = local.filter((p) => poolHasToken(p, baseToken));
@@ -1052,8 +1155,13 @@ async function scanTriangular(
         ];
 
         diag.trianglesEnumerated += 1;
-        const edge = cycleSpotEdge(legs);
-        recordEdge(diag, edge, `${baseToken.symbol}>${mid.symbol}>${far.symbol}`);
+        const edge = cycleSpotEdge(legs, curveRates);
+        recordEdge(
+          diag,
+          edge,
+          `${baseToken.symbol}>${mid.symbol}>${far.symbol} ` +
+            `${firstPool.venueId}>${secondPool.venueId}>${thirdPool.venueId}`,
+        );
 
         // Cheap gate. Triangular enumeration is cubic in pool count, so running
         // the full optimal-sizing search on every triple would dominate the scan

@@ -25,6 +25,15 @@ export interface ChainContext {
   /** Deployed ArboFlashArb address, when available. */
   contractAddress?: string;
   multicall: Contract;
+  /**
+   * Pins every batched read to a historical block.
+   *
+   * Set only by the backtester. Because all quoting funnels through `multicall`,
+   * this one field makes an entire scan replay against past state — the same
+   * code path, the same adapters, the same profit math, just answered by the
+   * chain as it was. Nothing in the live path sets it.
+   */
+  blockTag?: number;
 }
 
 export function createChainContext(config: ArboConfig, chain: ChainConfig): ChainContext {
@@ -110,9 +119,10 @@ async function executeChunk(
 
   try {
     const aggregate3 = ctx.multicall.getFunction('aggregate3');
-    const raw = (await aggregate3.staticCall(payload)) as Array<
-      [boolean, string] | { success: boolean; returnData: string }
-    >;
+    const raw = (await aggregate3.staticCall(
+      payload,
+      ctx.blockTag === undefined ? {} : { blockTag: ctx.blockTag },
+    )) as Array<[boolean, string] | { success: boolean; returnData: string }>;
 
     const decoded: CallResult[] = [];
     for (const entry of raw) {

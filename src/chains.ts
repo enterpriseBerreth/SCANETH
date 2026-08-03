@@ -339,6 +339,12 @@ const OPTIMISM_TOKENS: TokenInfo[] = [
   { symbol: 'OP', address: '0x4200000000000000000000000000000000000042', decimals: 18, usdHint: 1.5 },
   { symbol: 'wstETH', address: '0x1F32b1c2345538c0c6f582fCB022739c4A194Ebb', decimals: 18, usdHint: 3600 },
   { symbol: 'VELO', address: '0x9560e827aF36c94D2Ac33a39bCE1Fe78631088Db', decimals: 18, usdHint: 0.05 },
+  // Curve's own stablecoin, here for a specific structural reason: it is quoted
+  // against USDC, USDT and USDC.e in three separate Curve pools *and* on Uniswap
+  // V3's 1 bp tier. Those are the cheapest round trips in this bot — roughly
+  // 2-5 bps versus the 10-60 bps a WETH pair costs — and a low fee floor is the
+  // only regime where a few bps of dislocation survives its own fees.
+  { symbol: 'crvUSD', address: '0xC52D7F23a2e460248Db6eE192Cb23dD12bDDCbf6', decimals: 18, usdHint: 1, stable: true },
 ];
 
 const OPTIMISM: ChainConfig = {
@@ -380,6 +386,29 @@ const OPTIMISM: ChainConfig = {
       factory: '0x0c3c1c532F1e39EdF36BE9Fe0bE1410313E074Bf',
       feeBps: 30,
     },
+    {
+      id: 'curve',
+      label: 'Curve',
+      kind: 'curve',
+      router: '0x0000000000000000000000000000000000000000',
+      factory: '0x0000000000000000000000000000000000000000',
+      feeBps: 4,
+      // All three verified live: `coins()` resolves and `get_dy()` answers.
+      //
+      // These three pools all quote crvUSD against a different dollar, which is
+      // what makes them interesting together rather than individually. At the
+      // time of writing crvUSD fetched 0.999264 USDC in one and 1.000110 USDT in
+      // another — the same asset, an 85 bps disagreement, and both legs costing
+      // ~4 bps to cross. That is the shape of trade this chain was added for.
+      curvePools: [
+        // crvUSD/USDC
+        '0x03771e24b7C9172d163Bf447490B142a15be3485',
+        // crvUSD/USDT
+        '0xD1b30BA128573fcd7D141C8A987961b40e047BB6',
+        // crvUSD/USDC.e
+        '0x05FA06D4Fb883F67f1cfEA0889edBff9e8358101',
+      ],
+    },
   ],
   pairs: [
     ['WETH', 'USDC'],
@@ -398,6 +427,12 @@ const OPTIMISM: ChainConfig = {
     ['WETH', 'wstETH'],
     ['WETH', 'VELO'],
     ['USDC', 'VELO'],
+    // The low-fee set. Every one of these crosses at 1-5 bps per leg rather than
+    // 30, which is the whole reason they are worth quoting.
+    ['USDC', 'crvUSD'],
+    ['USDT', 'crvUSD'],
+    ['USDCe', 'crvUSD'],
+    ['USDCe', 'USDT'],
   ],
 };
 
