@@ -24,6 +24,20 @@ function optionalStr(key: string): string | undefined {
   return raw.trim();
 }
 
+/** First non-empty candidate wins; later duplicates are dropped. */
+function dedupe(urls: Array<string | undefined>): string[] {
+  const seen = new Set<string>();
+  const out: string[] = [];
+  for (const url of urls) {
+    if (!url) continue;
+    const key = url.trim();
+    if (key === '' || seen.has(key)) continue;
+    seen.add(key);
+    out.push(key);
+  }
+  return out;
+}
+
 function num(key: string, fallback: number): number {
   const raw = optionalStr(key);
   if (raw === undefined) return fallback;
@@ -55,10 +69,22 @@ export interface ArboConfig {
   mode: Mode;
   chains: ChainName[];
   rpcUrls: Record<ChainName, string>;
+  /**
+   * Ordered `eth_getLogs` endpoint candidates per chain. Kept apart from
+   * `rpcUrls` because free providers commonly serve `eth_call` while refusing
+   * `eth_getLogs`; the tracker walks this list until one answers.
+   */
+  logsRpcUrls: Record<ChainName, string[]>;
   /** Optional wss:// endpoints; enables block-triggered scanning per chain. */
   wsUrls: Partial<Record<ChainName, string>>;
   /** Fallback block-polling cadence, used when a chain has no WebSocket URL. */
   blockPollIntervalMs: number;
+  /**
+   * Ceiling on how many blocks a screen price may be reused for a pool that
+   * shows no log activity. Bounds the damage from any state change that does not
+   * emit an event the activity filter observes.
+   */
+  maxCleanBlocks: number;
   privateSubmitRpcUrl?: string;
   contractAddresses: Partial<Record<ChainName, string>>;
   executorPrivateKey?: string;
@@ -150,6 +176,33 @@ export function loadConfig(): ArboConfig {
   if (arbWs) wsUrls.arbitrum = arbWs;
   if (ethWs) wsUrls.ethereum = ethWs;
 
+  // Log endpoints are tracked separately from the main RPC because `eth_getLogs`
+  // is the first method free providers ration. PublicNode, for one, serves quotes
+  // happily and answers getLogs with a flat 403, which silently disables
+  // dirty-pool tracking. These candidates are tried in order until one responds,
+  // so a rationed main RPC costs nothing beyond one failed request at startup.
+  const logsRpcUrls: Record<ChainName, string[]> = {
+    base: dedupe([
+      optionalStr('BASE_LOGS_RPC_URL'),
+      rpcUrls.base,
+      'https://mainnet.base.org',
+      'https://base.meowrpc.com',
+      'https://1rpc.io/base',
+    ]),
+    arbitrum: dedupe([
+      optionalStr('ARBITRUM_LOGS_RPC_URL'),
+      rpcUrls.arbitrum,
+      'https://arb1.arbitrum.io/rpc',
+      'https://arbitrum.drpc.org',
+    ]),
+    ethereum: dedupe([
+      optionalStr('ETHEREUM_LOGS_RPC_URL'),
+      rpcUrls.ethereum,
+      'https://eth.llamarpc.com',
+      'https://rpc.ankr.com/eth',
+    ]),
+  };
+
   const contractAddresses: Partial<Record<ChainName, string>> = {};
   const baseContract = optionalStr('ARB_CONTRACT_BASE');
   const arbContract = optionalStr('ARB_CONTRACT_ARBITRUM');
@@ -164,11 +217,15 @@ export function loadConfig(): ArboConfig {
     mode: mode as Mode,
     chains: chains as ChainName[],
     rpcUrls,
+    logsRpcUrls,
     wsUrls,
     // Base and Arbitrum both produce blocks faster than this, but polling harder
     // burns request budget on public endpoints for little gain. A WebSocket URL
     // is the real fix; this is the floor.
     blockPollIntervalMs: num('BLOCK_POLL_INTERVAL_MS', 2_000),
+    // ~30s on Base/Arbitrum. Long enough that a quiet pool is genuinely free,
+    // short enough that an unlogged state change cannot persist.
+    maxCleanBlocks: num('MAX_CLEAN_BLOCKS', 15),
     privateSubmitRpcUrl: optionalStr('PRIVATE_SUBMIT_RPC_URL'),
     contractAddresses,
     executorPrivateKey,

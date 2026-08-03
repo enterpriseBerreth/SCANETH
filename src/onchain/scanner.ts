@@ -26,6 +26,7 @@ import { quoteV3Batch, type V3QuoteRequest } from './dex/univ3';
 import { getAmountOutSolidly } from './dex/solidly';
 import { quoteCurveBatch } from './dex/curve';
 import { PriceOracle } from './prices';
+import type { PoolActivityTracker } from './dirty';
 import {
   bestFromLadder,
   gasCostUsd,
@@ -67,6 +68,48 @@ export interface ScanContext {
   oracle: PriceOracle;
   config: ArboConfig;
   gasPriceWei: bigint;
+  /**
+   * Block this pass is quoting against. Used to age screen-price cache entries;
+   * zero disables dirty-pool reuse and every pool is re-quoted.
+   */
+  block?: number;
+  /** Log-derived pool activity. Absent means "assume everything changed". */
+  activity?: PoolActivityTracker;
+  /** Survives between passes; holds screen prices for pools that did not trade. */
+  screenCache?: ScreenPriceCache;
+}
+
+/**
+ * Screen prices for pools that have not traded since they were last quoted.
+ *
+ * Only the *screening* rate is cached — the cheap first-pass number used to
+ * decide whether a pair is worth looking at. Confirmation always re-quotes at
+ * the real trade size, and execution always re-simulates, so a stale entry can
+ * cost a wasted confirmation but can never reach a transaction.
+ *
+ * Keyed by pool and input token because a pool's forward and reverse rates are
+ * separate measurements; the whole point of quoting both is that one is not the
+ * reciprocal of the other.
+ */
+export class ScreenPriceCache {
+  private readonly prices = new Map<string, number>();
+
+  private static key(pool: string, tokenIn: TokenInfo): string {
+    return `${pool.toLowerCase()}:${tokenIn.address.toLowerCase()}`;
+  }
+
+  get(pool: string, tokenIn: TokenInfo): number | undefined {
+    return this.prices.get(ScreenPriceCache.key(pool, tokenIn));
+  }
+
+  set(pool: string, tokenIn: TokenInfo, price: number): void {
+    if (!(price > 0) || !Number.isFinite(price)) return;
+    this.prices.set(ScreenPriceCache.key(pool, tokenIn), price);
+  }
+
+  get size(): number {
+    return this.prices.size;
+  }
 }
 
 /**
@@ -95,6 +138,10 @@ export interface ScanDiagnostics {
   trianglesEnumerated: number;
   /** Venue quotes discarded as implausible against the oracle — dead/broken pools. */
   quotesImplausible: number;
+  /** Screen quotes served from cache because the pool had not traded. */
+  quotesReused: number;
+  /** Screen quotes that actually hit the network this pass. */
+  quotesFetched: number;
   bestEdgeBps: number | null;
   bestEdgeRoute: string | null;
 }
@@ -109,6 +156,8 @@ function newDiagnostics(): ScanDiagnostics {
     cyclesUnprofitable: 0,
     trianglesEnumerated: 0,
     quotesImplausible: 0,
+    quotesReused: 0,
+    quotesFetched: 0,
     bestEdgeBps: null,
     bestEdgeRoute: null,
   };
@@ -693,6 +742,62 @@ async function assembleOpportunity(
 // ── two-leg cross-venue scanning ────────────────────────────────────────────
 
 /**
+ * Does this pool need a fresh network quote, or will the cached one do?
+ *
+ * Answers "yes" for anything not provably unchanged: no tracker, no cache, a
+ * tracker reporting the pool as touched, or a missing cache entry in either
+ * direction. Both directions are required together because the pair is screened
+ * on their product.
+ */
+function needsScreen(
+  scan: ScanContext,
+  pool: Pool,
+  baseToken: TokenInfo,
+  counterToken: TokenInfo,
+): boolean {
+  const { activity, screenCache, block } = scan;
+  if (!activity || !screenCache || !block) return true;
+  if (activity.needsRequote(pool.pool, block)) return true;
+  if (screenCache.get(pool.pool, baseToken) === undefined) return true;
+  if (screenCache.get(pool.pool, counterToken) === undefined) return true;
+  return false;
+}
+
+function cachedScreen(scan: ScanContext, pool: Pool, tokenIn: TokenInfo): number {
+  return scan.screenCache?.get(pool.pool, tokenIn) ?? 0;
+}
+
+/**
+ * Store freshly-quoted screen prices and mark their pools clean.
+ *
+ * A pool is only marked clean when both directions came back. Marking a
+ * half-quoted pool clean would make it look cached forever while having nothing
+ * usable to serve, so it would silently drop out of every future scan.
+ */
+function absorbScreenQuotes(
+  scan: ScanContext,
+  pools: Pool[],
+  baseToken: TokenInfo,
+  counterToken: TokenInfo,
+  forward: Map<string, number>,
+  reverse: Map<string, number>,
+): void {
+  const { screenCache, activity, block } = scan;
+  if (!screenCache) return;
+
+  for (const pool of pools) {
+    const id = poolId(pool);
+    const fwd = forward.get(id);
+    const rev = reverse.get(id);
+    if (!(fwd && fwd > 0) || !(rev && rev > 0)) continue;
+
+    screenCache.set(pool.pool, baseToken, fwd);
+    screenCache.set(pool.pool, counterToken, rev);
+    if (activity && block) activity.noteQuoted(pool.pool, block);
+  }
+}
+
+/**
  * Classic flash-loan arbitrage: borrow the base token, sell it where it fetches
  * the most of the counter token, buy it back where it is cheapest, repay.
  */
@@ -732,6 +837,17 @@ async function scanPair(
     const v3Pools = candidates.filter((p): p is V3Pool => p.kind === 'univ3');
     const curvePools = candidates.filter((p): p is CurvePool => p.kind === 'curve');
 
+    // Only pools that actually traded need re-quoting. Everything else keeps the
+    // number from the last pass, which is not an approximation — a pool that
+    // emitted no events did not change. See `onchain/dirty.ts` for why this is
+    // safe to rely on and how it fails open.
+    const v3Fresh = v3Pools.filter((p) => needsScreen(scan, p, baseToken, counterToken));
+    const curveFresh = curvePools.filter((p) => needsScreen(scan, p, baseToken, counterToken));
+
+    diag.quotesFetched += (v3Fresh.length + curveFresh.length) * 2;
+    diag.quotesReused +=
+      (v3Pools.length - v3Fresh.length + curvePools.length - curveFresh.length) * 2;
+
     // Both directions are quoted, never derived by reciprocal.
     //
     // The second leg of the cycle trades counter -> base, so it needs a real
@@ -743,31 +859,41 @@ async function scanPair(
     // class of false positive that was consuming the whole confirmation budget.
     let v3Fwd = new Map<string, number>();
     let v3Rev = new Map<string, number>();
-    try {
-      [v3Fwd, v3Rev] = await Promise.all([
-        v3ScreenPrices(scan, v3Pools, baseToken, probeAmountIn),
-        v3ScreenPrices(scan, v3Pools, counterToken, probeCounterIn),
-      ]);
-    } catch (err) {
-      diag.v3ScreenFailures += 1;
-      log.debug('v3 screen failed', { pair: `${tokenX.symbol}/${tokenY.symbol}`, ...errMeta(err) });
+    if (v3Fresh.length > 0) {
+      try {
+        [v3Fwd, v3Rev] = await Promise.all([
+          v3ScreenPrices(scan, v3Fresh, baseToken, probeAmountIn),
+          v3ScreenPrices(scan, v3Fresh, counterToken, probeCounterIn),
+        ]);
+      } catch (err) {
+        diag.v3ScreenFailures += 1;
+        log.debug('v3 screen failed', { pair: `${tokenX.symbol}/${tokenY.symbol}`, ...errMeta(err) });
+      }
     }
 
     // Curve has no local math we trust, so it is probed on-chain exactly like V3.
     let curveFwd = new Map<string, number>();
     let curveRev = new Map<string, number>();
-    try {
-      [curveFwd, curveRev] = await Promise.all([
-        curveScreenPrices(scan, curvePools, baseToken, probeAmountIn),
-        curveScreenPrices(scan, curvePools, counterToken, probeCounterIn),
-      ]);
-    } catch (err) {
-      diag.v3ScreenFailures += 1;
-      log.debug('curve screen failed', {
-        pair: `${tokenX.symbol}/${tokenY.symbol}`,
-        ...errMeta(err),
-      });
+    if (curveFresh.length > 0) {
+      try {
+        [curveFwd, curveRev] = await Promise.all([
+          curveScreenPrices(scan, curveFresh, baseToken, probeAmountIn),
+          curveScreenPrices(scan, curveFresh, counterToken, probeCounterIn),
+        ]);
+      } catch (err) {
+        diag.v3ScreenFailures += 1;
+        log.debug('curve screen failed', {
+          pair: `${tokenX.symbol}/${tokenY.symbol}`,
+          ...errMeta(err),
+        });
+      }
     }
+
+    // Fold fresh quotes into the cache and mark those pools clean. Only pools
+    // that produced *both* directions are marked: a half-quoted pool has no
+    // usable cache entry, so calling it clean would strand it permanently.
+    absorbScreenQuotes(scan, v3Fresh, baseToken, counterToken, v3Fwd, v3Rev);
+    absorbScreenQuotes(scan, curveFresh, baseToken, counterToken, curveFwd, curveRev);
 
     // `forward` is counter-per-base; `reverse` is base-per-counter. Both are
     // measured, so their product is the true round-trip rate.
@@ -783,11 +909,11 @@ async function scanPair(
         forward = solidlyScreenPrice(pool, baseToken, probeAmountIn);
         reverse = solidlyScreenPrice(pool, counterToken, probeCounterIn);
       } else if (pool.kind === 'curve') {
-        forward = curveFwd.get(poolId(pool)) ?? 0;
-        reverse = curveRev.get(poolId(pool)) ?? 0;
+        forward = curveFwd.get(poolId(pool)) ?? cachedScreen(scan, pool, baseToken);
+        reverse = curveRev.get(poolId(pool)) ?? cachedScreen(scan, pool, counterToken);
       } else {
-        forward = v3Fwd.get(poolId(pool)) ?? 0;
-        reverse = v3Rev.get(poolId(pool)) ?? 0;
+        forward = v3Fwd.get(poolId(pool)) ?? cachedScreen(scan, pool, baseToken);
+        reverse = v3Rev.get(poolId(pool)) ?? cachedScreen(scan, pool, counterToken);
       }
       if (forward <= 0 || reverse <= 0) continue;
 

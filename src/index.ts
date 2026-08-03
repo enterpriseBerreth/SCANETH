@@ -25,11 +25,18 @@ import {
   refreshPools,
   solidlyLiquidityUsd,
   v2LiquidityUsd,
+  allPools,
   type PoolSet,
 } from './onchain/dex';
 import { PriceOracle } from './onchain/prices';
 import { BlockWatcher } from './onchain/blocks';
-import { scanChainVerbose, requoteCycle, type ScanDiagnostics } from './onchain/scanner';
+import { PoolActivityTracker } from './onchain/dirty';
+import {
+  scanChainVerbose,
+  requoteCycle,
+  ScreenPriceCache,
+  type ScanDiagnostics,
+} from './onchain/scanner';
 import { describeRoute, executeOpportunity } from './onchain/executor';
 import { estimateRouteGas, flashFee, gasCostUsd, valueUsd } from './onchain/profit';
 import { PaperLedger, type PendingPaperTrade } from './paper';
@@ -58,6 +65,10 @@ interface ChainRuntime {
   trigger?: 'block' | 'poll';
   /** Live block subscription, torn down on shutdown. */
   blockWatcher?: BlockWatcher;
+  /** Log-derived pool activity, so untouched pools are not re-quoted. */
+  activity?: PoolActivityTracker;
+  /** Screen prices carried between passes for pools that did not trade. */
+  screenCache: ScreenPriceCache;
 }
 
 class Arbo {
@@ -269,6 +280,7 @@ class Arbo {
           oracle,
           lastGasPriceWei: 0n,
           lastScanDurationMs: 0,
+          screenCache: new ScreenPriceCache(),
         });
       } catch (err) {
         log.error('chain initialisation failed', { chain: chainName, ...errMeta(err) });
@@ -325,6 +337,21 @@ class Arbo {
 
     runtime.blockWatcher = watcher;
     watcher.start();
+
+    // Watch the pools' own logs so the scanner can tell what actually moved.
+    // Quoted venues (V3, Curve) dominate the scan's RPC bill, and on a typical
+    // block almost none of them traded — re-quoting them all is paying full
+    // price for numbers that did not change.
+    const activity = new PoolActivityTracker({
+      chainName: runtime.name,
+      pools: allPools(runtime.pools).map((p) => p.pool),
+      wsUrl: this.config.wsUrls[runtime.name],
+      logsRpcUrls: this.config.logsRpcUrls[runtime.name],
+      pollIntervalMs: this.config.blockPollIntervalMs,
+      maxCleanBlocks: this.config.maxCleanBlocks,
+    });
+    runtime.activity = activity;
+    activity.start();
   }
 
   private scheduleOnchain(runtime: ChainRuntime, delayMs: number): void {
@@ -445,6 +472,12 @@ class Arbo {
         oracle: runtime.oracle,
         config: this.config,
         gasPriceWei: runtime.lastGasPriceWei,
+        // Stamped from the block that triggered this pass, before any quoting.
+        // Using the block current at quote time instead would let an event that
+        // landed mid-scan mark a stale quote as fresh.
+        block: runtime.lastScanBlock ?? 0,
+        activity: runtime.activity,
+        screenCache: runtime.screenCache,
       };
 
       // Settle before scanning. Pool state was just refreshed, so this is the
@@ -517,6 +550,8 @@ class Arbo {
           cyclesConfirmed: diagnostics.cyclesConfirmed,
           cyclesUnprofitable: diagnostics.cyclesUnprofitable,
           quotesImplausible: diagnostics.quotesImplausible,
+          quotesFetched: diagnostics.quotesFetched,
+          quotesReused: diagnostics.quotesReused,
           bestEdgeBps:
             diagnostics.bestEdgeBps === null
               ? null
@@ -767,6 +802,8 @@ class Arbo {
         curvePools: runtime.pools.curve.length,
         scanTrigger: runtime.trigger ?? 'poll',
         lastScanBlock: runtime.lastScanBlock ?? null,
+        poolActivity: runtime.activity?.stats() ?? null,
+        screenCached: runtime.screenCache.size,
         gasPriceGwei: Number(runtime.lastGasPriceWei) / 1e9,
         prices: runtime.oracle.snapshot(),
         lastScanDurationMs: runtime.lastScanDurationMs,
@@ -792,6 +829,8 @@ class Arbo {
     for (const runtime of this.runtimes) {
       runtime.blockWatcher?.stop();
       runtime.blockWatcher = undefined;
+      runtime.activity?.stop();
+      runtime.activity = undefined;
     }
 
     // Persist the in-flight rollup window. Railway redeploys are routine, and
