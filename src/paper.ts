@@ -35,15 +35,36 @@ import type { ArbOpportunity, ChainName, RouteLeg } from './types';
 const log = createLogger('paper');
 
 /**
- * `filled`  — the edge survived the delay and cleared cost. Booked as a win.
- * `decayed` — the route still quoted, but the edge no longer covered costs. In
- *             live mode this is a reverted transaction: gas lost, principal safe.
- * `dead`    — the route stopped quoting entirely (drained or paused pool).
+ * `filled`   — the edge survived the delay and cleared the on-chain profit
+ *              assertion. Booked as a win.
+ * `reverted` — the transaction would have been sent, but the edge decayed below
+ *              `minProfit` before inclusion. `ArboFlashArb` reverts at that
+ *              point, so the cost is gas only and principal is untouched.
+ * `dead`     — the route stopped quoting entirely (drained or paused pool).
+ *              Also gas-only: the transaction reverts on the first hop.
+ * `skipped`  — expected profit never cleared the floor, so nothing would have
+ *              been broadcast. Recorded for decay statistics; costs nothing and
+ *              must not move the balance.
+ *
+ * `decayed` is retained only so ledger entries written before the revert-aware
+ * accounting model still parse. Nothing produces it now.
  */
-export type PaperOutcome = 'filled' | 'decayed' | 'dead';
+export type PaperOutcome = 'filled' | 'reverted' | 'dead' | 'skipped' | 'decayed';
+
+/**
+ * Accounting model version stamped onto every trade.
+ *
+ * v1 booked the full negative gross on a decayed route. That is a loss the
+ * flash-loan contract makes impossible — it reverts before repaying — so v1
+ * balances understate live performance. Entries below the current version are
+ * kept on disk for reference but are not replayed into the balance.
+ */
+export const LEDGER_MODEL_VERSION = 2;
 
 export interface PaperTrade {
   kind: 'trade';
+  /** Accounting model that produced this row. See LEDGER_MODEL_VERSION. */
+  modelVersion?: number;
   id: string;
   chain: ChainName;
   route: string;
@@ -100,8 +121,11 @@ type LedgerLine = PaperTrade | MarketSample;
 export interface PaperStats {
   trades: number;
   filled: number;
-  decayed: number;
+  /** Sent but reverted on-chain: gas lost, principal safe. */
+  reverted: number;
   dead: number;
+  /** Never broadcast — expected profit was below the floor. */
+  skipped: number;
   /** Fraction of candidates whose edge survived to settlement. */
   fillRate: number;
   grossUsd: number;
@@ -220,12 +244,23 @@ export class PaperLedger {
 
     let trades = 0;
     let skipped = 0;
+    let legacy = 0;
     for (const line of raw.split('\n')) {
       const text = line.trim();
       if (!text) continue;
       try {
         const entry = JSON.parse(text) as LedgerLine;
         if (entry.kind !== 'trade') continue;
+
+        // Rows written under an older accounting model are not replayed into the
+        // balance. v1 booked the full negative gross on a decayed route — a loss
+        // the flash-loan contract reverts before it can occur — so replaying them
+        // would carry a fictional drawdown forward indefinitely.
+        if ((entry.modelVersion ?? 1) < LEDGER_MODEL_VERSION) {
+          legacy += 1;
+          continue;
+        }
+
         this.accumulate(entry);
         trades += 1;
       } catch {
@@ -234,9 +269,20 @@ export class PaperLedger {
       }
     }
 
+    if (legacy > 0) {
+      log.warn('ignored paper trades from an older accounting model', {
+        path: this.path,
+        legacyTrades: legacy,
+        modelVersion: LEDGER_MODEL_VERSION,
+        reason:
+          'v1 booked full gross losses on decayed routes; the contract reverts instead, so those balances were not achievable',
+      });
+    }
+
     log.info('paper ledger loaded', {
       path: this.path,
       trades,
+      legacyIgnored: legacy,
       skippedLines: skipped,
       netUsd: Number(this.totals.netUsd.toFixed(4)),
       capitalUsd: Number(this.capitalUsd.toFixed(4)),
@@ -289,6 +335,21 @@ export class PaperLedger {
   /**
    * Book the outcome of a re-quote. `actualGrossUsd` must come from a fresh
    * quote, never from the detection-time estimate.
+   *
+   * The accounting mirrors what `ArboFlashArb` would actually do on-chain, which
+   * is not the same as "book whatever the re-quote says":
+   *
+   *  - The contract asserts `balance >= owed + minProfit` *before* repaying and
+   *    reverts otherwise. A decayed opportunity therefore never completes at a
+   *    loss — the whole transaction unwinds and the only cost is gas.
+   *  - So a route that has decayed below the profit floor costs `gasCostUsd`,
+   *    not the negative gross. Booking the gross would report a loss the
+   *    contract makes structurally impossible, and would make paper results far
+   *    worse than live trading could ever be.
+   *
+   * Candidates whose *expected* profit never cleared the floor are recorded for
+   * decay statistics but are marked `skipped`: live, no transaction would have
+   * been sent at all, so they must not move the balance.
    */
   async settle(
     entry: PendingPaperTrade,
@@ -297,30 +358,48 @@ export class PaperLedger {
     this.dropPending(entry);
 
     const settledAt = Date.now();
-    const actualNetUsd = result.quoted ? result.actualGrossUsd - result.gasCostUsd : -result.gasCostUsd;
+
+    // The send decision is made on detection-time expectations, because that is
+    // all the bot knows at the moment it would broadcast. Using the settled
+    // number here would be hindsight and would flatter the results.
+    const wouldSend = entry.expectedNetUsd >= this.minProfitUsd;
+
+    // What the on-chain profit assertion would see.
+    const clearsOnChainGuard = result.quoted && result.actualGrossUsd >= this.minProfitUsd;
 
     let outcome: PaperOutcome;
-    if (!result.quoted) {
+    let actualNetUsd: number;
+
+    if (!wouldSend) {
+      // No transaction, no gas, no balance movement.
+      outcome = 'skipped';
+      actualNetUsd = 0;
+    } else if (!result.quoted) {
+      // Route no longer quotes; the transaction would revert on the first hop.
       outcome = 'dead';
-    } else if (actualNetUsd > 0) {
+      actualNetUsd = -result.gasCostUsd;
+    } else if (clearsOnChainGuard) {
       outcome = 'filled';
+      actualNetUsd = result.actualGrossUsd - result.gasCostUsd;
     } else {
-      outcome = 'decayed';
+      // Sent, but the opportunity decayed before inclusion: the contract reverts
+      // and only gas is burned. Principal is never at risk.
+      outcome = 'reverted';
+      actualNetUsd = -result.gasCostUsd;
     }
 
     // Decay is expressed against notional so it is comparable across trade sizes.
     const decayUsd = entry.expectedGrossUsd - result.actualGrossUsd;
     const decayBps = entry.notionalUsd > 0 ? (decayUsd / entry.notionalUsd) * 10_000 : 0;
 
-    // The balance moves by the realised number, win or lose. P&L percent is taken
-    // against capital before the trade — the standard convention, and the one
-    // that stays meaningful as the account compounds.
+    // Only trades that would actually have been broadcast move the balance.
     const capitalBeforeUsd = this.capitalUsd;
     const capitalAfterUsd = capitalBeforeUsd + actualNetUsd;
     const pnlPct = capitalBeforeUsd > 0 ? (actualNetUsd / capitalBeforeUsd) * 100 : 0;
 
     const trade: PaperTrade = {
       kind: 'trade',
+      modelVersion: LEDGER_MODEL_VERSION,
       id: entry.id,
       chain: entry.chain,
       route: entry.route,
@@ -332,7 +411,7 @@ export class PaperLedger {
       expectedNetUsd: round(entry.expectedNetUsd, 6),
       settledAt,
       settleDelayMs: settledAt - entry.detectedAt,
-      gasCostUsd: round(result.gasCostUsd, 6),
+      gasCostUsd: round(outcome === 'skipped' ? 0 : result.gasCostUsd, 6),
       actualGrossUsd: round(result.quoted ? result.actualGrossUsd : 0, 6),
       actualNetUsd: round(actualNetUsd, 6),
       decayBps: round(decayBps, 3),
@@ -403,8 +482,9 @@ export class PaperLedger {
     return {
       trades: t.trades,
       filled: t.filled,
-      decayed: t.decayed,
+      reverted: t.reverted,
       dead: t.dead,
+      skipped: t.skipped,
       fillRate: t.trades > 0 ? round(t.filled / t.trades, 4) : 0,
       grossUsd: round(t.grossUsd, 4),
       gasUsd: round(t.gasUsd, 4),
@@ -448,7 +528,8 @@ export class PaperLedger {
       : this.capitalUsd + trade.actualNetUsd;
 
     if (trade.outcome === 'filled') t.filled += 1;
-    else if (trade.outcome === 'decayed') t.decayed += 1;
+    else if (trade.outcome === 'reverted' || trade.outcome === 'decayed') t.reverted += 1;
+    else if (trade.outcome === 'skipped') t.skipped += 1;
     else t.dead += 1;
 
     if (t.bestUsd === null || trade.actualNetUsd > t.bestUsd) t.bestUsd = trade.actualNetUsd;
@@ -507,8 +588,9 @@ function emptyTotals() {
   return {
     trades: 0,
     filled: 0,
-    decayed: 0,
+    reverted: 0,
     dead: 0,
+    skipped: 0,
     grossUsd: 0,
     gasUsd: 0,
     netUsd: 0,

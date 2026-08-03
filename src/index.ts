@@ -369,8 +369,9 @@ class Arbo {
     log.info('paper trading report', {
       trades: stats.trades,
       filled: stats.filled,
-      decayed: stats.decayed,
+      reverted: stats.reverted,
       dead: stats.dead,
+      skipped: stats.skipped,
       fillRate: stats.fillRate,
       netUsd: stats.netUsd,
       grossUsd: stats.grossUsd,

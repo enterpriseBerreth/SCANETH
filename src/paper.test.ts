@@ -164,7 +164,7 @@ async function main(): Promise<void> {
     });
   });
 
-  await check('a decayed edge is booked as a loss, not discarded', async () => {
+  await check('a decayed edge reverts on-chain and costs gas only', async () => {
     await withLedger(5, async (ledger) => {
       ledger.open(opportunity(), 'r', 0);
       const [entry] = ledger.due('base');
@@ -177,12 +177,38 @@ async function main(): Promise<void> {
         quoted: true,
       });
 
-      assert.equal(trade.outcome, 'decayed');
-      assert.equal(trade.actualNetUsd, -1.5, 'a decayed trade still pays gas');
+      // `ArboFlashArb` asserts `balance >= owed + minProfit` before repaying, so
+      // a decayed route unwinds entirely. Gas is burned; the shortfall is not.
+      assert.equal(trade.outcome, 'reverted');
+      assert.equal(trade.actualNetUsd, -2, 'a reverted trade pays gas and nothing else');
       assert.equal(trade.wouldExecuteLive, false);
-      assert.equal(ledger.stats().netUsd, -1.5);
-      assert.equal(ledger.stats().decayed, 1);
+      assert.equal(ledger.stats().netUsd, -2);
+      assert.equal(ledger.stats().reverted, 1);
       assert.equal(ledger.stats().filled, 0);
+    });
+  });
+
+  await check('a candidate below the profit floor is never sent and costs nothing', async () => {
+    await withLedger(5, async (ledger) => {
+      // Expected net of $1 against a $5 floor: live, this transaction is never
+      // broadcast, so it must not move the balance by so much as gas.
+      ledger.open(opportunity({ netProfitUsd: 1, grossProfitUsd: 3 }), 'r', 0);
+      const [entry] = ledger.due('base');
+      assert.ok(entry);
+
+      const trade = await ledger.settle(entry, {
+        actualGrossUsd: 0.2,
+        gasCostUsd: 2,
+        quoted: true,
+      });
+
+      assert.equal(trade.outcome, 'skipped');
+      assert.equal(trade.actualNetUsd, 0, 'an unsent trade has no P&L');
+      assert.equal(trade.gasCostUsd, 0, 'an unsent trade burns no gas');
+      assert.equal(trade.capitalAfterUsd, trade.capitalBeforeUsd);
+      assert.equal(ledger.stats().netUsd, 0);
+      assert.equal(ledger.stats().skipped, 1);
+      assert.equal(ledger.stats().capitalUsd, START_CAPITAL);
     });
   });
 
@@ -218,8 +244,8 @@ async function main(): Promise<void> {
       });
 
       assert.equal(trade.expectedNetUsd, 500, 'prediction is retained for comparison');
-      assert.equal(trade.actualNetUsd, -1, 'but the booked number comes from the re-quote');
-      assert.equal(ledger.stats().netUsd, -1);
+      assert.equal(trade.actualNetUsd, -2, 'the revert costs gas, never the decayed gross');
+      assert.equal(ledger.stats().netUsd, -2);
     });
   });
 
@@ -254,8 +280,9 @@ async function main(): Promise<void> {
         quoted: true,
       });
 
-      assert.equal(trade.actualNetUsd, 7);
-      assert.equal(trade.wouldExecuteLive, false, '7 must not clear a 10 dollar floor');
+      assert.equal(trade.outcome, 'reverted', '9 gross cannot clear a 10 dollar guard');
+      assert.equal(trade.actualNetUsd, -2, 'the on-chain guard reverts it, leaving gas');
+      assert.equal(trade.wouldExecuteLive, false, 'a reverted trade is not a live win');
       assert.equal(ledger.stats().liveEligible, 0);
     });
   });
@@ -301,8 +328,8 @@ async function main(): Promise<void> {
 
       const before = ledger.stats();
       assert.equal(before.trades, 3);
-      // (9-2) + (0.5-2) + (20-2) = 7 - 1.5 + 18 = 23.5
-      assert.equal(before.netUsd, 23.5);
+      // 9 fills (9-2=7), 0.5 reverts (gas only, -2), 20 fills (20-2=18).
+      assert.equal(before.netUsd, 23);
 
       const reloaded = new PaperLedger(path, 5, START_CAPITAL);
       await reloaded.load();
@@ -311,8 +338,54 @@ async function main(): Promise<void> {
       assert.equal(after.trades, before.trades, 'trade count must survive reload');
       assert.equal(after.netUsd, before.netUsd, 'net P&L must survive reload');
       assert.equal(after.filled, before.filled);
-      assert.equal(after.decayed, before.decayed);
+      assert.equal(after.reverted, before.reverted);
       assert.equal(after.gasUsd, before.gasUsd);
+    });
+  });
+
+  await check('trades from the old accounting model are not replayed', async () => {
+    await withLedger(5, async (ledger, path) => {
+      // A v1 row: the old model booked the full negative gross on a decayed
+      // route, a loss the flash-loan guard makes impossible. Replaying it would
+      // carry a fictional -$40 drawdown forward forever.
+      const legacy = {
+        kind: 'trade',
+        id: 'v1',
+        chain: 'base',
+        route: 'old',
+        baseSymbol: 'USDC',
+        tokenPath: ['USDC', 'WETH', 'USDC'],
+        notionalUsd: 1_000,
+        detectedAt: Date.now(),
+        expectedGrossUsd: 10,
+        expectedNetUsd: 8,
+        settledAt: Date.now(),
+        settleDelayMs: 0,
+        gasCostUsd: 2,
+        actualGrossUsd: -38,
+        actualNetUsd: -40,
+        decayBps: 480,
+        outcome: 'decayed',
+        wouldExecuteLive: false,
+        capitalBeforeUsd: 1_000,
+        capitalAfterUsd: 960,
+        pnlPct: -4,
+      };
+      const { appendFile } = await import('node:fs/promises');
+      await appendFile(path, `${JSON.stringify(legacy)}\n`, 'utf8');
+
+      // ...followed by one honest v2 trade.
+      ledger.open(opportunity(), 'r', 0);
+      const [entry] = ledger.due('base');
+      assert.ok(entry);
+      await ledger.settle(entry, { actualGrossUsd: 9, gasCostUsd: 2, quoted: true });
+
+      const reloaded = new PaperLedger(path, 5, START_CAPITAL);
+      await reloaded.load();
+
+      assert.equal(reloaded.stats().trades, 1, 'only the v2 trade counts');
+      assert.equal(reloaded.stats().netUsd, 7, 'the v1 loss must not be replayed');
+      assert.equal(reloaded.stats().capitalUsd, START_CAPITAL + 7);
     });
   });
 
@@ -463,7 +536,7 @@ async function main(): Promise<void> {
 
       assert.equal(trade.actualNetUsd, -10);
       assert.equal(trade.pnlPct, -1, 'a $10 loss on $1,000 is -1%');
-      assert.equal(trade.outcome, 'decayed');
+      assert.equal(trade.outcome, 'reverted');
     });
   });
 
@@ -509,7 +582,7 @@ async function main(): Promise<void> {
 
       assert.equal(reloaded.capital, before.capitalUsd, 'balance must reload identically');
       assert.equal(reloaded.stats().returnPct, before.returnPct);
-      assert.equal(reloaded.stats().capitalUsd, 1_023.5);
+      assert.equal(reloaded.stats().capitalUsd, 1_023);
     });
   });
 
