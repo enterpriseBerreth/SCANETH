@@ -107,6 +107,18 @@ const BASE: ChainConfig = {
       feeBps: 5,
     },
     {
+      // Fee is 25 bps, not the 30 bps every other V2 fork uses. Verified
+      // empirically rather than assumed: the constant-product formula at 25 bps
+      // reproduces the router's `getAmountsOut` to the wei on the live WETH/USDC
+      // pool. Assuming 30 would understate every quote and hide real edges.
+      id: 'pancakeswap-v2',
+      label: 'PancakeSwap V2',
+      kind: 'univ2',
+      router: '0x8cFe327CEc66d1C090Dd72bd0FF11d690C33a2Eb',
+      factory: '0x02a84c1b3BBD7401a5f7fa98a384EBC70bB5749E',
+      feeBps: 25,
+    },
+    {
       id: 'curve',
       label: 'Curve',
       kind: 'curve',
@@ -298,9 +310,101 @@ const ETHEREUM: ChainConfig = {
   ],
 };
 
+// ── Optimism ─────────────────────────────────────────────────────────────────
+
+/**
+ * Optimism earns its place on economics, not novelty.
+ *
+ * Velodrome is to Optimism what Aerodrome is to Base — the dominant venue, same
+ * Solidly codebase, so it costs no new pricing math. What makes the chain worth
+ * scanning is that its liquidity is *concentrated* in one venue rather than
+ * split across a dozen: fewer competing searchers, and stable pairs like
+ * USDC/sUSD and USDC/USDCe that trade on a curve most generic bots misprice
+ * because they apply the constant-product formula to a stable pool.
+ *
+ * Every address below was probed on-chain before being written down.
+ */
+const OPTIMISM_TOKENS: TokenInfo[] = [
+  { symbol: 'WETH', address: '0x4200000000000000000000000000000000000006', decimals: 18, usdHint: 3000 },
+  { symbol: 'USDC', address: '0x0b2C639c533813f4Aa9D7837CAf62653d097Ff85', decimals: 6, usdHint: 1, stable: true },
+  // Bridged USDC. Reports `symbol() == "USDC"` on-chain, identically to native
+  // USDC — the two are distinguished only by address, and confusing them would
+  // route a trade into the wrong token.
+  { symbol: 'USDCe', address: '0x7F5c764cBc14f9669B88837ca1490cCa17c31607', decimals: 6, usdHint: 1, stable: true },
+  { symbol: 'USDT', address: '0x94b008aA00579c1307B0EF2c499aD98a8ce58e58', decimals: 6, usdHint: 1, stable: true },
+  { symbol: 'DAI', address: '0xDA10009cBd5D07dd0CeCc66161FC93D7c9000da1', decimals: 18, usdHint: 1, stable: true },
+  // Synthetix sUSD: 18 decimals despite being a dollar stable.
+  { symbol: 'sUSD', address: '0x8c6f28f2F1A3C87F0f938b96d27520d9751ec8d9', decimals: 18, usdHint: 1, stable: true },
+  { symbol: 'WBTC', address: '0x68f180fcCe6836688e9084f035309E29Bf0A2095', decimals: 8, usdHint: 95_000 },
+  { symbol: 'OP', address: '0x4200000000000000000000000000000000000042', decimals: 18, usdHint: 1.5 },
+  { symbol: 'wstETH', address: '0x1F32b1c2345538c0c6f582fCB022739c4A194Ebb', decimals: 18, usdHint: 3600 },
+  { symbol: 'VELO', address: '0x9560e827aF36c94D2Ac33a39bCE1Fe78631088Db', decimals: 18, usdHint: 0.05 },
+];
+
+const OPTIMISM: ChainConfig = {
+  name: 'optimism',
+  chainId: 10,
+  label: 'Optimism',
+  nativeSymbol: 'ETH',
+  wrappedNative: '0x4200000000000000000000000000000000000006',
+  multicall3: MULTICALL3,
+  aavePool: '0x794a61358D6845594F94dc1DB02A252b5b4814aD',
+  balancerVault: BALANCER_VAULT,
+  tokens: OPTIMISM_TOKENS,
+  venues: [
+    {
+      // Velodrome V2 — same Solidly fork as Aerodrome, so the stable-pool adapter
+      // applies unchanged. All sixteen probed pairs resolve on both the stable
+      // and volatile curves.
+      id: 'velodrome',
+      label: 'Velodrome V2',
+      kind: 'solidly',
+      router: '0xa062aE8A9c5e11aaA026fc2670B0D65cCc8B2858',
+      factory: '0xF1046053aa5682b4F9a81b5481394DA16BE5FF5a',
+      feeBps: 5,
+    },
+    {
+      id: 'uniswap-v3',
+      label: 'Uniswap V3',
+      kind: 'univ3',
+      router: UNIV3_ROUTER02_CANONICAL,
+      factory: UNIV3_FACTORY_CANONICAL,
+      quoter: UNIV3_QUOTER_V2_CANONICAL,
+      feeTiers: UNIV3_FEE_TIERS,
+    },
+    {
+      id: 'uniswap-v2',
+      label: 'Uniswap V2',
+      kind: 'univ2',
+      router: '0x4A7b5Da61326A6379179b40d00F57E5bbDC962c2',
+      factory: '0x0c3c1c532F1e39EdF36BE9Fe0bE1410313E074Bf',
+      feeBps: 30,
+    },
+  ],
+  pairs: [
+    ['WETH', 'USDC'],
+    ['WETH', 'USDT'],
+    ['WETH', 'DAI'],
+    ['WETH', 'WBTC'],
+    ['WETH', 'OP'],
+    ['USDC', 'OP'],
+    ['USDC', 'USDT'],
+    ['USDC', 'USDCe'],
+    ['USDC', 'DAI'],
+    // The reason this chain is here. sUSD is Synthetix-minted and drifts off peg
+    // far more than USDC/USDT ever does, and Velodrome prices it on the stable
+    // curve while Uniswap V3 prices it on a concentrated range.
+    ['USDC', 'sUSD'],
+    ['WETH', 'wstETH'],
+    ['WETH', 'VELO'],
+    ['USDC', 'VELO'],
+  ],
+};
+
 const REGISTRY: Record<ChainName, ChainConfig> = {
   base: BASE,
   arbitrum: ARBITRUM,
+  optimism: OPTIMISM,
   ethereum: ETHEREUM,
 };
 

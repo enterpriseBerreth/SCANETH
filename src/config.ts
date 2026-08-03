@@ -63,7 +63,7 @@ function list(key: string, fallback: string[]): string[] {
     .filter((s) => s.length > 0);
 }
 
-const SUPPORTED_CHAINS: ChainName[] = ['base', 'arbitrum', 'ethereum'];
+const SUPPORTED_CHAINS: ChainName[] = ['base', 'arbitrum', 'optimism', 'ethereum'];
 
 export interface ArboConfig {
   mode: Mode;
@@ -142,7 +142,7 @@ export function loadConfig(): ArboConfig {
     throw new Error(`MODE must be one of ${modes.join(', ')} — got "${mode}"`);
   }
 
-  const chains = list('ENABLED_CHAINS', ['base', 'arbitrum']).map((c) => c.toLowerCase());
+  const chains = list('ENABLED_CHAINS', ['base', 'arbitrum', 'optimism']).map((c) => c.toLowerCase());
   for (const c of chains) {
     if (!SUPPORTED_CHAINS.includes(c as ChainName)) {
       throw new Error(`Unsupported chain "${c}". Supported: ${SUPPORTED_CHAINS.join(', ')}`);
@@ -161,6 +161,7 @@ export function loadConfig(): ArboConfig {
   const rpcUrls: Record<ChainName, string> = {
     base: str('BASE_RPC_URL', 'https://base-rpc.publicnode.com'),
     arbitrum: str('ARBITRUM_RPC_URL', 'https://arb1.arbitrum.io/rpc'),
+    optimism: str('OPTIMISM_RPC_URL', 'https://optimism-rpc.publicnode.com'),
     ethereum: str('ETHEREUM_RPC_URL', 'https://ethereum-rpc.publicnode.com'),
   };
 
@@ -171,9 +172,11 @@ export function loadConfig(): ArboConfig {
   const wsUrls: Partial<Record<ChainName, string>> = {};
   const baseWs = optionalStr('BASE_WS_URL');
   const arbWs = optionalStr('ARBITRUM_WS_URL');
+  const opWs = optionalStr('OPTIMISM_WS_URL');
   const ethWs = optionalStr('ETHEREUM_WS_URL');
   if (baseWs) wsUrls.base = baseWs;
   if (arbWs) wsUrls.arbitrum = arbWs;
+  if (opWs) wsUrls.optimism = opWs;
   if (ethWs) wsUrls.ethereum = ethWs;
 
   // Log endpoints are tracked separately from the main RPC because `eth_getLogs`
@@ -194,6 +197,12 @@ export function loadConfig(): ArboConfig {
       rpcUrls.arbitrum,
       'https://arb1.arbitrum.io/rpc',
       'https://arbitrum.drpc.org',
+    ]),
+    optimism: dedupe([
+      optionalStr('OPTIMISM_LOGS_RPC_URL'),
+      rpcUrls.optimism,
+      'https://mainnet.optimism.io',
+      'https://optimism.drpc.org',
     ]),
     ethereum: dedupe([
       optionalStr('ETHEREUM_LOGS_RPC_URL'),

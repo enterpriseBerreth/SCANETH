@@ -10,7 +10,7 @@
  */
 export type Mode = 'simulate' | 'paper' | 'live';
 
-export type ChainName = 'base' | 'arbitrum' | 'ethereum';
+export type ChainName = 'base' | 'arbitrum' | 'optimism' | 'ethereum';
 
 /** Which on-chain protocol family a pool/router belongs to. */
 export type DexKind = 'univ2' | 'univ3' | 'solidly' | 'curve';
