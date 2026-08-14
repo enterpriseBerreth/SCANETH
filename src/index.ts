@@ -750,10 +750,12 @@ class Arbo {
     if (level === 'info') log.info('paper trade settled', payload);
     else log.debug('paper trade settled', payload);
 
-    // Every settled trade is reported, not just the winners. A stream of fills
-    // only would misstate the strategy, since the gas on a decayed edge is a
-    // real debit that a live account would genuinely have paid.
-    await this.notifier.paperTrade(trade);
+    // Skipped candidates never become trades — no transaction would have been
+    // broadcast — so alerting them as if a trade occurred produces a stream of
+    // $0.00 "PROFIT" messages that looks like the bot is broken.
+    if (trade.outcome !== 'skipped') {
+      await this.notifier.paperTrade(trade);
+    }
 
     if (!this.paper.solvent && !this.paperInsolvencyReported) {
       this.paperInsolvencyReported = true;
