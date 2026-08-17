@@ -89,7 +89,7 @@ class Arbo {
     this.notifier = new Notifier(config);
     this.paper = new PaperLedger(
       config.paperLedgerPath,
-      config.minProfitUsd,
+      config.paperProfitFloorUsd(config.mode),
       config.paperStartingCapitalUsd,
     );
   }
@@ -176,6 +176,7 @@ class Arbo {
       mode: this.config.mode,
       chains: this.config.chains,
       minProfitUsd: this.config.minProfitUsd,
+      paperProfitFloorUsd: this.config.paperProfitFloorUsd(this.config.mode),
       tradeRangeUsd: [this.config.minTradeUsd, this.config.maxTradeUsd],
       maxDailyLossUsd: this.config.maxDailyLossUsd,
       cexEnabled: this.config.cexEnabled,

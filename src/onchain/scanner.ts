@@ -77,6 +77,11 @@ export interface ScanContext {
   activity?: PoolActivityTracker;
   /** Survives between passes; holds screen prices for pools that did not trade. */
   screenCache?: ScreenPriceCache;
+  /**
+   * When true, return every comparable cycle even if it is unprofitable. Used by
+   * measurement tools that need to observe decay, not by the live scanner.
+   */
+  rawMode?: boolean;
 }
 
 /**
@@ -146,6 +151,8 @@ export interface ScanDiagnostics {
   bestEdgeRoute: string | null;
   /** Best edge seen per route this pass, so quiet pairs stay visible. */
   edgeByRoute: Map<string, number>;
+  /** Pairs skipped because FOCUS_PAIRS was set and this pair was not in it. */
+  pairsSkippedByFocus: number;
 }
 
 function newDiagnostics(): ScanDiagnostics {
@@ -163,6 +170,7 @@ function newDiagnostics(): ScanDiagnostics {
     bestEdgeBps: null,
     bestEdgeRoute: null,
     edgeByRoute: new Map(),
+    pairsSkippedByFocus: 0,
   };
 }
 
@@ -789,7 +797,13 @@ async function assembleOpportunity(
     );
   }
 
-  if (!sized || sized.profit <= 0n) return undefined;
+  if (!sized) return undefined;
+
+  // Raw mode allows measurement tools to observe negative or zero-profit cycles.
+  // The live scanner filters these out upstream; here we just need a complete
+  // opportunity object to re-quote.
+  const profitPositive = sized.profit > 0n;
+  if (!scan.rawMode && !profitPositive) return undefined;
 
   const basePrice = scan.oracle.usd(baseToken);
   const nativePrice = scan.oracle.nativeUsd();
@@ -1067,7 +1081,9 @@ async function scanPair(
     );
 
     // Phase 1 gate: the fee-adjusted edge must at least cover the flash premium.
-    if (edge < requiredEdge) continue;
+    // In raw mode this gate is bypassed so measurement tools can observe decay
+    // on cycles that look promising at the screen stage but fail confirmation.
+    if (!scan.rawMode && edge < requiredEdge) continue;
 
     const legs: RouteLeg[] = [
       buildLeg(sellVenue.pool, baseToken),
@@ -1193,8 +1209,21 @@ async function scanChainAll(
   const found: ArbOpportunity[] = [];
   const diag = newDiagnostics();
 
-  // Two-leg cross-venue, over every configured pair.
+  // Two-leg cross-venue, over every configured pair (or the focused subset).
+  const focus = scan.config.focusPairs
+    ? new Set(
+        scan.config.focusPairs
+          .filter((f) => f.chain === scan.ctx.chain.name)
+          .map((f) => `${f.pair[0]}/${f.pair[1]}`),
+      )
+    : undefined;
+
   for (const [symbolX, symbolY] of scan.ctx.chain.pairs) {
+    if (focus && !focus.has(`${symbolX}/${symbolY}`) && !focus.has(`${symbolY}/${symbolX}`)) {
+      diag.pairsSkippedByFocus += 1;
+      continue;
+    }
+
     let tokenX: TokenInfo;
     let tokenY: TokenInfo;
     try {
@@ -1212,14 +1241,19 @@ async function scanChainAll(
   }
 
   // Triangular, anchored on the wrapped native token and any stablecoin.
+  // Focus mode disables triangles unless one of the triangle legs matches a
+  // focused pair; otherwise we keep doing expensive work on pairs the user
+  // explicitly excluded.
   const anchors = scan.ctx.chain.tokens.filter(
     (t) => t.stable || t.address.toLowerCase() === scan.ctx.chain.wrappedNative.toLowerCase(),
   );
-  for (const anchor of anchors) {
-    try {
-      found.push(...(await scanTriangular(scan, anchor, diag)));
-    } catch (err) {
-      log.debug('triangular scan failed', { anchor: anchor.symbol, ...errMeta(err) });
+  if (!focus) {
+    for (const anchor of anchors) {
+      try {
+        found.push(...(await scanTriangular(scan, anchor, diag)));
+      } catch (err) {
+        log.debug('triangular scan failed', { anchor: anchor.symbol, ...errMeta(err) });
+      }
     }
   }
 

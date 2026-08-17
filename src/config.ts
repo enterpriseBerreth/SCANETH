@@ -39,12 +39,18 @@ function dedupe(urls: Array<string | undefined>): string[] {
 }
 
 function num(key: string, fallback: number): number {
-  const raw = optionalStr(key);
-  if (raw === undefined) return fallback;
-  const parsed = Number(raw);
-  if (!Number.isFinite(parsed)) {
-    throw new Error(`Environment variable ${key} must be a number, got "${raw}"`);
-  }
+  const raw = process.env[key];
+  if (raw === undefined || raw.trim() === '') return fallback;
+  const parsed = Number(raw.trim());
+  if (Number.isNaN(parsed)) throw new Error(`Invalid number for ${key}: ${raw}`);
+  return parsed;
+}
+
+function optionalNum(key: string): number | undefined {
+  const raw = process.env[key];
+  if (raw === undefined || raw.trim() === '') return undefined;
+  const parsed = Number(raw.trim());
+  if (Number.isNaN(parsed)) throw new Error(`Invalid number for ${key}: ${raw}`);
   return parsed;
 }
 
@@ -52,6 +58,27 @@ function bool(key: string, fallback: boolean): boolean {
   const raw = optionalStr(key);
   if (raw === undefined) return fallback;
   return raw.toLowerCase() === 'true' || raw === '1';
+}
+
+/**
+ * Parse a focus-pair list like `base:WETH/USDC,arbitrum:WETH/LINK`.
+ * Invalid entries are dropped so a typo does not crash the bot.
+ */
+function parseFocusPairs(
+  raw: string | undefined,
+): Array<{ chain: ChainName; pair: [string, string] }> | undefined {
+  if (!raw) return undefined;
+  const out: Array<{ chain: ChainName; pair: [string, string] }> = [];
+  for (const part of raw.split(',')) {
+    const trimmed = part.trim();
+    if (!trimmed) continue;
+    const [chainPart, pairPart] = trimmed.split(':');
+    if (!chainPart || !pairPart) continue;
+    const [a, b] = pairPart.split('/');
+    if (!a || !b) continue;
+    out.push({ chain: chainPart.trim() as ChainName, pair: [a.trim(), b.trim()] });
+  }
+  return out.length > 0 ? out : undefined;
 }
 
 function list(key: string, fallback: string[]): string[] {
@@ -122,6 +149,13 @@ export interface ArboConfig {
   telegramTestOnBoot: boolean;
   /** How long a paper candidate is held before being re-quoted and booked. */
   paperSettleDelayMs: number;
+  /**
+   * Optional paper-only profit floor. When set, paper mode uses this instead of
+   * `minProfitUsd` so the simulation can gather evidence on smaller edges
+   * without lowering the live send threshold. Live mode always uses
+   * `minProfitUsd`.
+   */
+  paperMinProfitUsd?: number;
   /** Cadence for the cumulative report and market-conditions rollup. */
   paperReportIntervalMs: number;
 
@@ -139,6 +173,21 @@ export interface ArboConfig {
   cexMinSpreadBps: number;
   cexScanIntervalMs: number;
   cexTransferCostBps: number;
+
+  /**
+   * Profit floor used for deciding whether a paper candidate would have been
+   * broadcast. Returns `paperMinProfitUsd` when in paper mode and set, otherwise
+   * falls back to the live floor. This keeps paper evidence-gathering separate
+   * from live safety.
+   */
+  paperProfitFloorUsd: (mode: 'live' | 'paper' | 'simulate') => number;
+
+  /**
+   * Optional focus list: `chain:pair,chain:pair`. When set, on-chain scanning
+   * only considers those pairs. This is useful when research shows a specific
+   * pair is the only one near profitability and the rest are RPC waste.
+   */
+  focusPairs?: Array<{ chain: ChainName; pair: [string, string] }>;
 
   telegramBotToken?: string;
   telegramChatId?: string;
@@ -270,7 +319,16 @@ export function loadConfig(): ArboConfig {
     // practice spans signing, propagation and at least one block, so settling
     // instantly would measure nothing and report a fill rate near 100%.
     paperSettleDelayMs: num('PAPER_SETTLE_DELAY_MS', 3_000),
+    paperMinProfitUsd: optionalNum('PAPER_MIN_PROFIT_USD'),
     paperReportIntervalMs: num('PAPER_REPORT_INTERVAL_MS', 300_000),
+
+    focusPairs: parseFocusPairs(optionalStr('FOCUS_PAIRS')),
+
+    paperProfitFloorUsd(mode: 'live' | 'paper' | 'simulate'): number {
+      const self = this as unknown as ArboConfig;
+      if (mode === 'paper' && self.paperMinProfitUsd !== undefined) return self.paperMinProfitUsd;
+      return self.minProfitUsd;
+    },
 
     maxDailyLossUsd: num('MAX_DAILY_LOSS_USD', 100),
     maxConsecutiveFailures: num('MAX_CONSECUTIVE_FAILURES', 5),
