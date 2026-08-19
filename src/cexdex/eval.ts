@@ -27,7 +27,7 @@ const FEE_TIERS = [100, 500, 3_000, 10_000];
 const SWAP_GAS = 180_000n;
 
 /** Find the deepest Uniswap V3 pool for tokenA/tokenB on this chain. */
-async function bestV3Pool(
+export async function bestV3Pool(
   ctx: ChainContext,
   tokenA: TokenInfo,
   tokenB: TokenInfo,
@@ -55,7 +55,7 @@ async function bestV3Pool(
 }
 
 /** Quote a single V3 swap. Returns amountOut in tokenOut units. */
-async function quoteV3(
+export async function quoteV3(
   ctx: ChainContext,
   tokenIn: TokenInfo,
   tokenOut: TokenInfo,
@@ -80,7 +80,7 @@ async function quoteV3(
   }
 }
 
-interface EvalInput {
+export interface EvalInput {
   chain: ChainName;
   symbol: string;
   quoteSymbol: string;
@@ -186,5 +186,7 @@ export async function evaluateCexDex(
     gasCostUsd,
     netProfitUsd,
     discoveredAt: Date.now(),
+    feeTier: pool.feeTier,
+    cexFeeBps: input.cexFeeBps,
   };
 }

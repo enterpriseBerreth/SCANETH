@@ -180,6 +180,10 @@ export interface CexDexOpportunity {
   /** Expected net profit in USD after all costs. */
   netProfitUsd: number;
   discoveredAt: number;
+  /** V3 fee tier used for the DEX leg, captured by the evaluator. */
+  feeTier: number;
+  /** CEX taker fee in bps, captured by the evaluator. */
+  cexFeeBps: number;
 }
 
 export interface ExecutionResult {
@@ -201,6 +205,7 @@ export interface CexDexExecutionResult {
   reason?: string;
   cexOrderId?: string;
   dexTxHash?: string;
+  withdrawalId?: string;
   realisedProfitUsd?: number;
   gasSpentUsd?: number;
   capitalBeforeUsd: number;

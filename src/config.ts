@@ -254,6 +254,8 @@ export interface ArboConfig {
   cexDexMinProfitUsd: number;
   /** How often the CEX-DEX engine scans for opportunities. */
   cexDexScanIntervalMs: number;
+  /** Optional withdrawal address for CEX-DEX live rebalancing. */
+  cexDexWithdrawalAddress?: string;
 
   /**
    * Profit floor used for deciding whether a paper candidate would have been
@@ -436,6 +438,7 @@ export function loadConfig(): ArboConfig {
     cexDexWithdrawalCostUsd: num('CEX_DEX_WITHDRAWAL_COST_USD', 2),
     cexDexMinProfitUsd: num('CEX_DEX_MIN_PROFIT_USD', 10),
     cexDexScanIntervalMs: num('CEX_DEX_SCAN_INTERVAL_MS', 15_000),
+    cexDexWithdrawalAddress: optionalStr('CEX_DEX_WITHDRAWAL_ADDRESS'),
     cexCredentials: loadCexCredentials(['binance', 'kraken', 'coinbase', 'okx', 'bybit']),
 
     telegramBotToken: optionalStr('TELEGRAM_BOT_TOKEN'),

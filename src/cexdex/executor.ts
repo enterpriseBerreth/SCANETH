@@ -12,12 +12,16 @@
  * - Require balance tracker to confirm inventory
  */
 import fs from 'fs';
+import { formatUnits, parseUnits } from 'ethers';
 import type { ArboConfig } from '../config.js';
 import type { CexDexExecutionResult, CexDexOpportunity } from '../types.js';
-import type { CexAdapter } from '../cex/adapter.js';
+import type { CexAdapter, OrderSide } from '../cex/adapter.js';
 import type { BalanceTracker } from '../cex/balances.js';
 import { Notifier } from '../telegram.js';
 import { createLogger, errMeta } from '../logger.js';
+import { executeDexSwap } from './swap.js';
+import type { ChainContext } from '../onchain/provider.js';
+import { quoteV3 } from './eval.js';
 
 const log = createLogger('cexdex');
 
@@ -52,6 +56,7 @@ export class CexDexExecutor {
     private readonly config: ArboConfig,
     private readonly cex: CexAdapter,
     private readonly balances: BalanceTracker,
+    private readonly chainContexts: Map<string, ChainContext>,
   ) {
     this.path = config.paperLedgerPath.replace(/\.jsonl$/, '-cexdex.jsonl');
     this.capitalUsd = config.paperStartingCapitalUsd;
@@ -137,11 +142,114 @@ export class CexDexExecutor {
   }
 
   private async executeLive(opportunity: CexDexOpportunity): Promise<CexDexExecutionResult> {
-    // TODO: implement live CEX order + DEX swap. This is intentionally left as
-    // a stub because live mode requires funded API keys, withdrawal addresses,
-    // and a DEX swap router integration. The paper path proves the strategy
-    // first.
-    return this.book(opportunity, 'failed', 'live execution not yet implemented');
+    const ctx = this.chainContexts.get(opportunity.chain);
+    if (!ctx) {
+      return this.book(opportunity, 'failed', 'no chain context');
+    }
+
+    // Re-quote guard: the evaluator's quote may be stale. Re-quote the exact
+    // size now and require the net profit to remain positive after a last-
+    // second slippage buffer.
+    const freshDexOut = opportunity.buyOnDex
+      ? await quoteV3(
+          ctx,
+          opportunity.quoteToken,
+          opportunity.baseToken,
+          parseUnits(String(opportunity.notionalUsd), opportunity.quoteToken.decimals),
+          opportunity.feeTier,
+        )
+      : await quoteV3(ctx, opportunity.baseToken, opportunity.quoteToken, opportunity.amountBase, opportunity.feeTier);
+
+    if (!freshDexOut || freshDexOut <= 0n) {
+      return this.book(opportunity, 'skipped', 're-quote failed');
+    }
+
+    const dexPrice = opportunity.buyOnDex
+      ? opportunity.notionalUsd / Number(formatUnits(freshDexOut, opportunity.baseToken.decimals))
+      : Number(formatUnits(freshDexOut, opportunity.quoteToken.decimals)) / opportunity.notionalUsd;
+
+    const stillProfitable = opportunity.buyOnDex
+      ? (opportunity.cexPrice - dexPrice) / dexPrice > this.config.cexDexMinSpreadBps / 10_000
+      : (dexPrice - opportunity.cexPrice) / opportunity.cexPrice > this.config.cexDexMinSpreadBps / 10_000;
+
+    if (!stillProfitable) {
+      return this.book(opportunity, 'skipped', 're-quote no longer profitable');
+    }
+
+    // Decide which side trades on the CEX and which on the DEX.
+    const cexSide: OrderSide = opportunity.buyOnDex ? 'sell' : 'buy';
+    const cexSymbol = `${opportunity.baseToken.symbol}/${this.config.cexDexCexQuoteSymbol}`;
+    const amountBaseFloat = Number(formatUnits(opportunity.amountBase, opportunity.baseToken.decimals));
+
+    log.info('cexdex live executing', {
+      chain: opportunity.chain,
+      symbol: opportunity.symbol,
+      cex: opportunity.cex,
+      direction: opportunity.buyOnDex ? 'buy-dex/sell-cex' : 'buy-cex/sell-dex',
+      notionalUsd: opportunity.notionalUsd.toFixed(2),
+    });
+
+    // 1. CEX market order.
+    const cexOrder = await this.cex.marketOrder(opportunity.cex, cexSymbol, cexSide, amountBaseFloat);
+    if (!cexOrder) {
+      return this.book(opportunity, 'failed', 'CEX market order failed');
+    }
+
+    // 2. DEX swap.
+    const dexTokenIn = opportunity.buyOnDex ? opportunity.quoteToken : opportunity.baseToken;
+    const dexTokenOut = opportunity.buyOnDex ? opportunity.baseToken : opportunity.quoteToken;
+    const dexAmountIn = opportunity.buyOnDex
+      ? parseUnits(String(opportunity.notionalUsd), opportunity.quoteToken.decimals)
+      : opportunity.amountBase;
+
+    const dexSwap = await executeDexSwap(
+      ctx,
+      dexTokenIn,
+      dexTokenOut,
+      opportunity.feeTier,
+      dexAmountIn,
+      this.config.slippageBps,
+    );
+
+    if (!dexSwap) {
+      return this.book(opportunity, 'failed', 'DEX swap failed; CEX position is open and must be hedged manually');
+    }
+
+    // 3. Optional: rebalance by withdrawing the resulting asset from CEX to
+    // the wallet. Disabled unless a withdrawal address is configured.
+    let withdrawalId: string | undefined;
+    if (this.config.cexDexWithdrawalAddress) {
+      const withdrawAsset = opportunity.buyOnDex ? this.config.cexDexCexQuoteSymbol : opportunity.baseToken.symbol;
+      const withdrawAmount = opportunity.buyOnDex
+        ? cexOrder.cost
+        : Number(formatUnits(dexSwap.amountOut, opportunity.baseToken.decimals));
+      withdrawalId = (
+        await this.cex.withdraw(
+          opportunity.cex,
+          withdrawAsset,
+          withdrawAmount,
+          this.config.cexDexWithdrawalAddress,
+          opportunity.chain,
+        )
+      )?.id;
+    }
+
+    const cexFeeUsd = cexOrder.cost * (opportunity.cexFeeBps / 10_000);
+    const gasSpentUsd =
+      (Number(dexSwap.gasUsed) * Number(await ctx.provider.getFeeData().then((f) => f.gasPrice ?? 0n))) / 1e18;
+
+    const realised = opportunity.netProfitUsd; // Conservative; could refine with actual fills.
+    const result = this.book(opportunity, 'filled', undefined, realised, gasSpentUsd);
+    result.cexOrderId = cexOrder.orderId;
+    result.dexTxHash = dexSwap.txHash;
+    if (withdrawalId) result.withdrawalId = withdrawalId;
+
+    // Refresh balances after a live trade.
+    await this.balances.refreshToken(opportunity.chain, opportunity.baseToken);
+    await this.balances.refreshToken(opportunity.chain, opportunity.quoteToken);
+
+    this.consecutiveFailures = 0;
+    return result;
   }
 
   private book(

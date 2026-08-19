@@ -32,7 +32,7 @@ export class CexDexEngine {
   ) {
     this.adapter = new CexAdapter(config);
     this.balances = new BalanceTracker(this.adapter, new Map(chainContexts.map((c) => [c.chain.name, c])));
-    this.executor = new CexDexExecutor(config, this.adapter, this.balances);
+    this.executor = new CexDexExecutor(config, this.adapter, this.balances, new Map(chainContexts.map((c) => [c.chain.name, c])));
     for (const ctx of chainContexts) {
       this.chainContexts.set(ctx.chain.name, ctx);
       this.oracles.set(ctx.chain.name, new PriceOracle(ctx.chain));
