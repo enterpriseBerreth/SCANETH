@@ -148,6 +148,40 @@ export interface CexSpread {
   discoveredAt: number;
 }
 
+/**
+ * A concrete CEX-DEX round trip. Direction is always expressed from the
+ * perspective of the on-chain token: if `buyOnDex` is true, the bot buys the
+ * token on the DEX and sells it on the CEX; the CEX balance is assumed to
+ * already contain the token (or be withdrawable). If false, the bot sells token
+ * on DEX for stable and buys it back cheaper on CEX.
+ */
+export interface CexDexOpportunity {
+  id: string;
+  chain: ChainName;
+  symbol: string;
+  cex: string;
+  baseToken: TokenInfo;
+  quoteToken: TokenInfo;
+  /** True when the DEX leg is a buy; false when it is a sell. */
+  buyOnDex: boolean;
+  /** CEX price of one base token in quote currency. */
+  cexPrice: number;
+  /** DEX price of one base token in quote currency after price impact. */
+  dexPrice: number;
+  /** Size in base-token units. */
+  amountBase: bigint;
+  /** Size in quote currency at the entry price. */
+  notionalUsd: number;
+  cexFeeUsd: number;
+  dexFeeUsd: number;
+  transferCostUsd: number;
+  slippageCostUsd: number;
+  gasCostUsd: number;
+  /** Expected net profit in USD after all costs. */
+  netProfitUsd: number;
+  discoveredAt: number;
+}
+
 export interface ExecutionResult {
   opportunityId: string;
   submitted: boolean;
@@ -156,4 +190,20 @@ export interface ExecutionResult {
   reason?: string;
   realisedProfitUsd?: number;
   gasSpentUsd?: number;
+}
+
+/** Result of attempting one CEX-DEX round trip. */
+export interface CexDexExecutionResult {
+  opportunityId: string;
+  submitted: boolean;
+  /** 'paper' | 'live' outcome classification. */
+  outcome: 'filled' | 'reverted' | 'skipped' | 'failed';
+  reason?: string;
+  cexOrderId?: string;
+  dexTxHash?: string;
+  realisedProfitUsd?: number;
+  gasSpentUsd?: number;
+  capitalBeforeUsd: number;
+  capitalAfterUsd: number;
+  completedAt: number;
 }

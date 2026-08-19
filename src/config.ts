@@ -61,6 +61,51 @@ function bool(key: string, fallback: boolean): boolean {
 }
 
 /**
+ * Parse a CEX-DEX pair list like `base:ETH/USDC,arbitrum:ETH/USDC`.
+ */
+function parseCexDexPairs(
+  raw: string,
+): Array<{ chain: ChainName; symbol: string; quote: string }> {
+  const out: Array<{ chain: ChainName; symbol: string; quote: string }> = [];
+  for (const part of raw.split(',')) {
+    const trimmed = part.trim();
+    if (!trimmed) continue;
+    const [chainPart, pairPart] = trimmed.split(':');
+    if (!chainPart || !pairPart) continue;
+    const [symbol, quote] = pairPart.split('/');
+    if (!symbol || !quote) continue;
+    out.push({ chain: chainPart.trim() as ChainName, symbol: symbol.trim(), quote: quote.trim() });
+  }
+  return out;
+}
+
+/**
+ * Load CEX API credentials from environment variables. The keys are optional:
+ * paper mode does not need them, and not every exchange is used.
+ */
+function loadCexCredentials(
+  exchanges: string[],
+): Record<string, { apiKey?: string; secret?: string; password?: string; sandbox?: boolean }> {
+  const creds: Record<string, { apiKey?: string; secret?: string; password?: string; sandbox?: boolean }> = {};
+  for (const ex of exchanges) {
+    const prefix = `CEX_${ex.toUpperCase()}`;
+    const apiKey = optionalStr(`${prefix}_API_KEY`);
+    const secret = optionalStr(`${prefix}_SECRET`);
+    const password = optionalStr(`${prefix}_PASSWORD`);
+    const sandboxRaw = optionalStr(`${prefix}_SANDBOX`);
+    if (apiKey || secret || password) {
+      creds[ex] = {
+        apiKey,
+        secret,
+        password,
+        sandbox: sandboxRaw ? sandboxRaw.toLowerCase() === 'true' : undefined,
+      };
+    }
+  }
+  return creds;
+}
+
+/**
  * Parse a focus-pair list like `base:WETH/USDC,arbitrum:WETH/LINK`.
  * Invalid entries are dropped so a typo does not crash the bot.
  */
@@ -173,6 +218,42 @@ export interface ArboConfig {
   cexMinSpreadBps: number;
   cexScanIntervalMs: number;
   cexTransferCostBps: number;
+
+  /**
+   * CEX-DEX inventory arbitrage settings.
+   *
+   * This is a separate strategy from atomic flash-loan arb: it holds inventory
+   * on both the CEX and the DEX, and profits from spreads that persist long
+   * enough to move capital between venues. The trade-off is capital lockup and
+   * withdrawal latency versus escaping the millisecond race against searchers.
+   */
+  cexDexEnabled: boolean;
+  /** Paper or live. Live requires funded exchange API keys. */
+  cexDexMode: 'paper' | 'live';
+  /** Pairs to trade, as `chain:SYMBOL/QUOTE`. Example: base:ETH/USDC */
+  cexDexPairs: Array<{ chain: ChainName; symbol: string; quote: string }>;
+  /** Minimum net spread after fees to consider a trade. */
+  cexDexMinSpreadBps: number;
+  /** Maximum USD exposure per round trip. */
+  cexDexMaxTradeUsd: number;
+  /** CEX API credentials per exchange id (binance, kraken, coinbase, etc). */
+  cexCredentials: Record<
+    string,
+    { apiKey?: string; secret?: string; password?: string; sandbox?: boolean }
+  >;
+  /** Stablecoin used as the on-chain quote asset for the DEX leg. */
+  cexDexDexQuoteSymbol: string;
+  /** Stablecoin held on CEX as the quote asset. */
+  cexDexCexQuoteSymbol: string;
+  /**
+   * Assumed withdrawal/transfer cost from CEX to wallet in quote currency.
+   * Set conservatively: a slow or expensive withdrawal can erase the edge.
+   */
+  cexDexWithdrawalCostUsd: number;
+  /** Minimum profit in USD after all costs to execute. */
+  cexDexMinProfitUsd: number;
+  /** How often the CEX-DEX engine scans for opportunities. */
+  cexDexScanIntervalMs: number;
 
   /**
    * Profit floor used for deciding whether a paper candidate would have been
@@ -344,6 +425,18 @@ export function loadConfig(): ArboConfig {
     cexMinSpreadBps: num('CEX_MIN_SPREAD_BPS', 30),
     cexScanIntervalMs: num('CEX_SCAN_INTERVAL_MS', 15_000),
     cexTransferCostBps: num('CEX_TRANSFER_COST_BPS', 15),
+
+    cexDexEnabled: bool('CEX_DEX_ENABLED', true),
+    cexDexMode: (str('CEX_DEX_MODE', 'paper').toLowerCase() as 'paper' | 'live'),
+    cexDexPairs: parseCexDexPairs(str('CEX_DEX_PAIRS', 'base:ETH/USDC,arbitrum:ETH/USDC')),
+    cexDexMinSpreadBps: num('CEX_DEX_MIN_SPREAD_BPS', 40),
+    cexDexMaxTradeUsd: num('CEX_DEX_MAX_TRADE_USD', 2000),
+    cexDexDexQuoteSymbol: str('CEX_DEX_DEX_QUOTE_SYMBOL', 'USDC'),
+    cexDexCexQuoteSymbol: str('CEX_DEX_CEX_QUOTE_SYMBOL', 'USDT'),
+    cexDexWithdrawalCostUsd: num('CEX_DEX_WITHDRAWAL_COST_USD', 2),
+    cexDexMinProfitUsd: num('CEX_DEX_MIN_PROFIT_USD', 10),
+    cexDexScanIntervalMs: num('CEX_DEX_SCAN_INTERVAL_MS', 15_000),
+    cexCredentials: loadCexCredentials(['binance', 'kraken', 'coinbase', 'okx', 'bybit']),
 
     telegramBotToken: optionalStr('TELEGRAM_BOT_TOKEN'),
     telegramChatId: optionalStr('TELEGRAM_CHAT_ID'),

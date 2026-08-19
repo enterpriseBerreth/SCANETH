@@ -5,7 +5,7 @@
 
 import { createLogger, errMeta } from './logger';
 import type { ArboConfig } from './config';
-import type { ExecutionResult } from './types';
+import type { CexDexExecutionResult, CexDexOpportunity, ExecutionResult } from './types';
 import type { PaperTrade } from './paper';
 
 const log = createLogger('telegram');
@@ -144,6 +144,34 @@ export class Notifier {
    */
   async halted(reason: string): Promise<void> {
     await this.send(`<b>ARBO halted</b>\nreason: <code>${escapeHtml(reason)}</code>`);
+  }
+
+  /**
+   * Alert for a completed CEX-DEX round trip. Sent only on filled outcomes so
+   * the channel does not fill with skips and cooldowns.
+   */
+  async cexDexTrade(result: CexDexExecutionResult, opportunity: CexDexOpportunity): Promise<void> {
+    const win = (result.realisedProfitUsd ?? 0) >= 0;
+    const heading = win ? 'CEX-DEX — PROFIT' : 'CEX-DEX — LOSS';
+    const sign = win ? '+' : '-';
+    const magnitude = Math.abs(result.realisedProfitUsd ?? 0);
+    const pct = result.capitalBeforeUsd > 0 ? (magnitude / result.capitalBeforeUsd) * 100 : 0;
+
+    await this.send(
+      `<b>${heading}</b>\n\n` +
+        `Token: <b>${escapeHtml(opportunity.symbol)}</b>\n` +
+        `CEX: ${escapeHtml(opportunity.cex)} · Chain: ${escapeHtml(opportunity.chain)}\n` +
+        `Direction: ${opportunity.buyOnDex ? 'buy DEX / sell CEX' : 'buy CEX / sell DEX'}\n` +
+        `PNL: <b>${sign}$${magnitude.toFixed(2)}</b>\n` +
+        `PNL %: <b>${sign}${pct.toFixed(2)}%</b>\n` +
+        `Capital before: $${result.capitalBeforeUsd.toFixed(2)}\n` +
+        `Capital after: <b>$${result.capitalAfterUsd.toFixed(2)}</b>\n\n` +
+        `<i>size $${opportunity.notionalUsd.toFixed(0)} · ` +
+        `cex fee $${opportunity.cexFeeUsd.toFixed(2)} · ` +
+        `dex fee $${opportunity.dexFeeUsd.toFixed(2)} · ` +
+        `transfer $${opportunity.transferCostUsd.toFixed(2)} · ` +
+        `gas $${(result.gasSpentUsd ?? 0).toFixed(2)}</i>`,
+    );
   }
 
   async error(scope: string, message: string): Promise<void> {

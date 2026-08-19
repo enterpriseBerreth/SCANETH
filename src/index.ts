@@ -32,6 +32,7 @@ import {
 import { PriceOracle } from './onchain/prices';
 import { BlockWatcher } from './onchain/blocks';
 import { PoolActivityTracker } from './onchain/dirty';
+import { CexDexEngine } from './cexdex/index.js';
 import {
   scanChainVerbose,
   requoteCycle,
@@ -78,6 +79,7 @@ class Arbo {
   private readonly paper: PaperLedger;
   private readonly runtimes: ChainRuntime[] = [];
   private cexFeeds?: CexFeeds;
+  private cexDexEngine?: CexDexEngine;
   private httpServer?: Server;
   private stopping = false;
   private halted = false;
@@ -119,7 +121,11 @@ class Arbo {
       await this.initCex();
     }
 
-    if (this.runtimes.length === 0 && !this.cexFeeds) {
+    if (this.config.cexDexEnabled) {
+      await this.initCexDex();
+    }
+
+    if (this.runtimes.length === 0 && !this.cexFeeds && !this.cexDexEngine) {
       log.error('no usable chains and no CEX feeds — nothing to do');
       process.exitCode = 1;
       return;
@@ -132,6 +138,7 @@ class Arbo {
       chains: this.runtimes.map((r) => r.name),
       mode: this.config.mode,
       telegram: this.notifier.isEnabled ? 'enabled' : 'disabled',
+      cexDex: this.config.cexDexEnabled ? this.config.cexDexMode : 'disabled',
     });
 
     // Boot-time connectivity probe is opt-in for the same reason. Redeploys are
@@ -299,6 +306,12 @@ class Arbo {
     }
 
     log.info('chains ready', { chains: this.runtimes.map((r) => r.name) });
+  }
+
+  private async initCexDex(): Promise<void> {
+    const engine = new CexDexEngine(this.config, this.runtimes.map((r) => r.ctx));
+    this.cexDexEngine = engine;
+    await engine.start();
   }
 
   private async initCex(): Promise<void> {
@@ -869,6 +882,7 @@ class Arbo {
     }
 
     await this.cexFeeds?.close();
+    this.cexDexEngine?.stop();
 
     // Every handle below keeps the event loop alive. Without closing them a
     // `--once` run scans correctly and then hangs forever instead of exiting,
