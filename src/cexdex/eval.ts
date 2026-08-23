@@ -146,7 +146,11 @@ export async function evaluateCexDex(
     ? ((input.cexQuote.bid - dexPrice) / dexPrice) * 10_000
     : ((dexPrice - input.cexQuote.ask) / input.cexQuote.ask) * 10_000;
 
-  if (spreadBps < config.cexDexMinSpreadBps) return undefined;
+  const isPaper = config.mode === 'paper';
+  const minSpreadBps = isPaper ? (config.cexDexPaperMinSpreadBps ?? config.cexDexMinSpreadBps) : config.cexDexMinSpreadBps;
+  const minProfitUsd = isPaper ? (config.cexDexPaperMinProfitUsd ?? config.cexDexMinProfitUsd) : config.cexDexMinProfitUsd;
+
+  if (spreadBps < minSpreadBps) return undefined;
 
   // Cost accounting.
   const cexFeeUsd = (notionalUsd * input.cexFeeBps) / 10_000;
@@ -165,7 +169,7 @@ export async function evaluateCexDex(
   const netProfitUsd =
     grossUsd - cexFeeUsd - dexFeeUsd - slippageCostUsd - transferCostUsd - gasCostUsd;
 
-  if (netProfitUsd < config.cexDexMinProfitUsd) return undefined;
+  if (netProfitUsd < minProfitUsd) return undefined;
 
   return {
     id: `${input.chain}:${input.symbol}:${Date.now()}`,

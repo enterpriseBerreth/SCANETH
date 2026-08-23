@@ -24,6 +24,7 @@ export interface ServerDeps {
   /** False when ledger writes have failed and history is memory-only. */
   paperDurable: () => boolean;
   paperLedgerPath: () => string;
+  cexDexStats?: () => Record<string, unknown> | undefined;
 }
 
 function json(value: unknown): string {
@@ -92,13 +93,29 @@ export function startServer(deps: ServerDeps): Server {
           ledgerPath: deps.paperLedgerPath(),
           stats,
           recentTrades: deps.paperTrades(),
+          cexDex: deps.cexDexStats?.(),
+        }),
+      );
+      return;
+    }
+
+    if (url === '/cexdex') {
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(
+        json({
+          mode: deps.config.mode,
+          cexDexMode: deps.config.cexDexMode,
+          pairs: deps.config.cexDexPairs,
+          minSpreadBps: deps.config.cexDexMinSpreadBps,
+          minProfitUsd: deps.config.cexDexMinProfitUsd,
+          stats: deps.cexDexStats?.(),
         }),
       );
       return;
     }
 
     res.writeHead(404, { 'content-type': 'application/json' });
-    res.end(json({ error: 'not found', routes: ['/health', '/stats', '/paper'] }));
+    res.end(json({ error: 'not found', routes: ['/health', '/stats', '/paper', '/cexdex'] }));
   });
 
   server.on('error', (err) => log.error('http server error', errMeta(err)));
@@ -106,7 +123,7 @@ export function startServer(deps: ServerDeps): Server {
   server.listen(deps.config.port, () => {
     log.info('http server listening', {
       port: deps.config.port,
-      routes: ['/health', '/stats', '/paper'],
+      routes: ['/health', '/stats', '/paper', '/cexdex'],
     });
   });
 

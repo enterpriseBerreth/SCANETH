@@ -288,6 +288,7 @@ export class CexDexExecutor {
     };
 
     this.append(row);
+    this.updateLedgerStats(row);
 
     const result: CexDexExecutionResult = {
       opportunityId: opportunity.id,
@@ -308,7 +309,81 @@ export class CexDexExecutor {
     return result;
   }
 
-  getStats(): { capitalUsd: number; dailyLossUsd: number } {
-    return { capitalUsd: this.capitalUsd, dailyLossUsd: this.dailyLossUsd };
+  getStats(): {
+    capitalUsd: number;
+    dailyLossUsd: number;
+    trades: number;
+    filled: number;
+    skipped: number;
+    failed: number;
+    netProfitUsd: number;
+    bestProfitUsd: number | null;
+    worstProfitUsd: number | null;
+    avgProfitUsd: number | null;
+    avgNotionalUsd: number | null;
+  } {
+    return {
+      capitalUsd: this.capitalUsd,
+      dailyLossUsd: this.dailyLossUsd,
+      ...this.ledgerStats,
+    };
+  }
+
+  private ledgerStats: {
+    trades: number;
+    filled: number;
+    skipped: number;
+    failed: number;
+    netProfitUsd: number;
+    bestProfitUsd: number | null;
+    worstProfitUsd: number | null;
+    avgProfitUsd: number | null;
+    avgNotionalUsd: number | null;
+  } = {
+    trades: 0,
+    filled: 0,
+    skipped: 0,
+    failed: 0,
+    netProfitUsd: 0,
+    bestProfitUsd: null,
+    worstProfitUsd: null,
+    avgProfitUsd: null,
+    avgNotionalUsd: null,
+  };
+
+  private updateLedgerStats(row: LedgerRow): void {
+    const s = this.ledgerStats;
+    s.trades += 1;
+    if (row.outcome === 'filled') s.filled += 1;
+    else if (row.outcome === 'skipped') s.skipped += 1;
+    else if (row.outcome === 'failed') s.failed += 1;
+
+    s.netProfitUsd += row.netProfitUsd;
+
+    const profits: number[] = [];
+    const notionals: number[] = [];
+    if (fs.existsSync(this.path)) {
+      try {
+        const rows = fs
+          .readFileSync(this.path, 'utf8')
+          .split('\n')
+          .filter(Boolean)
+          .map((line) => JSON.parse(line) as LedgerRow)
+          .filter((r) => r.kind === 'cexdex-trade');
+        for (const r of rows) {
+          profits.push(r.netProfitUsd);
+          notionals.push(r.notionalUsd);
+        }
+      } catch {
+        // ignore
+      }
+    }
+
+    if (profits.length > 0) {
+      s.bestProfitUsd = Math.max(...profits);
+      s.worstProfitUsd = Math.min(...profits);
+      s.avgProfitUsd = profits.reduce((a, b) => a + b, 0) / profits.length;
+      s.avgNotionalUsd = notionals.reduce((a, b) => a + b, 0) / notionals.length;
+    }
   }
 }

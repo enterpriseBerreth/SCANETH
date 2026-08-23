@@ -256,6 +256,17 @@ export interface ArboConfig {
   cexDexScanIntervalMs: number;
   /** Optional withdrawal address for CEX-DEX live rebalancing. */
   cexDexWithdrawalAddress?: string;
+  /**
+   * Paper-only CEX-DEX spread floor. When set, paper mode uses this instead of
+   * `cexDexMinSpreadBps` so the simulation gathers evidence on smaller spreads
+   * without changing the live send threshold.
+   */
+  cexDexPaperMinSpreadBps?: number;
+  /**
+   * Paper-only CEX-DEX profit floor. When set, paper mode uses this instead of
+   * `cexDexMinProfitUsd` for the same reason.
+   */
+  cexDexPaperMinProfitUsd?: number;
 
   /**
    * Profit floor used for deciding whether a paper candidate would have been
@@ -442,6 +453,10 @@ export function loadConfig(): ArboConfig {
     cexDexMinProfitUsd: num('CEX_DEX_MIN_PROFIT_USD', 10),
     cexDexScanIntervalMs: num('CEX_DEX_SCAN_INTERVAL_MS', 15_000),
     cexDexWithdrawalAddress: optionalStr('CEX_DEX_WITHDRAWAL_ADDRESS'),
+    // Paper-only floors for CEX-DEX evidence gathering. Defaults are deliberately
+    // low so the simulation captures smaller edges without changing live safety.
+    cexDexPaperMinSpreadBps: optionalNum('CEX_DEX_PAPER_MIN_SPREAD_BPS') ?? 15,
+    cexDexPaperMinProfitUsd: optionalNum('CEX_DEX_PAPER_MIN_PROFIT_USD') ?? 0.5,
     cexCredentials: loadCexCredentials(['binance', 'kraken', 'coinbase', 'okx', 'bybit']),
 
     telegramBotToken: optionalStr('TELEGRAM_BOT_TOKEN'),

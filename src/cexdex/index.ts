@@ -39,6 +39,10 @@ export class CexDexEngine {
     }
   }
 
+  getStats(): ReturnType<CexDexExecutor['getStats']> {
+    return this.executor.getStats();
+  }
+
   async start(): Promise<void> {
     if (!this.config.cexDexEnabled) {
       log.info('cexdex engine disabled');
