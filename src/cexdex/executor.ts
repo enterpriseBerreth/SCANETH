@@ -138,6 +138,7 @@ export class CexDexExecutor {
     const realised = opportunity.netProfitUsd;
     const result = this.book(opportunity, 'filled', undefined, realised, opportunity.gasCostUsd);
     this.consecutiveFailures = 0;
+    void this.notifier.cexDexTrade(result, opportunity);
     return result;
   }
 
@@ -249,6 +250,7 @@ export class CexDexExecutor {
     await this.balances.refreshToken(opportunity.chain, opportunity.quoteToken);
 
     this.consecutiveFailures = 0;
+    void this.notifier.cexDexTrade(result, opportunity);
     return result;
   }
 
@@ -301,10 +303,6 @@ export class CexDexExecutor {
       capitalAfterUsd: this.capitalUsd,
       completedAt: Date.now(),
     };
-
-    if (outcome === 'filled') {
-      void this.notifier.cexDexTrade(result, opportunity);
-    }
 
     return result;
   }

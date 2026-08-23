@@ -14,17 +14,23 @@ import { CexDexExecutor } from './executor.js';
 import { createLogger, errMeta } from '../logger.js';
 import type { ChainName, CexDexOpportunity } from '../types.js';
 import { PriceOracle } from '../onchain/prices.js';
+import { Notifier } from '../telegram.js';
 
 const log = createLogger('cexdex-engine');
+
+const SUMMARY_INTERVAL_MS = 6 * 60 * 60 * 1000; // 6 hours
 
 export class CexDexEngine {
   private adapter: CexAdapter;
   private balances: BalanceTracker;
   private executor: CexDexExecutor;
+  private notifier: Notifier;
   private timer?: NodeJS.Timeout;
+  private summaryTimer?: NodeJS.Timeout;
   private stopped = false;
   private chainContexts: Map<ChainName, ChainContext> = new Map();
   private oracles: Map<ChainName, PriceOracle> = new Map();
+  private lastSummaryStats = { trades: 0, filled: 0, netProfitUsd: 0 };
 
   constructor(
     private readonly config: ArboConfig,
@@ -33,6 +39,7 @@ export class CexDexEngine {
     this.adapter = new CexAdapter(config);
     this.balances = new BalanceTracker(this.adapter, new Map(chainContexts.map((c) => [c.chain.name, c])));
     this.executor = new CexDexExecutor(config, this.adapter, this.balances, new Map(chainContexts.map((c) => [c.chain.name, c])));
+    this.notifier = new Notifier(config);
     for (const ctx of chainContexts) {
       this.chainContexts.set(ctx.chain.name, ctx);
       this.oracles.set(ctx.chain.name, new PriceOracle(ctx.chain));
@@ -58,11 +65,13 @@ export class CexDexEngine {
     });
 
     this.scheduleNext();
+    this.scheduleSummary();
   }
 
   stop(): void {
     this.stopped = true;
     if (this.timer) clearTimeout(this.timer);
+    if (this.summaryTimer) clearTimeout(this.summaryTimer);
   }
 
   private scheduleNext(): void {
@@ -70,6 +79,44 @@ export class CexDexEngine {
     this.timer = setTimeout(() => {
       void this.tick();
     }, this.config.cexDexScanIntervalMs ?? 15_000);
+  }
+
+  private scheduleSummary(): void {
+    if (this.stopped) return;
+    this.summaryTimer = setTimeout(() => {
+      void this.sendSummary();
+      this.scheduleSummary();
+    }, SUMMARY_INTERVAL_MS);
+  }
+
+  private async sendSummary(): Promise<void> {
+    if (this.stopped) return;
+    const stats = this.executor.getStats();
+    const newTrades = stats.trades - this.lastSummaryStats.trades;
+    const newFilled = stats.filled - this.lastSummaryStats.filled;
+    const newNet = stats.netProfitUsd - this.lastSummaryStats.netProfitUsd;
+
+    if (newTrades === 0) {
+      log.info('cexdex summary skipped — no activity');
+      return;
+    }
+
+    const win = newNet >= 0;
+    const sign = win ? '+' : '-';
+    const text =
+      `<b>CEX-DEX 6h summary</b>\n\n` +
+      `Trades: ${newFilled} filled / ${newTrades} evaluated\n` +
+      `PNL: <b>${sign}$${Math.abs(newNet).toFixed(2)}</b>\n` +
+      `Capital: $${stats.capitalUsd.toFixed(2)}\n` +
+      `Best: $${(stats.bestProfitUsd ?? 0).toFixed(2)} · Worst: $${(stats.worstProfitUsd ?? 0).toFixed(2)}\n` +
+      `Avg notional: $${(stats.avgNotionalUsd ?? 0).toFixed(0)}`;
+
+    await this.notifier.send(text);
+    this.lastSummaryStats = {
+      trades: stats.trades,
+      filled: stats.filled,
+      netProfitUsd: stats.netProfitUsd,
+    };
   }
 
   private async tick(): Promise<void> {

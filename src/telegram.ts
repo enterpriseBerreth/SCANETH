@@ -26,7 +26,8 @@ export class Notifier {
     }
   }
 
-  private async send(text: string): Promise<void> {
+  /** Send without checking success. */
+  async send(text: string): Promise<void> {
     await this.sendChecked(text);
   }
 
