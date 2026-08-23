@@ -132,9 +132,11 @@ const BASE: ChainConfig = {
       // to `coins()` and `get_dy()` at startup and dropped if it does not.
       curvePools: [
         // USDC/USDbC — verified live via npm run verify:solidly.
-        // Other Base Curve pools were tried and did not resolve `coins()`, so
-        // they are omitted rather than left in as dead weight.
         '0xf6C5F01C7F3148891ad0e19DF78743D31E390D1f',
+        // USDC/DAI — the deepest stable-stable pool on Base.
+        '0xE3dA4E320f735B2cdF33a9a7eC612695A45c9bC7',
+        // cbETH/WETH — LST peg dislocation pool.
+        '0xC68B0b49D86DaEbb1e9BEe038C4d5b4C20D5E203',
       ],
     },
   ],
@@ -145,20 +147,10 @@ const BASE: ChainConfig = {
     ['WETH', 'cbETH'],
     ['USDC', 'DAI'],
     ['USDC', 'USDbC'],
-    // Each new token is paired against both WETH and USDC on purpose: a token
-    // reachable through only one route can never form a triangle, and triangular
-    // cycles are where two-leg spreads that look dead often still pay.
-    ['WETH', 'AERO'],
-    ['USDC', 'AERO'],
-    ['WETH', 'wstETH'],
-    ['WETH', 'rETH'],
-    ['WETH', 'cbBTC'],
-    ['USDC', 'cbBTC'],
-    ['USDC', 'EURC'],
-    ['WETH', 'VIRTUAL'],
-    ['USDC', 'VIRTUAL'],
-    ['WETH', 'DEGEN'],
-    ['WETH', 'BRETT'],
+    // LST/stables: small peg dislocations are the most realistic DEX-DEX edge.
+    ['cbETH', 'WETH'],
+    ['wstETH', 'WETH'],
+    ['rETH', 'WETH'],
   ],
 };
 
@@ -227,8 +219,10 @@ const ARBITRUM: ChainConfig = {
         // 2pool: USDC.e/USDT — the deepest stable pool on Arbitrum, and the one
         // most likely to hold a peg different from the Uniswap pools.
         '0x7f90122BF0700F9E7e1F688fe926940E8839F353',
-        // tricrypto: USDT/WBTC/WETH
-        '0x960ea3e3C7FB317332d990873d354E18d7645590',
+        // USDC/USDT native pool on Arbitrum.
+        '0x9b3d675FDbe021FD0de41C230b339dCa42E1e4A3',
+        // MIM/USDC/USDT — stable basket.
+        '0x30dF229cefa463e7e3E89715150213BB426fcA39',
       ],
     },
   ],
@@ -236,20 +230,16 @@ const ARBITRUM: ChainConfig = {
     ['WETH', 'USDC'],
     ['WETH', 'USDT'],
     ['WETH', 'DAI'],
-    ['WETH', 'WBTC'],
-    ['WETH', 'ARB'],
+    ['WETH', 'USDCe'],
     ['USDC', 'USDT'],
     ['USDC', 'USDCe'],
     ['USDC', 'DAI'],
+    // LST/stables and LST pairs.
     ['WETH', 'wstETH'],
     ['WETH', 'rETH'],
-    ['WETH', 'GMX'],
-    ['USDC', 'GMX'],
-    ['WETH', 'LINK'],
-    ['USDC', 'LINK'],
-    ['WETH', 'UNI'],
-    ['WETH', 'PENDLE'],
-    ['USDC', 'ARB'],
+    ['USDC', 'wstETH'],
+    ['USDC', 'rETH'],
+    ['WBTC', 'USDC'],
   ],
 };
 
@@ -414,21 +404,12 @@ const OPTIMISM: ChainConfig = {
     ['WETH', 'USDC'],
     ['WETH', 'USDT'],
     ['WETH', 'DAI'],
-    ['WETH', 'WBTC'],
-    ['WETH', 'OP'],
-    ['USDC', 'OP'],
     ['USDC', 'USDT'],
     ['USDC', 'USDCe'],
     ['USDC', 'DAI'],
-    // The reason this chain is here. sUSD is Synthetix-minted and drifts off peg
-    // far more than USDC/USDT ever does, and Velodrome prices it on the stable
-    // curve while Uniswap V3 prices it on a concentrated range.
+    // LST/stables and low-fee stable routes.
     ['USDC', 'sUSD'],
     ['WETH', 'wstETH'],
-    ['WETH', 'VELO'],
-    ['USDC', 'VELO'],
-    // The low-fee set. Every one of these crosses at 1-5 bps per leg rather than
-    // 30, which is the whole reason they are worth quoting.
     ['USDC', 'crvUSD'],
     ['USDT', 'crvUSD'],
     ['USDCe', 'crvUSD'],

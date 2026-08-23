@@ -402,7 +402,10 @@ export function loadConfig(): ArboConfig {
     // practice spans signing, propagation and at least one block, so settling
     // instantly would measure nothing and report a fill rate near 100%.
     paperSettleDelayMs: num('PAPER_SETTLE_DELAY_MS', 3_000),
-    paperMinProfitUsd: optionalNum('PAPER_MIN_PROFIT_USD'),
+    // Optional paper-only profit floor. Set this LOWER than MIN_PROFIT_USD so paper
+    // mode gathers evidence on smaller edges without changing the live send safety
+    // threshold. Default is intentionally low ($0.50) to capture realistic decay.
+    paperMinProfitUsd: num('PAPER_MIN_PROFIT_USD', 0.5),
     paperReportIntervalMs: num('PAPER_REPORT_INTERVAL_MS', 300_000),
 
     focusPairs: parseFocusPairs(optionalStr('FOCUS_PAIRS')),
