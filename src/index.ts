@@ -109,7 +109,11 @@ class Arbo {
       paperTrades: () => this.paper.recentTrades(),
       paperDurable: () => this.paper.isWritable,
       paperLedgerPath: () => this.paper.ledgerPath,
-      cexDexStats: () => this.cexDexEngine?.getStats(),
+      cexDexStats: () => {
+        const stats = this.cexDexEngine?.getStats();
+        const nearMisses = this.cexDexEngine?.getNearMisses();
+        return stats ? { ...stats, nearMisses } : undefined;
+      },
     });
 
     if (this.config.mode === 'paper') {

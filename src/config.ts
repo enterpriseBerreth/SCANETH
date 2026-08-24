@@ -444,7 +444,31 @@ export function loadConfig(): ArboConfig {
 
     cexDexEnabled: bool('CEX_DEX_ENABLED', true),
     cexDexMode: (str('CEX_DEX_MODE', 'paper').toLowerCase() as 'paper' | 'live'),
-    cexDexPairs: parseCexDexPairs(str('CEX_DEX_PAIRS', 'base:ETH/USDC,arbitrum:ETH/USDC')),
+    cexDexPairs: parseCexDexPairs(
+      str(
+        'CEX_DEX_PAIRS',
+        // Default pairs: majors + L2 tokens + stable-stable. Stable-stable pairs
+        // are intentionally included because they are lower-risk and often show
+        // structural CEX-DEX dislocations during volatility.
+        'base:ETH/USDC,' +
+          'base:ARB/USDC,' +
+          'base:LINK/USDC,' +
+          'base:AERO/USDC,' +
+          'base:USDC/USDbC,' +
+          'base:USDC/DAI,' +
+          'arbitrum:ETH/USDC,' +
+          'arbitrum:ARB/USDC,' +
+          'arbitrum:LINK/USDC,' +
+          'arbitrum:UNI/USDC,' +
+          'arbitrum:USDC/USDT,' +
+          'arbitrum:USDC/USDCe,' +
+          'optimism:ETH/USDC,' +
+          'optimism:OP/USDC,' +
+          'optimism:VELO/USDC,' +
+          'optimism:USDC/DAI,' +
+          'optimism:USDC/USDT',
+      ),
+    ),
     cexDexMinSpreadBps: num('CEX_DEX_MIN_SPREAD_BPS', 40),
     cexDexMaxTradeUsd: num('CEX_DEX_MAX_TRADE_USD', 2000),
     cexDexDexQuoteSymbol: str('CEX_DEX_DEX_QUOTE_SYMBOL', 'USDC'),

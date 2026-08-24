@@ -91,11 +91,17 @@ export interface EvalInput {
   nativeUsd: number;
 }
 
+export interface EvalResult {
+  opportunity?: CexDexOpportunity;
+  spreadBps: number;
+  netProfitUsd?: number;
+}
+
 export async function evaluateCexDex(
   config: ArboConfig,
   ctx: ChainContext,
   input: EvalInput,
-): Promise<CexDexOpportunity | undefined> {
+): Promise<EvalResult | undefined> {
   const chain = ctx.chain;
   let baseToken: TokenInfo;
   let quoteToken: TokenInfo;
@@ -115,6 +121,12 @@ export async function evaluateCexDex(
   // Choose direction: buy where price is lower, sell where price is higher.
   const buyOnDex = input.cexQuote.bid > cexMid * 1.0001; // CEX bid beats DEX mid by ~1bp
   const sellOnDex = !buyOnDex;
+
+  // Spread in bps from the DEX perspective — always compute so callers can log
+  // near-misses even when the edge is below the profit floor.
+  const rawSpreadBps = buyOnDex
+    ? ((input.cexQuote.bid - cexMid) / cexMid) * 10_000
+    : ((cexMid - input.cexQuote.ask) / input.cexQuote.ask) * 10_000;
 
   // Size: limited by configured max and available depth.
   const depthUsd = Math.min(
@@ -141,7 +153,7 @@ export async function evaluateCexDex(
     ? notionalUsd / Number(formatUnits(dexAmountOut, baseToken.decimals))
     : Number(formatUnits(dexAmountOut, quoteToken.decimals)) / notionalUsd;
 
-  // Spread in bps from the DEX perspective.
+  // More precise spread using the actual DEX quote.
   const spreadBps = buyOnDex
     ? ((input.cexQuote.bid - dexPrice) / dexPrice) * 10_000
     : ((dexPrice - input.cexQuote.ask) / input.cexQuote.ask) * 10_000;
@@ -150,7 +162,9 @@ export async function evaluateCexDex(
   const minSpreadBps = isPaper ? (config.cexDexPaperMinSpreadBps ?? config.cexDexMinSpreadBps) : config.cexDexMinSpreadBps;
   const minProfitUsd = isPaper ? (config.cexDexPaperMinProfitUsd ?? config.cexDexMinProfitUsd) : config.cexDexMinProfitUsd;
 
-  if (spreadBps < minSpreadBps) return undefined;
+  if (spreadBps < minSpreadBps) {
+    return { opportunity: undefined, spreadBps, netProfitUsd: undefined };
+  }
 
   // Cost accounting.
   const cexFeeUsd = (notionalUsd * input.cexFeeBps) / 10_000;
@@ -169,28 +183,34 @@ export async function evaluateCexDex(
   const netProfitUsd =
     grossUsd - cexFeeUsd - dexFeeUsd - slippageCostUsd - transferCostUsd - gasCostUsd;
 
-  if (netProfitUsd < minProfitUsd) return undefined;
+  if (netProfitUsd < minProfitUsd) {
+    return { opportunity: undefined, spreadBps, netProfitUsd };
+  }
 
   return {
-    id: `${input.chain}:${input.symbol}:${Date.now()}`,
-    chain: input.chain,
-    symbol: input.symbol,
-    cex: input.cex,
-    baseToken,
-    quoteToken,
-    buyOnDex,
-    cexPrice: buyOnDex ? input.cexQuote.bid : input.cexQuote.ask,
-    dexPrice,
-    amountBase,
-    notionalUsd,
-    cexFeeUsd,
-    dexFeeUsd,
-    transferCostUsd,
-    slippageCostUsd,
-    gasCostUsd,
+    opportunity: {
+      id: `${input.chain}:${input.symbol}:${Date.now()}`,
+      chain: input.chain,
+      symbol: input.symbol,
+      cex: input.cex,
+      baseToken,
+      quoteToken,
+      buyOnDex,
+      cexPrice: buyOnDex ? input.cexQuote.bid : input.cexQuote.ask,
+      dexPrice,
+      amountBase,
+      notionalUsd,
+      cexFeeUsd,
+      dexFeeUsd,
+      transferCostUsd,
+      slippageCostUsd,
+      gasCostUsd,
+      netProfitUsd,
+      discoveredAt: Date.now(),
+      feeTier: pool.feeTier,
+      cexFeeBps: input.cexFeeBps,
+    },
+    spreadBps,
     netProfitUsd,
-    discoveredAt: Date.now(),
-    feeTier: pool.feeTier,
-    cexFeeBps: input.cexFeeBps,
   };
 }

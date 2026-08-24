@@ -31,6 +31,11 @@ export class CexDexEngine {
   private chainContexts: Map<ChainName, ChainContext> = new Map();
   private oracles: Map<ChainName, PriceOracle> = new Map();
   private lastSummaryStats = { trades: 0, filled: 0, netProfitUsd: 0 };
+  private bestNearMisses: { symbol: string; cex: string; spreadBps: number; netProfitUsd: number; at: number }[] = [];
+
+  getNearMisses(): typeof this.bestNearMisses {
+    return this.bestNearMisses;
+  }
 
   constructor(
     private readonly config: ArboConfig,
@@ -147,7 +152,7 @@ export class CexDexEngine {
 
           const feeBps = await this.adapter.feeBps(exchangeId, cexSymbol);
 
-          const opportunity = await evaluateCexDex(this.config, ctx, {
+          const evalResult = await evaluateCexDex(this.config, ctx, {
             chain: pair.chain,
             symbol: pair.symbol,
             quoteSymbol: pair.quote,
@@ -158,7 +163,22 @@ export class CexDexEngine {
             nativeUsd,
           });
 
-          if (opportunity) opportunities.push(opportunity);
+          if (!evalResult) continue;
+
+          // Track the best near-miss across the whole scan so /cexdex can show how
+          // close the strategy came even when nothing clears the floor.
+          const miss = {
+            symbol: `${pair.symbol}/${pair.quote}@${exchangeId}`,
+            cex: exchangeId,
+            spreadBps: evalResult.spreadBps,
+            netProfitUsd: evalResult.netProfitUsd ?? Number.NEGATIVE_INFINITY,
+            at: Date.now(),
+          };
+          this.bestNearMisses.push(miss);
+          this.bestNearMisses.sort((a, b) => b.netProfitUsd - a.netProfitUsd);
+          this.bestNearMisses = this.bestNearMisses.slice(0, 10);
+
+          if (evalResult.opportunity) opportunities.push(evalResult.opportunity);
         }
       }
 
