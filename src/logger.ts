@@ -25,8 +25,8 @@ const threshold = LEVEL_ORDER[configuredLevel] ?? LEVEL_ORDER.info;
 
 /** Railway sets this; use JSON there so log search works. */
 const useJson =
-  process.env.ARBO_LOG_JSON === 'true' ||
-  (!!process.env.RAILWAY_ENVIRONMENT && process.env.ARBO_LOG_JSON !== 'false');
+  process.env.SCANETH_LOG_JSON === 'true' ||
+  (!!process.env.RAILWAY_ENVIRONMENT && process.env.SCANETH_LOG_JSON !== 'false');
 
 /** BigInt is not JSON-serialisable by default, so stringify it. */
 function replacer(_key: string, value: unknown): unknown {

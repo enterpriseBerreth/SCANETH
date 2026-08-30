@@ -1,193 +1,86 @@
-# ARBO
+# SCANETH
 
-Crypto arbitrage bot. Two independent engines:
+**SCANETH** = Smart Contract Analyzer for New Ethereum Tokens.
 
-- **Engine A — atomic DEX arbitrage, flash-loan funded.** Scans Uniswap V2-fork and Uniswap V3 pools across chains for 2-leg cross-venue and triangular cycles, sizes each one optimally, and executes the whole route inside a single flash loan. Because the trade is atomic and the contract reverts unless it clears a minimum profit, an arb that goes bad costs gas — never principal.
-- **Engine B — CEX spread scanner, alert only.** Reads public order books via `ccxt` and reports cross-venue spreads net of taker fees and withdrawal costs.
+A research-only Ethereum mainnet bot that watches every block for newly created ERC-20 contracts, pairs them with nearby Uniswap V2/V3 and SushiSwap V2 liquidity events, runs a static risk analysis on their bytecode and metadata, and sends Telegram alerts for low-risk launches.
 
-The two are separate for a reason that is worth stating plainly: **a flash loan cannot span a centralised exchange.** It must be repaid in the same transaction, and no CEX deposit/withdraw settles inside a block. Cross-venue CEX arbitrage requires pre-positioned inventory on both sides, which is a fundamentally different risk model. Engine B therefore scans and alerts; it does not trade.
+No transactions are sent. No private keys are required. SCANETH is an alpha-generation and risk-screening tool, not a trading bot.
 
-## Status
+## What it does
 
-Ships in `MODE=paper`. No transaction is ever sent; every candidate is measured instead. Going live is a config change, not a rewrite:
+1. **Block streaming** — connects via WebSocket when available, or HTTP polling as a fallback.
+2. **Contract creation detection** — every block is inspected for new contracts.
+3. **DEX liquidity pairing** — `PairCreated` and `PoolCreated` events are matched to token contracts within a 3-block window.
+4. **Risk scoring** — bytecode heuristics + metadata completeness produce a 0-100 score:
+   - red-flag opcodes (selfdestruct, blacklist, unguarded mint, pause, etc.)
+   - missing ERC-20 compliance signals
+   - incomplete name/symbol/decimals/totalSupply
+   - tiny or zero supply
+   - EOA deployer vs. launchpad contract
+5. **Telegram alerts** — only launches that cleared the risk threshold, received real liquidity, and have complete metadata are pushed.
 
-1. Deploy the contract — `npm run deploy:contract`
-2. Set `ARB_CONTRACT_<CHAIN>` and `EXECUTOR_PRIVATE_KEY`
-3. Set `MODE=live`
+## Environment variables
 
-The config layer refuses to start in `live` mode if either value is missing, so it cannot be half-enabled by accident.
-
-## Paper trading
-
-The purpose is to answer one question honestly: **would this have made money?**
-
-That is harder than it sounds, because the natural way to build a paper trader is to book the profit you predicted at detection time — which measures your own optimism, not the market. Arbitrage edges decay in seconds, and between spotting a cycle and landing a transaction the pools move.
-
-So a paper fill here is **never** the detected number:
-
-1. A candidate is detected and queued, with its predicted profit recorded.
-2. It is held for `PAPER_SETTLE_DELAY_MS`.
-3. The identical route is re-quoted on-chain at the identical size against fresh state.
-4. **That second number is booked**, net of gas at the current price.
-
-| Outcome | Meaning | Booked |
-|---|---|---|
-| `filled` | Edge survived and cleared cost | realised gross − gas |
-| `decayed` | Edge no longer covers cost | −gas (a live attempt would revert) |
-| `dead` | Route stopped quoting entirely | −gas |
-
-A decayed edge is deliberately recorded as a **loss, not a skip**. In live mode that transaction gets broadcast and reverts, and the gas is really gone. Ignoring those would flatter the record exactly where it matters most.
-
-Paper mode books every cycle that is genuinely profitable, not only those clearing `MIN_PROFIT_USD` — otherwise the ledger stays empty whenever the floor is not met, which proves nothing either way. Each trade carries `wouldExecuteLive` so the live-threshold subset is still recoverable.
-
-### What it does not model
-
-- **Competition.** If an edge survives the delay it is booked as a win. In reality a faster searcher may have taken it. Real fill rates are therefore **lower** than reported, never higher.
-- **Inclusion risk** — a live transaction can be dropped or reordered.
-- **Intra-block ordering** — settlement quotes at the head of a block; a real transaction lands inside it.
-
-All three bias the report *optimistically*, which is the right direction for a measurement whose job is to decide whether to risk money: if it does not clear here, it will not clear live.
-
-### The capital account
-
-Paper trading opens with `PAPER_STARTING_CAPITAL_USD` (default **$1,000**) and every settled trade moves that balance — credits on wins, debits on losses. Each trade records `capitalBeforeUsd` and `capitalAfterUsd`, so the account compounds and P&L percent is measured against the capital actually at risk at that moment rather than against the opening balance forever.
-
-Worth being clear about what the balance is and is not. Flash loans are uncollateralised, so **it is not a cap on trade size** — an $8,000 notional cycle on a $1,000 account is entirely normal, because the loan is borrowed and repaid inside one transaction. What the balance really represents is the **gas warchest**: the money that pays for transactions, including the ones that revert. That is what runs out, and when it hits zero the bot stops opening candidates instead of continuing to report fills it could never have afforded.
-
-### Reading the record
-
-`GET /paper` returns cumulative stats plus recent trades. The numbers that matter are `capitalUsd` and `returnPct`. Also watch:
-
-- `fillRate` — how often an edge survived the delay.
-- `avgDecayBps` — how fast edges evaporate. Large decay means latency is the binding constraint.
-- `liveEligible` / `liveEligibleNetUsd` — the subset that would actually have been sent live.
-
-**Zero trades is itself a result.** A market-conditions rollup is written on a timer so that stays interpretable: it records how close the market came even when nothing qualified. Without it, "no trades" is indistinguishable from a broken scanner.
-
-### Alerts
-
-With `TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID` set, **exactly one alert is sent per settled trade** — token, PNL $, PNL %, and capital before and after.
-
-Nothing else is alerted. Startup, detected opportunities and CEX spreads are logs, not messages, because the stream is only useful if every entry is a completed trade with a realised P&L behind it. The single exception is an operational halt: a bot that has stopped trading looks exactly like a quiet market, and finding that out days later is worse than one extra message.
-
-Losses are included on purpose. Gas on a decayed edge is a real debit a live account would genuinely have paid, and a feed of wins only would misstate the strategy. Verify delivery before relying on it:
-
-```bash
-npm run telegram:test
-```
-
-That sends a connectivity check followed by a sample trade in the exact production format, and exits non-zero if Telegram refused either. Note that Telegram will not deliver to a chat that has never contacted the bot, so send it `/start` once first.
-
-### Persistence
-
-Newline-delimited JSON at `PAPER_LEDGER_PATH`; totals *and the balance* are recomputed from the file on boot so there is exactly one source of truth and a restart cannot diverge from recorded history. On Railway it **must** live on a mounted volume (`/data`), or every redeploy silently resets the track record. A truncated final line from an unclean shutdown is skipped rather than fatal, and an unwritable disk logs once and continues in memory rather than killing the bot.
+| Variable | Required | Default | Description |
+|---|---|---|---|
+| `ETHEREUM_RPC_URL` | no | `https://ethereum-rpc.publicnode.com` | HTTP RPC endpoint |
+| `ETHEREUM_WS_URL` | no | — | WebSocket RPC endpoint (strongly recommended) |
+| `PORT` | no | `3000` | HTTP server port |
+| `ALERT_RISK_SCORE` | no | `25` | Max risk score (0-100) to alert |
+| `POLL_INTERVAL_MS` | no | `12000` | HTTP polling cadence when no WS |
+| `START_BLOCK` | no | current head | Override first block to scan |
+| `BACKTEST_FROM` / `BACKTEST_TO` | no | — | Scan a historical range and exit |
+| `TELEGRAM_BOT_TOKEN` | no | — | Telegram bot token |
+| `TELEGRAM_CHAT_ID` | no | — | Telegram chat/channel id |
+| `TELEGRAM_TEST_ON_BOOT` | no | `false` | Send a test alert at startup |
+| `SCANETH_ENABLED` | no | `true` | Set `false` to disable scanning |
 
 ## Quick start
 
 ```bash
 npm install
-copy env.template .env      # then edit
-npm run doctor              # validate every address against live RPCs
-npm run scan:once           # one full scan pass, then exit
-npm start                   # continuous
+copy env.template .env   # then edit
+npm run typecheck
+npm start
 ```
 
-## Commands
+## HTTP endpoints
 
-| Command | Purpose |
-|---|---|
-| `npm start` | Run continuously |
-| `npm run scan:once` | Single scan pass, then exit cleanly |
-| `npm run doctor` | Validate chains, venues, lenders and pool prices against live RPCs |
-| `npm run telegram:test` | Verify Telegram delivery and preview the trade-alert format |
-| `npm test` | Profit engine, paper ledger and settlement checks (52 checks) |
-| `npm run typecheck` | `tsc --noEmit` |
-| `npm run bench:rpc` | Benchmark candidate RPC endpoints |
-| `npm run deploy:contract` | Compile and deploy `ArboFlashArb.sol` |
+- `GET /health` — liveness, returns scanner state and block counters.
+- `GET /stats` — full run state, recent alerts, config summary.
+- `GET /alerts` — last 20 alert payloads.
 
-Health endpoints: `/health` (liveness), `/stats` (full run state, per-chain diagnostics, prices) and `/paper` (balance, cumulative P&L, recent trades).
+## Backtesting
 
-## How it decides
-
-**Two-phase scanning**, because RPC calls are the scarce resource:
-
-1. **Screen** — nearly free. V2 pools are priced from cached reserves; V3 pools get one small batched probe quote. Anything whose fee-adjusted spread cannot cover the flash premium is dropped here.
-2. **Confirm** — survivors only. V2-only cycles are sized by exact local ternary search at zero RPC cost; cycles touching V3 are sized with a batched on-chain quote ladder.
-
-**Optimal sizing** uses ternary search rather than the closed-form V2 solution, because the closed form does not generalise to V3 or to mixed-venue routes. Profit is computed net of the flash premium, both swap fees, price impact, and gas priced in real USD.
-
-**Gas is priced from live pool reserves, not a constant.** This is deliberate. A hardcoded ETH price of $3000 against a $1865 market is a 60% error in every gas estimate, which silently rejects profitable trades — or, in the other direction, accepts unprofitable ones.
-
-**Balancer V2 is preferred over Aave V3** for the flash loan, because Balancer charges no premium versus Aave's 5 bps. Aave is the fallback.
-
-## Liquidity floor
-
-`MIN_POOL_LIQUIDITY_USD` (default `$25,000`) excludes pools below the floor. This is not a nice-to-have.
-
-Abandoned pools exist at every V3 fee tier for every pair. Because arbitraging them back to fair value costs more gas than they contain, nobody ever does, so they sit at arbitrary prices indefinitely. Left in the scan they are not opportunities but phantoms: a live Base DAI/USDC pool screened at a rate off by a factor of 1e8 — an apparent 99-billion-percent edge — and a WETH/DAI pool sat at 2.2x the true rate. They also consumed the entire quote budget. Excluding them is what makes the reported edge numbers mean anything.
-
-A second guard, `MAX_RATE_DEVIATION` in `src/onchain/scanner.ts`, discards any venue quote more than 3x away from the oracle-implied rate. Real cross-venue edges are basis points, so the band is generous while still rejecting provably-broken data.
-
-## Reading the logs
-
-Every scan reports stage counters, not just a result:
-
-```
-scan complete — no actionable opportunities
-  v2Pools: 1  v3Pools: 6  durationMs: 918
-  cyclesScreened: 2  cyclesConfirmed: 2  cyclesUnprofitable: 2
-  quotesImplausible: 0
-  bestEdgeBps: 105.45  bestEdgeRoute: "WETH/USDC uniswap-v2->uniswap-v3"
-  nativeUsd: 1872.64
+```bash
+set BACKTEST_FROM=21000000
+set BACKTEST_TO=21000010
+npm start
 ```
 
-`bestEdgeBps` is the number to watch — the best fee-adjusted spot edge seen that pass, in bps against break-even. A small or negative value means the code is working and the market is tight. **`null` means nothing was ever priced**, which is a bug in the scanner or the pool set, not market conditions. Without these counters a quiet scan and a broken scan look identical, since both report zero opportunities.
+The bot scans the range and exits.
 
-Note that a positive `bestEdgeBps` is not a missed trade. Phase 1 prices at spot, ignoring price impact; phase 2 walks real quotes at real sizes and usually finds the edge evaporates. That gap is the screen doing its job.
+## Risk methodology
 
-## RPC latency
+SCANETH uses static analysis only. It cannot prove a contract is safe; it can only flag known unsafe patterns. A low score means "none of the common red flags were found," not "this token is a good investment." Always do your own research before interacting with any contract.
 
-Defaults are benchmarked, not guessed — re-check with `npm run bench:rpc`:
+## Deployment
 
-| Endpoint | 6 concurrent bursts x 20 calls |
-|---|---|
-| `mainnet.base.org` | 2170 ms |
-| `base-rpc.publicnode.com` | **263 ms** |
-| `1rpc.io/base` | 155 ms |
-| `base.llamarpc.com` | fails (521) |
-
-The obvious choice, `mainnet.base.org`, throttles hard enough to turn a Base scan pass into 49 seconds. Switching endpoints alone took it to 3.2s. For `MODE=live`, use a paid endpoint — latency is the difference between winning a fill and paying gas to lose one.
-
-## Safety
-
-- `MODE=simulate` cannot send a transaction. The executor has a hard guard, not just a branch.
-- Every send is preceded by a mandatory `eth_call` simulation against pending state.
-- `ArboFlashArb.executeArb` is `onlyOwner`, and asserts `finalBalance >= owed + minProfit` on-chain, reverting otherwise. An unprofitable arb costs gas, never principal.
-- Risk engine: per-trade cap, daily loss limit, consecutive-failure cooldown, `KILL_SWITCH`.
-- `rescueTokens` escape hatch on the contract.
-
-## An honest note on expectations
-
-Atomic DEX-to-DEX arbitrage is one of the most competitive niches in crypto. Professional searchers run co-located infrastructure with private orderflow and submit through builder-integrated relays. The accounting here is rigorous — correct fee and gas math, pre-send simulation, revert-on-unprofitable — so ARBO should not lose principal on a bad fill. That is a different claim from it being profitable.
-
-Run it in `simulate` long enough to see whether the opportunities it detects actually survive real gas and real competition **before** funding the contract. The `bestEdgeBps` figure over time is the honest measure of whether there is anything here worth trading on your chosen chains and pairs.
+SCANETH is designed to run continuously on Railway. The `railway.json` and `Procfile` are included; set the environment variables in the Railway dashboard and the healthcheck on `/health` will keep the service alive.
 
 ## Layout
 
 ```
-contracts/ArboFlashArb.sol     Flash-loan receiver (Aave V3 + Balancer V2)
-scripts/deploy-contract.mjs    solc compile + deploy (no Foundry needed)
-scripts/bench-rpc.mjs          RPC endpoint benchmark
-src/config.ts                  Env parsing + hard validation
-src/chains.ts                  Chain registry: RPCs, lenders, venues, tokens
-src/onchain/provider.ts        Providers + Multicall3 batching with bisect retry
-src/onchain/dex/               V2 and V3 adapters, pool discovery, depth filter
-src/onchain/prices.ts          USD oracle derived from live pool reserves
-src/onchain/profit.ts          Optimal sizing and full cost accounting
-src/onchain/scanner.ts         Two-phase cycle search + diagnostics
-src/onchain/executor.ts        Encoding, eth_call simulation, submission
-src/cex/                       Public-feed spread scanner
-src/risk.ts                    Caps, loss limits, kill switch
-src/server.ts                  /health and /stats
-src/tools/doctor.ts            Live address and pool validation
+src/index.ts              Entry point
+src/config.ts             Environment parsing
+src/server.ts             /health, /stats, /alerts
+src/logger.ts             Structured JSON/coloured logs
+src/state.ts              In-memory run state
+src/scaneth/
+  types.ts                Domain types
+  constants.ts            Mainnet addresses and risk patterns
+  provider.ts             RPC/WS provider setup
+  scanner.ts              Block scanner
+  analyzer.ts             Risk scoring and alert formatting
+  notifier.ts             Telegram integration
 ```

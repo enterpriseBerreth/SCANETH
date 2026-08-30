@@ -1,7 +1,7 @@
 {
-  "name": "arbo",
+  "name": "scaneth",
   "version": "1.0.0",
-  "description": "ARBO - crypto arbitrage bot: atomic flash-loan DEX arbitrage + cross-venue CEX spread scanner",
+  "description": "SCANETH — Smart Contract Analyzer for New Ethereum Tokens. Watches Ethereum mainnet for fresh ERC-20 launches, scores them for risk, and alerts on low-risk tokens.",
   "type": "module",
   "main": "src/index.ts",
   "engines": {
@@ -12,25 +12,16 @@
     "dev": "tsx watch src/index.ts",
     "build": "tsc",
     "typecheck": "tsc --noEmit",
-    "doctor": "tsx src/tools/doctor.ts",
-    "telegram:test": "tsx src/tools/telegram-test.ts",
-    "verify:solidly": "tsx src/tools/verify-solidly.ts",
-    "test": "tsx src/onchain/profit.test.ts && tsx src/paper.test.ts",
-    "test:profit": "tsx src/onchain/profit.test.ts",
-    "test:paper": "tsx src/paper.test.ts",
-    "bench:rpc": "node scripts/bench-rpc.mjs",
-    "scan:once": "tsx src/index.ts --once",
-    "deploy:contract": "node scripts/deploy-contract.mjs"
+    "backtest": "tsx src/index.ts",
+    "telegram:test": "tsx src/scaneth/telegram-test.ts"
   },
   "dependencies": {
-    "ccxt": "^4.4.36",
     "dotenv": "^16.4.5",
     "ethers": "^6.13.4",
     "tsx": "^4.19.2",
     "typescript": "^5.6.3"
   },
   "devDependencies": {
-    "@types/node": "^22.9.0",
-    "solc": "0.8.26"
+    "@types/node": "^22.9.0"
   }
 }

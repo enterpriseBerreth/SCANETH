@@ -1,30 +1,22 @@
 /**
- * Minimal HTTP surface.
+ * Minimal HTTP surface for SCANETH.
  *
- * Railway needs a healthcheck target, and a long-running bot that cannot be
- * inspected is a bot you cannot trust. `/stats` exposes the full run state so
- * you can see what it is actually doing without shelling into the container.
+ * Railway needs a healthcheck target, and `/stats` exposes what the scanner is
+ * currently seeing.
  */
 
 import { createServer, type Server } from 'node:http';
 import { createLogger, errMeta } from './logger';
 import type { BotState } from './state';
-import type { ArboConfig } from './config';
-import type { PaperStats, PaperTrade } from './paper';
+import type { ScanethConfig } from './config';
+import type { TokenLaunch } from './scaneth/types';
 
 const log = createLogger('server');
 
 export interface ServerDeps {
-  config: ArboConfig;
+  config: ScanethConfig;
   state: BotState;
-  /** Extra per-chain detail, supplied by the orchestrator. */
-  describeChains: () => Record<string, unknown>;
-  paperStats: () => PaperStats;
-  paperTrades: () => PaperTrade[];
-  /** False when ledger writes have failed and history is memory-only. */
-  paperDurable: () => boolean;
-  paperLedgerPath: () => string;
-  cexDexStats?: () => Record<string, unknown> | undefined;
+  recentAlerts: () => TokenLaunch[];
 }
 
 function json(value: unknown): string {
@@ -40,15 +32,14 @@ export function startServer(deps: ServerDeps): Server {
     const url = req.url ?? '/';
 
     if (url === '/health' || url === '/') {
-      // Deliberately shallow: liveness only. A scan failure should not cause
-      // Railway to restart the container mid-trade.
       res.writeHead(200, { 'content-type': 'application/json' });
       res.end(
         json({
           status: 'ok',
-          mode: deps.config.mode,
+          scannerEnabled: deps.config.enabled,
           uptimeSeconds: Math.floor((Date.now() - deps.state.startedAt) / 1000),
-          scansCompleted: deps.state.scansCompleted,
+          blocksProcessed: deps.state.blocksProcessed,
+          lastBlockNumber: deps.state.lastBlockNumber,
         }),
       );
       return;
@@ -58,64 +49,25 @@ export function startServer(deps: ServerDeps): Server {
       res.writeHead(200, { 'content-type': 'application/json' });
       res.end(
         json({
-          mode: deps.config.mode,
-          chains: deps.config.chains,
-          thresholds: {
-            minProfitUsd: deps.config.minProfitUsd,
-            minTradeUsd: deps.config.minTradeUsd,
-            maxTradeUsd: deps.config.maxTradeUsd,
-            maxDailyLossUsd: deps.config.maxDailyLossUsd,
-            minPoolLiquidityUsd: deps.config.minPoolLiquidityUsd,
+          config: {
+            rpcUrl: deps.config.rpcUrl.replace(/\/\/.*@/, '//***@'),
+            alertRiskScore: deps.config.alertRiskScore,
+            pollIntervalMs: deps.config.pollIntervalMs,
           },
           state: deps.state.snapshot(),
-          paper: deps.paperStats(),
-          onchain: deps.describeChains(),
         }),
       );
       return;
     }
 
-    if (url === '/paper') {
-      const stats = deps.paperStats();
+    if (url === '/alerts') {
       res.writeHead(200, { 'content-type': 'application/json' });
-      res.end(
-        json({
-          mode: deps.config.mode,
-          // Stated inline so the numbers are never read without their caveats.
-          methodology:
-            'Every candidate is re-quoted on-chain after PAPER_SETTLE_DELAY_MS and ' +
-            'booked at that second price, net of gas. Detected profit is treated as a ' +
-            'prediction only. Competition and inclusion risk are NOT modelled, so real ' +
-            'fill rates would be lower than reported, never higher.',
-          settleDelayMs: deps.config.paperSettleDelayMs,
-          minProfitUsd: deps.config.minProfitUsd,
-          durable: deps.paperDurable(),
-          ledgerPath: deps.paperLedgerPath(),
-          stats,
-          recentTrades: deps.paperTrades(),
-          cexDex: deps.cexDexStats?.(),
-        }),
-      );
-      return;
-    }
-
-    if (url === '/cexdex') {
-      res.writeHead(200, { 'content-type': 'application/json' });
-      res.end(
-        json({
-          mode: deps.config.mode,
-          cexDexMode: deps.config.cexDexMode,
-          pairs: deps.config.cexDexPairs,
-          minSpreadBps: deps.config.cexDexMinSpreadBps,
-          minProfitUsd: deps.config.cexDexMinProfitUsd,
-          stats: deps.cexDexStats?.(),
-        }),
-      );
+      res.end(json(deps.recentAlerts().slice(0, 20)));
       return;
     }
 
     res.writeHead(404, { 'content-type': 'application/json' });
-    res.end(json({ error: 'not found', routes: ['/health', '/stats', '/paper', '/cexdex'] }));
+    res.end(json({ error: 'not found', routes: ['/health', '/stats', '/alerts'] }));
   });
 
   server.on('error', (err) => log.error('http server error', errMeta(err)));
@@ -123,7 +75,7 @@ export function startServer(deps: ServerDeps): Server {
   server.listen(deps.config.port, () => {
     log.info('http server listening', {
       port: deps.config.port,
-      routes: ['/health', '/stats', '/paper', '/cexdex'],
+      routes: ['/health', '/stats', '/alerts'],
     });
   });
 
