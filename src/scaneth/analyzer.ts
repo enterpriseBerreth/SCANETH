@@ -1,5 +1,5 @@
 /**
- * SCANETH token risk analyzer.
+ * SCANETH token risk analyzer and alert formatter.
  *
  * Combines bytecode heuristics with on-chain metadata reads. Nothing here
  * executes a trade; the goal is to surface launches worth human review.
@@ -7,15 +7,10 @@
 
 import { Contract, type Provider } from 'ethers';
 import { createLogger, errMeta } from '../logger';
-import {
-  BURN_ADDRESSES,
-  DEX_FACTORIES,
-  ERC20,
-  RISK_PATTERNS,
-  RISK_TIERS,
-  ZERO_ADDRESS,
-} from './constants';
-import type { LiquidityEvent, RiskFinding, RiskReport, TokenLaunch, TokenMetadata } from './types';
+import { RISK_PATTERNS, RISK_TIERS } from './constants';
+import type { RiskFinding, RiskReport, TokenLaunch, TokenMetadata } from './types';
+import type { ScanFilters } from './scanner';
+import { formatAge } from './dexscreener';
 
 const log = createLogger('scaneth:analyzer');
 
@@ -76,11 +71,10 @@ export async function readTokenMetadata(
 export async function analyzeToken(
   provider: Provider,
   tokenAddress: string,
-  deployer: string,
+  _deployer: string,
 ): Promise<RiskReport> {
   const findings: RiskFinding[] = [];
 
-  // 1. Bytecode static analysis.
   try {
     const code = await provider.getCode(tokenAddress);
     findings.push(...analyzeBytecode(code));
@@ -88,7 +82,6 @@ export async function analyzeToken(
     log.debug('getCode failed', { address: tokenAddress, ...errMeta(err) });
   }
 
-  // 2. Metadata-derived checks.
   const meta = await readTokenMetadata(provider, tokenAddress);
 
   if (!meta.complete) {
@@ -107,31 +100,6 @@ export async function analyzeToken(
       points: 15,
       critical: false,
     });
-  }
-
-  if (meta.totalSupply > 0n && meta.totalSupply < 1_000_000n * 10n ** BigInt(meta.decimals || 18)) {
-    findings.push({
-      key: 'tiny_supply',
-      label: 'Very small total supply (under 1M tokens)',
-      points: 5,
-      critical: false,
-    });
-  }
-
-  // 3. Deployer reputation proxy: contracts deployed by contracts get a small
-  // trust bump because they are likely launchpads; EOAs are neutral.
-  try {
-    const deployerCode = await provider.getCode(deployer);
-    if (deployerCode === '0x') {
-      findings.push({
-        key: 'eoa_deployer',
-        label: 'Deployed by an EOA (no launchpad contract)',
-        points: 5,
-        critical: false,
-      });
-    }
-  } catch {
-    // ignore
   }
 
   const score = Math.min(100, findings.reduce((sum, f) => sum + f.points, 0));
@@ -159,10 +127,8 @@ export function analyzeBytecode(bytecode: string): RiskFinding[] {
     }
   }
 
-  // Additional structural heuristics.
-  const hasDelegateCall = lowered.includes('f4'); // DELEGATECALL opcode
-  const hasCallValue = lowered.includes('34'); // CALLVALUE opcode
-  const hasExtCodeSize = lowered.includes('3b'); // EXTCODESIZE opcode
+  const hasDelegateCall = lowered.includes('f4');
+  const hasCallValue = lowered.includes('34');
 
   if (hasDelegateCall && hasCallValue) {
     findings.push({
@@ -173,7 +139,7 @@ export function analyzeBytecode(bytecode: string): RiskFinding[] {
     });
   }
 
-  if (!lowered.includes(ERC20.Transfer.slice(2))) {
+  if (!lowered.includes('ddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef')) {
     findings.push({
       key: 'missing_transfer_event',
       label: 'Bytecode does not emit Transfer event — likely not ERC-20 compliant',
@@ -193,81 +159,65 @@ export function tierForScore(score: number): import('./types').RiskTier {
 }
 
 /**
- * Pair a newly created token with any liquidity event that references it.
- * SCANETH only reports tokens that actually received DEX liquidity.
+ * Decide whether a launch is worth alerting.
+ *
+ * Filters:
+ *   - pair age <= MAX_AGE_HOURS
+ *   - h1 transactions >= MIN_H1_TXNS
+ *   - h1 sells >= MIN_H1_SELLS
+ *   - risk score <= maxRiskScore
+ *   - metadata must be complete
  */
-export function pairLiquidity(
-  tokenAddress: string,
-  liquidityEvents: LiquidityEvent[],
-): LiquidityEvent[] {
-  const lowered = tokenAddress.toLowerCase();
-  return liquidityEvents.filter(
-    (ev) =>
-      ev.tokenAddress.toLowerCase() === lowered ||
-      ev.poolAddress.toLowerCase() === lowered,
-  );
-}
-
-/**
- * Decide whether a launch is worth alerting. SCANETH is conservative: only
- * low-risk tokens with real liquidity and some metadata completeness qualify.
- */
-export function shouldAlert(launch: TokenLaunch, minScore: number): boolean {
-  if (launch.risk.tier === 'critical') return false;
-  if (launch.risk.score > minScore) return false;
-  if (launch.liquidity.length === 0) return false;
+export function shouldAlert(launch: TokenLaunch, filters: ScanFilters): boolean {
+  if (!launch.dexScreener) return false;
   if (!launch.metadata.complete) return false;
+  if (launch.risk.score > filters.maxRiskScore) return false;
+
+  const ageHours = launch.dexScreener.ageMs / 3_600_000;
+  if (ageHours > filters.maxAgeHours) return false;
+  if (launch.dexScreener.h1Txns < filters.minH1Txns) return false;
+  if (launch.dexScreener.h1Sells < filters.minH1Sells) return false;
+
   return true;
 }
 
 /** Format a launch into a concise Telegram alert. */
-export function formatAlert(launch: TokenLaunch, chainLabel: string): string {
-  const firstLiq = launch.liquidity[0];
-  const links = [
-    `<a href="https://etherscan.io/token/${launch.tokenAddress}">Token</a>`,
-    `<a href="https://etherscan.io/address/${launch.deployer}">Deployer</a>`,
-  ];
-  if (firstLiq) {
-    links.push(`<a href="https://etherscan.io/address/${firstLiq.poolAddress}">Pool</a>`);
-    links.push(`<a href="https://etherscan.io/tx/${firstLiq.txHash}">Tx</a>`);
-  }
+export function formatAlert(launch: TokenLaunch): string {
+  const ds = launch.dexScreener!;
+  const pair = ds.pair;
+  const age = formatAge(ds.ageMs);
 
-  const findings = launch.risk.findings
-    .filter((f) => f.points > 0)
-    .slice(0, 5)
-    .map((f) => `• ${f.label} (${f.points} pts)`)
-    .join('\n') || 'No major red flags detected.';
+  const links = [
+    `<a href="https://etherscan.io/token/${launch.tokenAddress}">Etherscan</a>`,
+    `<a href="https://dexscreener.com/ethereum/${pair.pairAddress}">DEXScreener</a>`,
+  ];
+
+  const mcap = pair.marketCap ? `$${formatNumber(pair.marketCap)}` : 'unknown';
+  const liquidity = pair.liquidity?.usd ? `$${formatNumber(pair.liquidity.usd)}` : 'unknown';
+  const price = pair.priceUsd ? `$${Number(pair.priceUsd).toExponential(4)}` : 'unknown';
 
   return (
-    `<b>SCANETH — New low-risk launch</b>\n\n` +
+    `<b>SCANETH — Active new launch</b>\n\n` +
     `<b>${escapeHtml(launch.metadata.name)} (${escapeHtml(launch.metadata.symbol)})</b>\n` +
-    `Risk score: <b>${launch.risk.score}/100 (${launch.risk.tier})</b>\n` +
-    `Decimals: ${launch.metadata.decimals}\n` +
-    `Total supply: ${formatSupply(launch.metadata.totalSupply, launch.metadata.decimals)}\n` +
-    `Block: ${launch.blockNumber}\n\n` +
-    `<b>Liquidity</b>\n` +
-    `${launch.liquidity
-      .map(
-        (l) =>
-          `• ${l.dex} — ${shorten(l.poolAddress)} ${l.lpLockedOrBurned ? '(LP locked/burned)' : ''}`,
-      )
-      .join('\n')}\n\n` +
-    `<b>Risk findings</b>\n${findings}\n\n` +
+    `Address: <code>${launch.tokenAddress}</code>\n` +
+    `Age: <b>${age}</b>\n` +
+    `Price: ${price}\n` +
+    `Market cap: ${mcap}\n` +
+    `Liquidity: ${liquidity}\n\n` +
+    `<b>Past hour activity</b>\n` +
+    `Txns: <b>${ds.h1Txns}</b>\n` +
+    `Buys: ${ds.h1Buys}\n` +
+    `Sells: <b>${ds.h1Sells}</b>\n\n` +
+    `Risk score: ${launch.risk.score}/100 (${launch.risk.tier})\n\n` +
     links.join(' · ')
   );
 }
 
-function formatSupply(raw: bigint, decimals: number): string {
-  if (raw === 0n) return '0';
-  const div = 10n ** BigInt(decimals || 18);
-  const whole = raw / div;
-  const frac = raw % div;
-  const fracStr = frac.toString().padStart(decimals || 18, '0').slice(0, 4);
-  return `${whole.toString()}.${fracStr}`;
-}
-
-function shorten(addr: string): string {
-  return `${addr.slice(0, 6)}...${addr.slice(-4)}`;
+function formatNumber(n: number): string {
+  if (n >= 1_000_000_000) return `${(n / 1_000_000_000).toFixed(2)}B`;
+  if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(2)}M`;
+  if (n >= 1_000) return `${(n / 1_000).toFixed(2)}K`;
+  return n.toFixed(2);
 }
 
 function escapeHtml(value: string): string {

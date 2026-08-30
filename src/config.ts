@@ -40,7 +40,13 @@ export interface ScanethConfig {
   wsUrl?: string;
   /** HTTP server port for healthchecks. */
   port: number;
-  /** Risk score threshold for Telegram alerts (0-100). */
+  /** Max pair age in hours to alert. */
+  maxAgeHours: number;
+  /** Minimum transactions in the past hour to alert. */
+  minH1Txns: number;
+  /** Minimum sells in the past hour to alert. */
+  minH1Sells: number;
+  /** Max risk score (0-100) to alert. */
   alertRiskScore: number;
   /** How often to poll for new blocks when no WebSocket is available. */
   pollIntervalMs: number;
@@ -62,7 +68,10 @@ export function loadConfig(): ScanethConfig {
     rpcUrl: str('ETHEREUM_RPC_URL', 'https://ethereum-rpc.publicnode.com'),
     wsUrl: optionalStr('ETHEREUM_WS_URL'),
     port: num('PORT', 3000),
-    alertRiskScore: num('ALERT_RISK_SCORE', 25),
+    maxAgeHours: num('MAX_AGE_HOURS', 6),
+    minH1Txns: num('MIN_H1_TXNS', 10),
+    minH1Sells: num('MIN_H1_SELLS', 1),
+    alertRiskScore: num('ALERT_RISK_SCORE', 100),
     pollIntervalMs: num('POLL_INTERVAL_MS', 12_000),
     startBlock: optionalStr('START_BLOCK') ? num('START_BLOCK', 0) : undefined,
     backtest: optionalStr('BACKTEST_FROM') && optionalStr('BACKTEST_TO')
@@ -84,6 +93,9 @@ export function loadConfig(): ScanethConfig {
 function validate(c: ScanethConfig): void {
   const problems: string[] = [];
 
+  if (c.maxAgeHours <= 0) problems.push('MAX_AGE_HOURS must be > 0');
+  if (c.minH1Txns < 0) problems.push('MIN_H1_TXNS cannot be negative');
+  if (c.minH1Sells < 0) problems.push('MIN_H1_SELLS cannot be negative');
   if (c.alertRiskScore < 0 || c.alertRiskScore > 100) {
     problems.push('ALERT_RISK_SCORE must be between 0 and 100');
   }

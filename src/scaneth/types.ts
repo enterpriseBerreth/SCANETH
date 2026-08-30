@@ -2,31 +2,43 @@
  * SCANETH shared types.
  *
  * SCANETH = Smart Contract Analyzer for New Ethereum Tokens.
- * A research-only bot that watches Ethereum for freshly-deployed ERC-20 tokens,
- * scores them for common risk patterns, and alerts on low-risk launches.
+ * Watches Ethereum for freshly-created DEX pairs, enriches them with
+ * DEXScreener data, and alerts when on-chain + DEXScreener filters match.
  */
 
-export type Mode = 'scan' | 'simulate';
+import type { DexScreenerPair } from './dexscreener';
 
 export type RiskTier = 'low' | 'medium' | 'high' | 'critical';
 
 export interface TokenLaunch {
   /** Unique opportunity id. */
   id: string;
-  /** Block where the token contract was created. */
+  /** Block where the pair was created. */
   blockNumber: number;
   /** Exact timestamp the launch was observed. */
   discoveredAt: number;
-  /** Deployer / creator EOA or contract. */
-  deployer: string;
   /** Contract address of the ERC-20 token. */
   tokenAddress: string;
   /** Human-readable token metadata. */
   metadata: TokenMetadata;
-  /** Liquidity events detected in the same block window. */
-  liquidity: LiquidityEvent[];
+  /** DEX pair data from DEXScreener. */
+  dexScreener?: DexScreenerEnrichment;
   /** Risk evaluation result. */
   risk: RiskReport;
+}
+
+export interface DexScreenerEnrichment {
+  pair: DexScreenerPair;
+  /** Age of the pair in milliseconds. */
+  ageMs: number;
+  /** Transactions in the past hour. */
+  h1Txns: number;
+  /** Buys in the past hour. */
+  h1Buys: number;
+  /** Sells in the past hour. */
+  h1Sells: number;
+  /** Total transactions across all buckets. */
+  totalTxns: number;
 }
 
 export interface TokenMetadata {
@@ -36,23 +48,6 @@ export interface TokenMetadata {
   totalSupply: bigint;
   /** True when all three metadata reads succeeded. */
   complete: boolean;
-}
-
-export interface LiquidityEvent {
-  /** DEX where liquidity was added. */
-  dex: 'uniswap-v2' | 'uniswap-v3' | 'sushiswap-v2' | 'unknown';
-  /** Pair or pool address. */
-  poolAddress: string;
-  /** Base token of the pair (usually WETH or a stablecoin). */
-  quoteToken: string;
-  /** Token being paired with the quote. */
-  tokenAddress: string;
-  /** Transaction hash of the liquidity addition. */
-  txHash: string;
-  /** Block number of the liquidity addition. */
-  blockNumber: number;
-  /** Whether the LP tokens were burned/locked in the same transaction. */
-  lpLockedOrBurned: boolean;
 }
 
 export interface RiskReport {
@@ -77,10 +72,12 @@ export interface RiskFinding {
 
 export interface ScanStats {
   blocksProcessed: number;
-  contractsCreated: number;
+  pairsDetected: number;
   tokensIdentified: number;
   launchesDetected: number;
   alertsSent: number;
+  dexScreenerHits: number;
+  dexScreenerMisses: number;
   lastBlockNumber: number;
   lastBlockAt: number;
 }

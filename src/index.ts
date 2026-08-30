@@ -1,10 +1,10 @@
 /**
  * SCANETH entry point.
  *
- * Wires the Ethereum block scanner, risk analyzer, Telegram notifier and HTTP
- * server together. The bot streams every new block, identifies freshly created
- * ERC-20 contracts, pairs them with nearby DEX liquidity events, scores them
- * for risk, and sends Telegram alerts for low-risk launches.
+ * Wires the Ethereum block scanner, DEXScreener enrichment, Telegram notifier
+ * and HTTP server together. The bot streams every new Ethereum block, detects
+ * new DEX pairs, enriches the non-quote token with DEXScreener data, and sends
+ * Telegram alerts when age + activity filters are met.
  */
 
 import { loadConfig, type ScanethConfig } from './config';
@@ -42,7 +42,12 @@ class ScanethBot {
     });
 
     this.providers = createProviders(this.config.rpcUrl, this.config.wsUrl);
-    this.scanner = new BlockScanner(this.providers.http, this.config.alertRiskScore);
+    this.scanner = new BlockScanner(this.providers.http, {
+      maxAgeHours: this.config.maxAgeHours,
+      minH1Txns: this.config.minH1Txns,
+      minH1Sells: this.config.minH1Sells,
+      maxRiskScore: this.config.alertRiskScore,
+    });
 
     const network = await this.providers.http.getNetwork();
     log.info('connected', { chainId: network.chainId, name: network.name });
@@ -76,7 +81,12 @@ class ScanethBot {
   private banner(): void {
     log.info('SCANETH starting', {
       rpcUrl: this.config.rpcUrl.replace(/\/\/.*@/, '//***@'),
-      alertRiskScore: this.config.alertRiskScore,
+      filters: {
+        maxAgeHours: this.config.maxAgeHours,
+        minH1Txns: this.config.minH1Txns,
+        minH1Sells: this.config.minH1Sells,
+        maxRiskScore: this.config.alertRiskScore,
+      },
       telegram: this.notifier.isEnabled ? 'enabled' : 'disabled',
     });
     log.info('research-only scanner — no transactions are ever sent');
@@ -111,14 +121,16 @@ class ScanethBot {
 
     for (const alert of result.alerts) {
       this.state.recordAlert(alert);
-      log.info('low-risk launch alert', {
+      log.info('active new launch alert', {
         name: alert.metadata.name,
         symbol: alert.metadata.symbol,
-        score: alert.risk.score,
+        ageHours: alert.dexScreener ? (alert.dexScreener.ageMs / 3_600_000).toFixed(2) : null,
+        h1Txns: alert.dexScreener?.h1Txns,
+        h1Sells: alert.dexScreener?.h1Sells,
         block: alert.blockNumber,
       });
       if (this.notifier.isEnabled) {
-        await this.notifier.alertLaunch(alert, 'Ethereum');
+        await this.notifier.alertLaunch(alert);
       }
     }
   }

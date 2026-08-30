@@ -29,8 +29,8 @@ export class ScanethNotifier {
     return this.enabled;
   }
 
-  async alertLaunch(launch: TokenLaunch, chainLabel: string): Promise<boolean> {
-    return this.sendChecked(formatAlert(launch, chainLabel));
+  async alertLaunch(launch: TokenLaunch): Promise<boolean> {
+    return this.sendChecked(formatAlert(launch));
   }
 
   async test(): Promise<boolean> {

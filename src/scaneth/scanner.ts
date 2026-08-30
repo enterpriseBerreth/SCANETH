@@ -1,20 +1,18 @@
 /**
  * SCANETH block scanner.
  *
- * Watches every Ethereum block for:
- *   - new contract creations (token candidates)
- *   - Uniswap V2 / SushiSwap V2 PairCreated events
- *   - Uniswap V3 PoolCreated events
- *   - ERC-20 Transfer events into pair/pool addresses (liquidity adds)
- *
- * Detected launches are passed to the analyzer for risk scoring.
+ * Watches every Ethereum block for new DEX pairs (Uniswap V2, SushiSwap V2,
+ * Uniswap V3). For each newly-paired token it queries DEXScreener to enrich
+ * the launch with age, transaction counts, buys/sells, liquidity and market
+ * cap. Alerts are only emitted when the configured filters pass.
  */
 
 import { Interface, type Log, type Provider } from 'ethers';
 import { createLogger, errMeta } from '../logger';
-import { DEX_FACTORIES, ERC20, ZERO_ADDRESS } from './constants';
-import type { LiquidityEvent, ScanStats, TokenLaunch } from './types';
-import { analyzeToken, pairLiquidity, shouldAlert } from './analyzer';
+import { DEX_FACTORIES, QUOTE_TOKENS } from './constants';
+import type { ScanStats, TokenLaunch } from './types';
+import { analyzeToken, formatAlert, shouldAlert } from './analyzer';
+import { fetchTokenPairs, formatAge, pairAgeMs, pickBestPair } from './dexscreener';
 
 const log = createLogger('scaneth:scanner');
 
@@ -24,7 +22,6 @@ const PAIR_CREATED_IFACE = new Interface([
 const POOL_CREATED_IFACE = new Interface([
   'event PoolCreated(address indexed token0, address indexed token1, uint24 indexed fee, int24 tickSpacing, address pool)',
 ]);
-const TRANSFER_IFACE = new Interface(['event Transfer(address indexed from, address indexed to, uint256 value)']);
 
 export interface ScanResult {
   launches: TokenLaunch[];
@@ -32,35 +29,40 @@ export interface ScanResult {
   stats: ScanStats;
 }
 
+export interface ScanFilters {
+  /** Max pair age in hours to consider. */
+  maxAgeHours: number;
+  /** Minimum transactions in the past hour. */
+  minH1Txns: number;
+  /** Minimum sells in the past hour. */
+  minH1Sells: number;
+  /** Max risk score (0-100) to alert. */
+  maxRiskScore: number;
+}
+
 export class BlockScanner {
   private readonly seen = new Set<string>();
-  private readonly pendingLiquidity = new Map<number, LiquidityEvent[]>();
   private stats: ScanStats = {
     blocksProcessed: 0,
-    contractsCreated: 0,
+    pairsDetected: 0,
     tokensIdentified: 0,
     launchesDetected: 0,
     alertsSent: 0,
+    dexScreenerHits: 0,
+    dexScreenerMisses: 0,
     lastBlockNumber: 0,
     lastBlockAt: 0,
   };
 
   constructor(
     private readonly provider: Provider,
-    private readonly minRiskScore: number,
+    private readonly filters: ScanFilters,
   ) {}
 
   getStats(): ScanStats {
     return { ...this.stats };
   }
 
-  /**
-   * Process a single block. Returns launches and alerts discovered.
-   *
-   * The scanner intentionally does not rely on a mempool subscription; new-token
-   * launches become durable once included in a block, and scanning blocks avoids
-   * the noise of reorgs and dropped transactions.
-   */
   async processBlock(blockNumber: number): Promise<ScanResult> {
     const startedAt = Date.now();
     const result: ScanResult = {
@@ -70,59 +72,49 @@ export class BlockScanner {
     };
 
     try {
-      const [block, logs] = await Promise.all([
-        this.provider.getBlock(blockNumber, true),
-        this.provider.getLogs({ fromBlock: blockNumber, toBlock: blockNumber }),
-      ]);
-      if (!block) {
-        log.warn('block not found', { blockNumber });
-        return result;
-      }
+      const logs = await this.provider.getLogs({ fromBlock: blockNumber, toBlock: blockNumber });
 
       this.stats.lastBlockNumber = blockNumber;
       this.stats.lastBlockAt = Date.now();
       this.stats.blocksProcessed += 1;
 
-      // 1. Detect new contracts created by EOA/contract transactions.
-      const createdContracts = this.extractCreatedContracts(block);
-      this.stats.contractsCreated += createdContracts.length;
+      const newPairs = this.extractNewPairs(logs);
+      this.stats.pairsDetected += newPairs.length;
 
-      // 2. Detect liquidity events (PairCreated / PoolCreated / transfers to pairs).
-      const liquidityEvents = this.extractLiquidityEvents(logs);
-      this.storeLiquidity(blockNumber, liquidityEvents);
-
-      // 3. For each created contract, test if it is an ERC-20 and pair with liquidity.
-      for (const { address, deployer, txHash } of createdContracts) {
-        if (this.seen.has(address)) continue;
-        this.seen.add(address);
+      for (const { tokenAddress, dex, pairAddress, txHash } of newPairs) {
+        if (this.seen.has(tokenAddress)) continue;
+        this.seen.add(tokenAddress);
 
         try {
-          const launch = await this.buildLaunch(address, deployer, txHash, blockNumber);
+          const launch = await this.buildLaunch(tokenAddress, dex, pairAddress, txHash, blockNumber);
           if (!launch) continue;
 
           this.stats.tokensIdentified += 1;
-          if (launch.liquidity.length > 0) {
+          if (launch.dexScreener) {
+            this.stats.dexScreenerHits += 1;
             this.stats.launchesDetected += 1;
             result.launches.push(launch);
-            if (shouldAlert(launch, this.minRiskScore)) {
+
+            if (shouldAlert(launch, this.filters)) {
               result.alerts.push(launch);
               this.stats.alertsSent += 1;
             }
+          } else {
+            this.stats.dexScreenerMisses += 1;
           }
         } catch (err) {
-          log.debug('token analysis failed', { address, ...errMeta(err) });
+          log.debug('token analysis failed', { address: tokenAddress, ...errMeta(err) });
         }
       }
 
       log.info('block scanned', {
         blockNumber,
-        contracts: createdContracts.length,
+        pairs: newPairs.length,
         launches: result.launches.length,
         alerts: result.alerts.length,
         durationMs: Date.now() - startedAt,
       });
 
-      this.pruneLiquidity(blockNumber);
       return result;
     } catch (err) {
       log.error('block scan failed', { blockNumber, ...errMeta(err) });
@@ -131,8 +123,7 @@ export class BlockScanner {
   }
 
   /**
-   * Scan a historical range. Useful for backtesting or warming up after a
-   * deployment outage. Large ranges should be batched by the caller.
+   * Scan a historical range. Useful for backtesting.
    */
   async scanRange(fromBlock: number, toBlock: number): Promise<ScanResult> {
     const merged: ScanResult = { launches: [], alerts: [], stats: this.stats };
@@ -144,30 +135,11 @@ export class BlockScanner {
     return merged;
   }
 
-  private extractCreatedContracts(block: Awaited<ReturnType<Provider['getBlock']>>): Array<{
-    address: string;
-    deployer: string;
-    txHash: string;
-  }> {
-    const out: Array<{ address: string; deployer: string; txHash: string }> = [];
-    // When prefetchTxs=true, block.transactions contains TransactionResponse objects.
-    const txs = (block?.transactions ?? []) as unknown as Array<{
-      to?: string | null;
-      creates?: string | null;
-      from: string;
-      hash: string;
-    }>;
-    for (const tx of txs) {
-      // Contract creation has a null `to` and the deployed address as `creates`.
-      if (!tx.to && tx.creates) {
-        out.push({ address: tx.creates, deployer: tx.from, txHash: tx.hash });
-      }
-    }
-    return out;
-  }
+  private extractNewPairs(
+    logs: Log[],
+  ): Array<{ tokenAddress: string; dex: string; pairAddress: string; txHash: string }> {
+    const out: Array<{ tokenAddress: string; dex: string; pairAddress: string; txHash: string }> = [];
 
-  private extractLiquidityEvents(logs: Log[]): LiquidityEvent[] {
-    const out: LiquidityEvent[] = [];
     for (const logEntry of logs) {
       const address = logEntry.address.toLowerCase();
 
@@ -178,14 +150,15 @@ export class BlockScanner {
         try {
           const parsed = PAIR_CREATED_IFACE.parseLog(logEntry);
           if (!parsed) continue;
+          const t0 = String(parsed.args.token0).toLowerCase();
+          const t1 = String(parsed.args.token1).toLowerCase();
+          const tokenAddress = this.identifyNewToken(t0, t1);
+          if (!tokenAddress) continue;
           out.push({
-            dex: dex as LiquidityEvent['dex'],
-            poolAddress: String(parsed.args.pair),
-            quoteToken: String(parsed.args.token0),
-            tokenAddress: String(parsed.args.token1),
+            tokenAddress,
+            dex,
+            pairAddress: String(parsed.args.pair),
             txHash: logEntry.transactionHash,
-            blockNumber: logEntry.blockNumber,
-            lpLockedOrBurned: false,
           });
         } catch {
           // ignore parse failures
@@ -197,90 +170,84 @@ export class BlockScanner {
         try {
           const parsed = POOL_CREATED_IFACE.parseLog(logEntry);
           if (!parsed) continue;
+          const t0 = String(parsed.args.token0).toLowerCase();
+          const t1 = String(parsed.args.token1).toLowerCase();
+          const tokenAddress = this.identifyNewToken(t0, t1);
+          if (!tokenAddress) continue;
           out.push({
+            tokenAddress,
             dex: 'uniswap-v3',
-            poolAddress: String(parsed.args.pool),
-            quoteToken: String(parsed.args.token0),
-            tokenAddress: String(parsed.args.token1),
+            pairAddress: String(parsed.args.pool),
             txHash: logEntry.transactionHash,
-            blockNumber: logEntry.blockNumber,
-            lpLockedOrBurned: false,
           });
         } catch {
           // ignore parse failures
         }
       }
-
-      // ERC-20 Transfer into a pool: used to mark LP lock/burn heuristically.
-      if (logEntry.topics[0] === ERC20.Transfer) {
-        try {
-          const parsed = TRANSFER_IFACE.parseLog(logEntry);
-          if (!parsed) continue;
-          const from = String(parsed.args.from).toLowerCase();
-          const to = String(parsed.args.to).toLowerCase();
-          // Only track zero-address mints here as a cheap proxy.
-          if (from === ZERO_ADDRESS.toLowerCase()) {
-            // Could be initial mint into pool.
-          }
-        } catch {
-          // ignore
-        }
-      }
     }
+
     return out;
   }
 
-  private storeLiquidity(blockNumber: number, events: LiquidityEvent[]): void {
-    const existing = this.pendingLiquidity.get(blockNumber) ?? [];
-    existing.push(...events);
-    this.pendingLiquidity.set(blockNumber, existing);
-  }
+  /**
+   * Given a pair's two tokens, return the one that is NOT a common quote asset.
+   * If both are quote assets, the pair is not a new token launch.
+   */
+  private identifyNewToken(t0: string, t1: string): string | null {
+    const t0IsQuote = QUOTE_TOKENS.has(t0);
+    const t1IsQuote = QUOTE_TOKENS.has(t1);
 
-  private pruneLiquidity(currentBlock: number): void {
-    const cutoff = currentBlock - 10;
-    for (const key of this.pendingLiquidity.keys()) {
-      if (key < cutoff) this.pendingLiquidity.delete(key);
-    }
+    if (t0IsQuote && t1IsQuote) return null;
+    if (!t0IsQuote && !t1IsQuote) return null; // neither is a quote — ignore ambiguous pairs
+    return t0IsQuote ? t1 : t0;
   }
 
   private async buildLaunch(
     tokenAddress: string,
-    deployer: string,
+    dex: string,
+    pairAddress: string,
     txHash: string,
     blockNumber: number,
   ): Promise<TokenLaunch | null> {
-    const risk = await analyzeToken(this.provider, tokenAddress, deployer);
+    const [risk, metadata, pairs] = await Promise.all([
+      analyzeToken(this.provider, tokenAddress, ''),
+      import('./analyzer').then((m) => m.readTokenMetadata(this.provider, tokenAddress)),
+      fetchTokenPairs(tokenAddress),
+    ]);
 
-    // Collect liquidity events from the creation block and a small look-back.
-    const allLiquidity: LiquidityEvent[] = [];
-    for (let b = blockNumber - 3; b <= blockNumber; b++) {
-      allLiquidity.push(...(this.pendingLiquidity.get(b) ?? []));
-    }
+    const bestPair = pickBestPair(pairs, tokenAddress);
+    let dexScreener: TokenLaunch['dexScreener'];
 
-    const liquidity = pairLiquidity(tokenAddress, allLiquidity);
+    if (bestPair) {
+      const ageMs = pairAgeMs(bestPair);
+      const h1 = bestPair.txns?.h1;
+      const h1Txns = h1 ? h1.buys + h1.sells : 0;
+      const h1Buys = h1?.buys ?? 0;
+      const h1Sells = h1?.sells ?? 0;
+      const totalTxns =
+        (bestPair.txns?.m5 ? bestPair.txns.m5.buys + bestPair.txns.m5.sells : 0) +
+        (bestPair.txns?.h1 ? bestPair.txns.h1.buys + bestPair.txns.h1.sells : 0) +
+        (bestPair.txns?.h6 ? bestPair.txns.h6.buys + bestPair.txns.h6.sells : 0) +
+        (bestPair.txns?.h24 ? bestPair.txns.h24.buys + bestPair.txns.h24.sells : 0);
 
-    // Heuristic: mark LP locked/burned if the creation tx also sends LP tokens
-    // to a known burn address. We keep it simple: check creation tx logs only.
-    for (const liq of liquidity) {
-      liq.lpLockedOrBurned = this.isLpLockedOrBurned(txHash);
+      dexScreener = {
+        pair: bestPair,
+        ageMs: ageMs ?? 0,
+        h1Txns,
+        h1Buys,
+        h1Sells,
+        totalTxns,
+      };
     }
 
     return {
       id: `${tokenAddress}-${blockNumber}`,
       blockNumber,
       discoveredAt: Date.now(),
-      deployer,
       tokenAddress,
-      metadata: await import('./analyzer').then((m) => m.readTokenMetadata(this.provider, tokenAddress)),
-      liquidity,
+      metadata,
+      dexScreener,
       risk,
     };
-  }
-
-  private isLpLockedOrBurned(txHash: string): boolean {
-    // A full implementation would fetch the transaction receipt and inspect
-    // Transfer events to burn addresses. We default to false; this is a safe
-    // placeholder that does not mislead users.
-    return false;
   }
 }

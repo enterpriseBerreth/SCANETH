@@ -51,6 +51,9 @@ export function startServer(deps: ServerDeps): Server {
         json({
           config: {
             rpcUrl: deps.config.rpcUrl.replace(/\/\/.*@/, '//***@'),
+            maxAgeHours: deps.config.maxAgeHours,
+            minH1Txns: deps.config.minH1Txns,
+            minH1Sells: deps.config.minH1Sells,
             alertRiskScore: deps.config.alertRiskScore,
             pollIntervalMs: deps.config.pollIntervalMs,
           },

@@ -13,10 +13,12 @@ export class BotState {
   readonly startedAt = Date.now();
 
   blocksProcessed = 0;
-  contractsCreated = 0;
+  pairsDetected = 0;
   tokensIdentified = 0;
   launchesDetected = 0;
   alertsSent = 0;
+  dexScreenerHits = 0;
+  dexScreenerMisses = 0;
   lastBlockNumber = 0;
   lastBlockAt = 0;
   lastError?: string;
@@ -26,10 +28,12 @@ export class BotState {
 
   updateFromStats(stats: ScanStats): void {
     this.blocksProcessed = stats.blocksProcessed;
-    this.contractsCreated = stats.contractsCreated;
+    this.pairsDetected = stats.pairsDetected;
     this.tokensIdentified = stats.tokensIdentified;
     this.launchesDetected = stats.launchesDetected;
     this.alertsSent = stats.alertsSent;
+    this.dexScreenerHits = stats.dexScreenerHits;
+    this.dexScreenerMisses = stats.dexScreenerMisses;
     this.lastBlockNumber = stats.lastBlockNumber;
     this.lastBlockAt = stats.lastBlockAt;
   }
@@ -51,16 +55,21 @@ export class BotState {
       blocksProcessed: this.blocksProcessed,
       lastBlockNumber: this.lastBlockNumber,
       lastBlockAt: this.lastBlockAt ? new Date(this.lastBlockAt).toISOString() : null,
-      contractsCreated: this.contractsCreated,
+      pairsDetected: this.pairsDetected,
       tokensIdentified: this.tokensIdentified,
       launchesDetected: this.launchesDetected,
       alertsSent: this.alertsSent,
+      dexScreenerHits: this.dexScreenerHits,
+      dexScreenerMisses: this.dexScreenerMisses,
       lastError: this.lastError ?? null,
       recentAlerts: this.recentAlerts.slice(0, 10).map((a) => ({
         name: a.metadata.name,
         symbol: a.metadata.symbol,
         score: a.risk.score,
         tier: a.risk.tier,
+        ageHours: a.dexScreener ? (a.dexScreener.ageMs / 3_600_000).toFixed(2) : null,
+        h1Txns: a.dexScreener?.h1Txns,
+        h1Sells: a.dexScreener?.h1Sells,
         block: a.blockNumber,
         token: a.tokenAddress,
         at: new Date(a.discoveredAt).toISOString(),

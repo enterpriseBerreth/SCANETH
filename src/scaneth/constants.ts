@@ -15,6 +15,15 @@ export const ETHEREUM = {
   usdt: '0xdAC17F958D2ee523a2206206994597C13D831ec7',
 } as const;
 
+/** Common quote assets on Ethereum. Pairs containing these are candidate launches. */
+export const QUOTE_TOKENS = new Set([
+  '0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2', // WETH
+  '0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48', // USDC
+  '0xdac17f958d2ee523a2206206994597c13d831ec7', // USDT
+  '0x6b175474e89094c44da98b954eedeac495271d0f', // DAI
+  '0x2260fac5e5542a773aa44fbcfedf7c193bc2c599', // WBTC
+]);
+
 /** ERC-20 event and function signatures. */
 export const ERC20 = {
   Transfer: '0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef',
