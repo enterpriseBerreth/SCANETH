@@ -25,12 +25,22 @@ const ERC20_ABI = [
   'function totalSupply() view returns (uint256)',
   'function decimals() view returns (uint8)',
   'function owner() view returns (address)',
+  'function paused() view returns (bool)',
+  'function isBlacklisted(address) view returns (bool)',
+  'function maxTxAmount() view returns (uint256)',
+  'function maxTransactionAmount() view returns (uint256)',
+  'function maxSellAmount() view returns (uint256)',
 ];
 
 interface Erc20Contract {
   balanceOf(address: string): Promise<bigint>;
   totalSupply(): Promise<bigint>;
   owner(): Promise<string>;
+  paused(): Promise<boolean>;
+  isBlacklisted(address: string): Promise<boolean>;
+  maxTxAmount(): Promise<bigint>;
+  maxTransactionAmount(): Promise<bigint>;
+  maxSellAmount(): Promise<bigint>;
 }
 
 interface PairContract {
@@ -109,15 +119,43 @@ const ADMIN_SELECTORS = [
 export async function checkSafety(ctx: SafetyContext): Promise<SafetyReport> {
   const findings: SafetyFinding[] = [];
 
-  const [sim, bytecodeFindings, ownership, concentration, lpLock] = await Promise.all([
+  const [sim, bytecodeFindings, adminState, ownership, concentration, lpLock] = await Promise.all([
     simulateRoundTrip(ctx),
     scanBytecode(ctx.provider, ctx.tokenAddress),
+    checkAdminState(ctx.provider, ctx.tokenAddress),
     checkOwnership(ctx.provider, ctx.tokenAddress),
     checkHolderConcentration(ctx.provider, ctx.tokenAddress, ctx.pairAddress, ctx.maxTopHolderPct),
     checkLpLock(ctx.provider, ctx.pairAddress),
   ]);
 
   findings.push(...bytecodeFindings);
+
+  if (adminState.paused) {
+    findings.push({
+      key: 'paused',
+      label: 'Contract is currently paused',
+      points: 100,
+      critical: true,
+    });
+  }
+
+  if (adminState.blacklisted) {
+    findings.push({
+      key: 'blacklist_active',
+      label: 'Blacklist function is active and blocked our probe address',
+      points: 100,
+      critical: true,
+    });
+  }
+
+  if (adminState.maxTxLimit > 0n && sim.tokenOut > 0n && sim.tokenOut > adminState.maxTxLimit) {
+    findings.push({
+      key: 'max_tx_blocks_sell',
+      label: 'Max transaction limit would block our simulated sell',
+      points: 100,
+      critical: true,
+    });
+  }
 
   if (!sim.buyable) {
     findings.push({
@@ -197,6 +235,8 @@ interface SimResult {
   buyable: boolean;
   sellable: boolean;
   roundTripTaxBps: number;
+  /** Token amount received from simulated buy, used for max-tx checks. */
+  tokenOut: bigint;
 }
 
 /**
@@ -209,6 +249,7 @@ async function simulateRoundTrip(ctx: SafetyContext): Promise<SimResult> {
     buyable: false,
     sellable: false,
     roundTripTaxBps: Number.NaN,
+    tokenOut: 0n,
   };
 
   if (ctx.dex === 'uniswap-v3') {
@@ -229,6 +270,7 @@ async function simulateRoundTrip(ctx: SafetyContext): Promise<SimResult> {
   try {
     const buyAmounts = (await router.getAmountsOut!(probeWei, [ETHEREUM.wrappedNative, ctx.tokenAddress])) as bigint[];
     const tokenOut = buyAmounts[buyAmounts.length - 1] ?? 0n;
+    result.tokenOut = tokenOut;
     if (tokenOut <= 0n) return result;
     result.buyable = true;
 
@@ -301,6 +343,39 @@ async function checkOwnership(provider: Provider, tokenAddress: string): Promise
     // No owner() or reverts — treat as renounced for scoring purposes.
     return { ownershipRenounced: true };
   }
+}
+
+async function checkAdminState(
+  provider: Provider,
+  tokenAddress: string,
+): Promise<{ paused: boolean; blacklisted: boolean; maxTxLimit: bigint }> {
+  const contract = new Contract(tokenAddress, ERC20_ABI, provider) as unknown as Erc20Contract;
+  const state = { paused: false, blacklisted: false, maxTxLimit: 0n };
+
+  try {
+    state.paused = await contract.paused();
+  } catch {
+    // not pausable
+  }
+
+  try {
+    // Use a harmless probe address; if the contract blacklists the zero address
+    // we treat it as a red flag because many rugs blacklist burn addresses.
+    state.blacklisted = await contract.isBlacklisted(ZERO_ADDRESS);
+  } catch {
+    // no blacklist function
+  }
+
+  for (const fn of ['maxTxAmount', 'maxTransactionAmount', 'maxSellAmount'] as const) {
+    try {
+      state.maxTxLimit = await contract[fn]();
+      if (state.maxTxLimit > 0n) break;
+    } catch {
+      // try next
+    }
+  }
+
+  return state;
 }
 
 async function checkHolderConcentration(
