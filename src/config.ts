@@ -48,6 +48,14 @@ export interface ScanethConfig {
   minH1Sells: number;
   /** Max risk score (0-100) to alert. */
   alertRiskScore: number;
+  /** Max safety/rug score (0-100) to alert. */
+  maxSafetyScore: number;
+  /** ETH amount used for buy/sell simulation. */
+  probeEth: number;
+  /** Max acceptable round-trip tax in bps. */
+  maxTaxBps: number;
+  /** Reject if a single wallet holds more than this %. */
+  maxTopHolderPct: number;
   /** How often to poll for new blocks when no WebSocket is available. */
   pollIntervalMs: number;
   /** Optional fixed starting block; if omitted the bot starts at the current head. */
@@ -72,6 +80,10 @@ export function loadConfig(): ScanethConfig {
     minH1Txns: num('MIN_H1_TXNS', 10),
     minH1Sells: num('MIN_H1_SELLS', 1),
     alertRiskScore: num('ALERT_RISK_SCORE', 100),
+    maxSafetyScore: num('MAX_SAFETY_SCORE', 30),
+    probeEth: num('PROBE_ETH', 0.001),
+    maxTaxBps: num('MAX_TAX_BPS', 1000),
+    maxTopHolderPct: num('MAX_TOP_HOLDER_PCT', 50),
     pollIntervalMs: num('POLL_INTERVAL_MS', 12_000),
     startBlock: optionalStr('START_BLOCK') ? num('START_BLOCK', 0) : undefined,
     backtest: optionalStr('BACKTEST_FROM') && optionalStr('BACKTEST_TO')
@@ -98,6 +110,14 @@ function validate(c: ScanethConfig): void {
   if (c.minH1Sells < 0) problems.push('MIN_H1_SELLS cannot be negative');
   if (c.alertRiskScore < 0 || c.alertRiskScore > 100) {
     problems.push('ALERT_RISK_SCORE must be between 0 and 100');
+  }
+  if (c.maxSafetyScore < 0 || c.maxSafetyScore > 100) {
+    problems.push('MAX_SAFETY_SCORE must be between 0 and 100');
+  }
+  if (c.probeEth <= 0) problems.push('PROBE_ETH must be > 0');
+  if (c.maxTaxBps < 0) problems.push('MAX_TAX_BPS cannot be negative');
+  if (c.maxTopHolderPct < 0 || c.maxTopHolderPct > 100) {
+    problems.push('MAX_TOP_HOLDER_PCT must be between 0 and 100');
   }
   if (c.pollIntervalMs < 1_000) {
     problems.push('POLL_INTERVAL_MS below 1000 will hammer the RPC');

@@ -67,6 +67,8 @@ export class BotState {
         symbol: a.metadata.symbol,
         score: a.risk.score,
         tier: a.risk.tier,
+        safetyScore: a.safety.score,
+        sellable: a.safety.sellable,
         ageHours: a.dexScreener ? (a.dexScreener.ageMs / 3_600_000).toFixed(2) : null,
         h1Txns: a.dexScreener?.h1Txns,
         h1Sells: a.dexScreener?.h1Sells,

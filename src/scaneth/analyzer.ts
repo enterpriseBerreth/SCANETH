@@ -166,12 +166,16 @@ export function tierForScore(score: number): import('./types').RiskTier {
  *   - h1 transactions >= MIN_H1_TXNS
  *   - h1 sells >= MIN_H1_SELLS
  *   - risk score <= maxRiskScore
+ *   - safety score <= maxSafetyScore
+ *   - token must be sellable (honeypot check)
  *   - metadata must be complete
  */
 export function shouldAlert(launch: TokenLaunch, filters: ScanFilters): boolean {
   if (!launch.dexScreener) return false;
   if (!launch.metadata.complete) return false;
   if (launch.risk.score > filters.maxRiskScore) return false;
+  if (launch.safety.score > filters.maxSafetyScore) return false;
+  if (!launch.safety.sellable) return false;
 
   const ageHours = launch.dexScreener.ageMs / 3_600_000;
   if (ageHours > filters.maxAgeHours) return false;
@@ -186,6 +190,7 @@ export function formatAlert(launch: TokenLaunch): string {
   const ds = launch.dexScreener!;
   const pair = ds.pair;
   const age = formatAge(ds.ageMs);
+  const s = launch.safety;
 
   const links = [
     `<a href="https://etherscan.io/token/${launch.tokenAddress}">Etherscan</a>`,
@@ -195,6 +200,18 @@ export function formatAlert(launch: TokenLaunch): string {
   const mcap = pair.marketCap ? `$${formatNumber(pair.marketCap)}` : 'unknown';
   const liquidity = pair.liquidity?.usd ? `$${formatNumber(pair.liquidity.usd)}` : 'unknown';
   const price = pair.priceUsd ? `$${Number(pair.priceUsd).toExponential(4)}` : 'unknown';
+  const tax = Number.isFinite(s.roundTripTaxBps) ? `${(s.roundTripTaxBps / 100).toFixed(2)}%` : 'unknown';
+  const lpStatus = s.lpLockedOrBurned ? 'locked/burned' : 'unlocked';
+  const ownership = s.ownershipRenounced ? 'renounced' : 'active';
+
+  const safetyFlags = [
+    s.sellable ? 'sellable' : 'NOT SELLABLE',
+    `tax ${tax}`,
+    `LP ${lpStatus}`,
+    `owner ${ownership}`,
+    s.hasAdminFunctions ? 'admin funcs' : 'no admin funcs',
+    s.concentrated ? `top holder ${s.topHolderPct.toFixed(1)}%` : 'supply not concentrated',
+  ].join(' · ');
 
   return (
     `<b>SCANETH — Active new launch</b>\n\n` +
@@ -208,6 +225,9 @@ export function formatAlert(launch: TokenLaunch): string {
     `Txns: <b>${ds.h1Txns}</b>\n` +
     `Buys: ${ds.h1Buys}\n` +
     `Sells: <b>${ds.h1Sells}</b>\n\n` +
+    `<b>Safety check</b>\n` +
+    `Score: ${s.score}/100\n` +
+    `${safetyFlags}\n\n` +
     `Risk score: ${launch.risk.score}/100 (${launch.risk.tier})\n\n` +
     links.join(' · ')
   );

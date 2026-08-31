@@ -47,6 +47,10 @@ class ScanethBot {
       minH1Txns: this.config.minH1Txns,
       minH1Sells: this.config.minH1Sells,
       maxRiskScore: this.config.alertRiskScore,
+      maxSafetyScore: this.config.maxSafetyScore,
+      probeEth: this.config.probeEth,
+      maxTaxBps: this.config.maxTaxBps,
+      maxTopHolderPct: this.config.maxTopHolderPct,
     });
 
     const network = await this.providers.http.getNetwork();
@@ -86,6 +90,10 @@ class ScanethBot {
         minH1Txns: this.config.minH1Txns,
         minH1Sells: this.config.minH1Sells,
         maxRiskScore: this.config.alertRiskScore,
+        maxSafetyScore: this.config.maxSafetyScore,
+        probeEth: this.config.probeEth,
+        maxTaxBps: this.config.maxTaxBps,
+        maxTopHolderPct: this.config.maxTopHolderPct,
       },
       telegram: this.notifier.isEnabled ? 'enabled' : 'disabled',
     });

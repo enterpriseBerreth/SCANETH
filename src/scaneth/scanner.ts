@@ -13,6 +13,7 @@ import { DEX_FACTORIES, QUOTE_TOKENS } from './constants';
 import type { ScanStats, TokenLaunch } from './types';
 import { analyzeToken, formatAlert, shouldAlert } from './analyzer';
 import { fetchTokenPairs, formatAge, pairAgeMs, pickBestPair } from './dexscreener';
+import { checkSafety } from './safety';
 
 const log = createLogger('scaneth:scanner');
 
@@ -38,6 +39,14 @@ export interface ScanFilters {
   minH1Sells: number;
   /** Max risk score (0-100) to alert. */
   maxRiskScore: number;
+  /** Max safety/rug score (0-100) to alert. */
+  maxSafetyScore: number;
+  /** Simulated probe size in ETH. */
+  probeEth: number;
+  /** Max acceptable round-trip tax in bps. */
+  maxTaxBps: number;
+  /** Reject if top holder exceeds this %. */
+  maxTopHolderPct: number;
 }
 
 export class BlockScanner {
@@ -209,10 +218,19 @@ export class BlockScanner {
     txHash: string,
     blockNumber: number,
   ): Promise<TokenLaunch | null> {
-    const [risk, metadata, pairs] = await Promise.all([
+    const [risk, metadata, pairs, safety] = await Promise.all([
       analyzeToken(this.provider, tokenAddress, ''),
       import('./analyzer').then((m) => m.readTokenMetadata(this.provider, tokenAddress)),
       fetchTokenPairs(tokenAddress),
+      checkSafety({
+        provider: this.provider,
+        tokenAddress,
+        pairAddress,
+        dex,
+        probeEth: this.filters.probeEth,
+        maxTaxBps: this.filters.maxTaxBps,
+        maxTopHolderPct: this.filters.maxTopHolderPct,
+      }),
     ]);
 
     const bestPair = pickBestPair(pairs, tokenAddress);
@@ -248,6 +266,7 @@ export class BlockScanner {
       metadata,
       dexScreener,
       risk,
+      safety,
     };
   }
 }

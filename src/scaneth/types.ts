@@ -7,6 +7,7 @@
  */
 
 import type { DexScreenerPair } from './dexscreener';
+import type { SafetyReport } from './safety';
 
 export type RiskTier = 'low' | 'medium' | 'high' | 'critical';
 
@@ -25,6 +26,8 @@ export interface TokenLaunch {
   dexScreener?: DexScreenerEnrichment;
   /** Risk evaluation result. */
   risk: RiskReport;
+  /** On-chain safety / rug-pull report. */
+  safety: SafetyReport;
 }
 
 export interface DexScreenerEnrichment {
