@@ -1,10 +1,11 @@
 /**
  * SCANETH entry point.
  *
- * Wires the Ethereum block scanner, DEXScreener enrichment, Telegram notifier
- * and HTTP server together. The bot streams every new Ethereum block, detects
- * new DEX pairs, enriches the non-quote token with DEXScreener data, and sends
- * Telegram alerts when age + activity filters are met.
+ * Wires the Ethereum block scanner, DEXScreener enrichment, Telegram notifier,
+ * ATH/PNL tracker and HTTP server together. The bot streams every new Ethereum
+ * block, detects new DEX pairs, enriches the non-quote token with DEXScreener
+ * data, sends Telegram alerts when safety + activity filters are met, and then
+ * tracks alerted tokens for daily ATH with unrealized PNL updates.
  */
 
 import { loadConfig, type ScanethConfig } from './config';
@@ -14,6 +15,7 @@ import { startServer } from './server';
 import { ScanethNotifier } from './scaneth/notifier';
 import { BlockScanner } from './scaneth/scanner';
 import { createProviders, destroyProviders, type ProviderPair } from './scaneth/provider';
+import { AthTracker } from './scaneth/tracker';
 import type { TokenLaunch } from './scaneth/types';
 import type { Server } from 'node:http';
 
@@ -22,6 +24,7 @@ const log = createLogger('scaneth');
 class ScanethBot {
   private readonly state = new BotState();
   private readonly notifier: ScanethNotifier;
+  private readonly tracker: AthTracker;
   private providers?: ProviderPair;
   private scanner?: BlockScanner;
   private httpServer?: Server;
@@ -30,6 +33,7 @@ class ScanethBot {
 
   constructor(private readonly config: ScanethConfig) {
     this.notifier = new ScanethNotifier(config);
+    this.tracker = new AthTracker(config, this.notifier);
   }
 
   async start(): Promise<void> {
@@ -59,6 +63,10 @@ class ScanethBot {
     if (this.config.telegramTestOnBoot) {
       const ok = await this.notifier.test();
       log.info(ok ? 'telegram test delivered' : 'telegram test failed');
+    }
+
+    if (this.config.athTrackerEnabled) {
+      this.tracker.start();
     }
 
     if (this.config.backtest) {
@@ -95,6 +103,7 @@ class ScanethBot {
         maxTaxBps: this.config.maxTaxBps,
         maxTopHolderPct: this.config.maxTopHolderPct,
       },
+      athTracker: this.config.athTrackerEnabled ? 'enabled' : 'disabled',
       telegram: this.notifier.isEnabled ? 'enabled' : 'disabled',
     });
     log.info('research-only scanner — no transactions are ever sent');
@@ -140,6 +149,9 @@ class ScanethBot {
       if (this.notifier.isEnabled) {
         await this.notifier.alertLaunch(alert);
       }
+      if (this.config.athTrackerEnabled) {
+        this.tracker.trackAlert(alert);
+      }
     }
   }
 
@@ -149,6 +161,7 @@ class ScanethBot {
     log.info('shutting down', this.state.snapshot());
 
     if (this.pollTimer) clearTimeout(this.pollTimer);
+    this.tracker.stop();
 
     if (this.providers) {
       destroyProviders(this.providers);

@@ -60,6 +60,8 @@ export function startServer(deps: ServerDeps): Server {
             maxTaxBps: deps.config.maxTaxBps,
             maxTopHolderPct: deps.config.maxTopHolderPct,
             pollIntervalMs: deps.config.pollIntervalMs,
+            athPollIntervalMs: deps.config.athPollIntervalMs,
+            athTrackerEnabled: deps.config.athTrackerEnabled,
           },
           state: deps.state.snapshot(),
         }),

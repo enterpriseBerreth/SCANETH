@@ -58,6 +58,10 @@ export interface ScanethConfig {
   maxTopHolderPct: number;
   /** How often to poll for new blocks when no WebSocket is available. */
   pollIntervalMs: number;
+  /** How often to poll DEXScreener for ATH tracking on alerted tokens. */
+  athPollIntervalMs: number;
+  /** Enable ATH/PNL follow-up alerts. */
+  athTrackerEnabled: boolean;
   /** Optional fixed starting block; if omitted the bot starts at the current head. */
   startBlock?: number;
   /** Optional historical scan range for backtesting. */
@@ -85,6 +89,8 @@ export function loadConfig(): ScanethConfig {
     maxTaxBps: num('MAX_TAX_BPS', 1000),
     maxTopHolderPct: num('MAX_TOP_HOLDER_PCT', 50),
     pollIntervalMs: num('POLL_INTERVAL_MS', 12_000),
+    athPollIntervalMs: num('ATH_POLL_INTERVAL_MS', 60_000),
+    athTrackerEnabled: bool('ATH_TRACKER_ENABLED', true),
     startBlock: optionalStr('START_BLOCK') ? num('START_BLOCK', 0) : undefined,
     backtest: optionalStr('BACKTEST_FROM') && optionalStr('BACKTEST_TO')
       ? {
@@ -121,6 +127,9 @@ function validate(c: ScanethConfig): void {
   }
   if (c.pollIntervalMs < 1_000) {
     problems.push('POLL_INTERVAL_MS below 1000 will hammer the RPC');
+  }
+  if (c.athPollIntervalMs < 5_000) {
+    problems.push('ATH_POLL_INTERVAL_MS below 5000 will hammer DEXScreener');
   }
   if (c.backtest && c.backtest.to < c.backtest.from) {
     problems.push('BACKTEST_TO must be greater than or equal to BACKTEST_FROM');

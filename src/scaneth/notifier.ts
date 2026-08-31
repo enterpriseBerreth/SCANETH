@@ -40,6 +40,11 @@ export class ScanethNotifier {
     );
   }
 
+  /** Send an arbitrary HTML message. Used by the ATH tracker. */
+  async sendRaw(text: string): Promise<boolean> {
+    return this.sendChecked(text);
+  }
+
   async error(scope: string, message: string): Promise<void> {
     await this.send(
       `<b>SCANETH error</b> [${escapeHtml(scope)}]\n<code>${escapeHtml(message.slice(0, 500))}</code>`,
