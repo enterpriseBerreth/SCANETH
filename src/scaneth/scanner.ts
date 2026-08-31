@@ -210,7 +210,7 @@ export class BlockScanner {
     blockNumber: number,
   ): Promise<TokenLaunch | null> {
     const [risk, metadata, pairs] = await Promise.all([
-      analyzeToken(this.provider, tokenAddress, ''),
+      analyzeToken(this.provider, tokenAddress, '', pairAddress),
       import('./analyzer').then((m) => m.readTokenMetadata(this.provider, tokenAddress)),
       fetchTokenPairs(tokenAddress),
     ]);

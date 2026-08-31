@@ -57,6 +57,21 @@ export interface RiskReport {
   tier: RiskTier;
   /** Individual findings that contributed to the score. */
   findings: RiskFinding[];
+  /** Safety readout used to block alerts before a launch is surfaced. */
+  safety?: SafetyReport;
+}
+
+export interface SafetyReport {
+  okay: boolean;
+  criticalIssues: string[];
+  warnings: string[];
+  honeypot: boolean;
+  buyTaxPct: number;
+  maxTxBlocksSell: boolean;
+  lpBurned: boolean;
+  ownerRenounced: boolean;
+  holderConcentrationPct: number;
+  adminFlags: string[];
 }
 
 export interface RiskFinding {
