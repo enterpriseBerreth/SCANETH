@@ -36,7 +36,7 @@ export class ScanethNotifier {
   async test(): Promise<boolean> {
     return this.sendChecked(
       `<b>SCANETH — Telegram test</b>\n\n` +
-        `Connection verified. Low-risk token launch alerts will arrive here.`,
+        `Connection verified. New ETH launch alerts (7+ buys) will arrive here, followed by ATH/PNL updates.`,
     );
   }
 

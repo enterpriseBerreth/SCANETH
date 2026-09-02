@@ -1,5 +1,8 @@
 /**
  * SCANETH environment parsing and validation.
+ *
+ * New plan: alert on any new ETH token launch that reaches MIN_BUYS buys.
+ * Safety checks run and are reported, but they never block alerts.
  */
 
 import 'dotenv/config';
@@ -40,21 +43,13 @@ export interface ScanethConfig {
   wsUrl?: string;
   /** HTTP server port for healthchecks. */
   port: number;
-  /** Max pair age in hours to alert. */
-  maxAgeHours: number;
-  /** Minimum transactions in the past hour to alert. */
-  minH1Txns: number;
-  /** Minimum sells in the past hour to alert. */
-  minH1Sells: number;
-  /** Max risk score (0-100) to alert. */
-  alertRiskScore: number;
-  /** Max safety/rug score (0-100) to alert. */
-  maxSafetyScore: number;
+  /** Minimum total buys before sending an alert. */
+  minBuys: number;
   /** ETH amount used for buy/sell simulation. */
   probeEth: number;
-  /** Max acceptable round-trip tax in bps. */
+  /** Max acceptable round-trip tax in bps for the safety check. */
   maxTaxBps: number;
-  /** Reject if a single wallet holds more than this %. */
+  /** Flag if a single wallet holds more than this %. */
   maxTopHolderPct: number;
   /** How often to poll for new blocks when no WebSocket is available. */
   pollIntervalMs: number;
@@ -80,11 +75,7 @@ export function loadConfig(): ScanethConfig {
     rpcUrl: str('ETHEREUM_RPC_URL', 'https://ethereum-rpc.publicnode.com'),
     wsUrl: optionalStr('ETHEREUM_WS_URL'),
     port: num('PORT', 3000),
-    maxAgeHours: num('MAX_AGE_HOURS', 6),
-    minH1Txns: num('MIN_H1_TXNS', 10),
-    minH1Sells: num('MIN_H1_SELLS', 1),
-    alertRiskScore: num('ALERT_RISK_SCORE', 100),
-    maxSafetyScore: num('MAX_SAFETY_SCORE', 30),
+    minBuys: num('MIN_BUYS', 7),
     probeEth: num('PROBE_ETH', 0.001),
     maxTaxBps: num('MAX_TAX_BPS', 1000),
     maxTopHolderPct: num('MAX_TOP_HOLDER_PCT', 50),
@@ -111,15 +102,7 @@ export function loadConfig(): ScanethConfig {
 function validate(c: ScanethConfig): void {
   const problems: string[] = [];
 
-  if (c.maxAgeHours <= 0) problems.push('MAX_AGE_HOURS must be > 0');
-  if (c.minH1Txns < 0) problems.push('MIN_H1_TXNS cannot be negative');
-  if (c.minH1Sells < 0) problems.push('MIN_H1_SELLS cannot be negative');
-  if (c.alertRiskScore < 0 || c.alertRiskScore > 100) {
-    problems.push('ALERT_RISK_SCORE must be between 0 and 100');
-  }
-  if (c.maxSafetyScore < 0 || c.maxSafetyScore > 100) {
-    problems.push('MAX_SAFETY_SCORE must be between 0 and 100');
-  }
+  if (c.minBuys < 1) problems.push('MIN_BUYS must be >= 1');
   if (c.probeEth <= 0) problems.push('PROBE_ETH must be > 0');
   if (c.maxTaxBps < 0) problems.push('MAX_TAX_BPS cannot be negative');
   if (c.maxTopHolderPct < 0 || c.maxTopHolderPct > 100) {

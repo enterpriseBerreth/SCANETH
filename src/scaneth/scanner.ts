@@ -4,7 +4,8 @@
  * Watches every Ethereum block for new DEX pairs (Uniswap V2, SushiSwap V2,
  * Uniswap V3). For each newly-paired token it queries DEXScreener to enrich
  * the launch with age, transaction counts, buys/sells, liquidity and market
- * cap. Alerts are only emitted when the configured filters pass.
+ * cap. Alerts are emitted as soon as the token reaches 7 total buys;
+ * safety/rug status is reported but never blocks the alert.
  */
 
 import { Interface, type Log, type Provider } from 'ethers';
@@ -12,7 +13,7 @@ import { createLogger, errMeta } from '../logger';
 import { DEX_FACTORIES, QUOTE_TOKENS } from './constants';
 import type { ScanStats, TokenLaunch } from './types';
 import { analyzeToken, formatAlert, shouldAlert } from './analyzer';
-import { fetchTokenPairs, formatAge, pairAgeMs, pickBestPair } from './dexscreener';
+import { fetchTokenPairs, pairAgeMs, pickBestPair } from './dexscreener';
 import { checkSafety } from './safety';
 
 const log = createLogger('scaneth:scanner');
@@ -31,21 +32,13 @@ export interface ScanResult {
 }
 
 export interface ScanFilters {
-  /** Max pair age in hours to consider. */
-  maxAgeHours: number;
-  /** Minimum transactions in the past hour. */
-  minH1Txns: number;
-  /** Minimum sells in the past hour. */
-  minH1Sells: number;
-  /** Max risk score (0-100) to alert. */
-  maxRiskScore: number;
-  /** Max safety/rug score (0-100) to alert. */
-  maxSafetyScore: number;
-  /** Simulated probe size in ETH. */
+  /** Minimum total buys across all buckets before alerting. */
+  minBuys: number;
+  /** Simulated probe size in ETH for the safety check. */
   probeEth: number;
-  /** Max acceptable round-trip tax in bps. */
+  /** Max acceptable round-trip tax in bps for the safety check. */
   maxTaxBps: number;
-  /** Reject if top holder exceeds this %. */
+  /** Flag if top holder exceeds this % for the safety check. */
   maxTopHolderPct: number;
 }
 
@@ -104,7 +97,7 @@ export class BlockScanner {
             this.stats.launchesDetected += 1;
             result.launches.push(launch);
 
-            if (shouldAlert(launch, this.filters)) {
+            if (shouldAlert(launch, this.filters.minBuys)) {
               result.alerts.push(launch);
               this.stats.alertsSent += 1;
             }

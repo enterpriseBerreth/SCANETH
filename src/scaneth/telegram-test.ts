@@ -11,7 +11,19 @@ async function main(): Promise<void> {
   const config = loadConfig();
   const notifier = new ScanethNotifier(config);
 
-  const initialOk = await notifier.test();
+  const initialMessage =
+    `<b>SCANETH — New launch hit 7 buys (test)</b>\n\n` +
+    `<b>Example Token (EXAMPLE)</b>\n` +
+    `Address: <code>0x1234567890123456789012345678901234567890</code>\n` +
+    `Age: <b>12m</b>\n` +
+    `Price: $0.00001234\n\n` +
+    `<b>Legitimacy check</b>\n` +
+    `✅ Looks legitimate — no major red flags. Potential good buy.\n\n` +
+    `Risk score: 5/100 (low) · Safety score: 10/100\n\n` +
+    `<a href="https://etherscan.io/token/0x1234567890123456789012345678901234567890">Etherscan</a> · ` +
+    `<a href="https://dexscreener.com/ethereum/0x1234567890123456789012345678901234567890">DEXScreener</a>`;
+
+  const initialOk = await notifier.sendRaw(initialMessage);
   if (!initialOk) {
     console.error('Initial test alert failed');
     process.exit(1);

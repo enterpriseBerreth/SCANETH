@@ -47,11 +47,7 @@ class ScanethBot {
 
     this.providers = createProviders(this.config.rpcUrl, this.config.wsUrl);
     this.scanner = new BlockScanner(this.providers.http, {
-      maxAgeHours: this.config.maxAgeHours,
-      minH1Txns: this.config.minH1Txns,
-      minH1Sells: this.config.minH1Sells,
-      maxRiskScore: this.config.alertRiskScore,
-      maxSafetyScore: this.config.maxSafetyScore,
+      minBuys: this.config.minBuys,
       probeEth: this.config.probeEth,
       maxTaxBps: this.config.maxTaxBps,
       maxTopHolderPct: this.config.maxTopHolderPct,
@@ -94,11 +90,7 @@ class ScanethBot {
     log.info('SCANETH starting', {
       rpcUrl: this.config.rpcUrl.replace(/\/\/.*@/, '//***@'),
       filters: {
-        maxAgeHours: this.config.maxAgeHours,
-        minH1Txns: this.config.minH1Txns,
-        minH1Sells: this.config.minH1Sells,
-        maxRiskScore: this.config.alertRiskScore,
-        maxSafetyScore: this.config.maxSafetyScore,
+        minBuys: this.config.minBuys,
         probeEth: this.config.probeEth,
         maxTaxBps: this.config.maxTaxBps,
         maxTopHolderPct: this.config.maxTopHolderPct,

@@ -1,15 +1,15 @@
 /**
- * SCANETH token risk analyzer and alert formatter.
+ * SCANETH token analyzer and alert formatter.
  *
- * Combines bytecode heuristics with on-chain metadata reads. Nothing here
- * executes a trade; the goal is to surface launches worth human review.
+ * New plan: alert on every brand-new ETH token launch as soon as it reaches
+ * 7 buys. Safety/rug checks are reported but never block the alert. An ATH/PNL
+ * follow-up alert is sent later by the tracker.
  */
 
 import { Contract, type Provider } from 'ethers';
 import { createLogger, errMeta } from '../logger';
 import { RISK_PATTERNS, RISK_TIERS } from './constants';
 import type { RiskFinding, RiskReport, TokenLaunch, TokenMetadata } from './types';
-import type { ScanFilters } from './scanner';
 import { formatAge } from './dexscreener';
 
 const log = createLogger('scaneth:analyzer');
@@ -158,79 +158,63 @@ export function tierForScore(score: number): import('./types').RiskTier {
   return 'critical';
 }
 
-/**
- * Decide whether a launch is worth alerting.
- *
- * Filters:
- *   - pair age <= MAX_AGE_HOURS
- *   - h1 transactions >= MIN_H1_TXNS
- *   - h1 sells >= MIN_H1_SELLS
- *   - risk score <= maxRiskScore
- *   - safety score <= maxSafetyScore
- *   - token must be sellable (honeypot check)
- *   - metadata must be complete
- */
-export function shouldAlert(launch: TokenLaunch, filters: ScanFilters): boolean {
-  if (!launch.dexScreener) return false;
-  if (!launch.metadata.complete) return false;
-  if (launch.risk.score > filters.maxRiskScore) return false;
-  if (launch.safety.score > filters.maxSafetyScore) return false;
-  if (!launch.safety.sellable) return false;
-
-  const ageHours = launch.dexScreener.ageMs / 3_600_000;
-  if (ageHours > filters.maxAgeHours) return false;
-  if (launch.dexScreener.h1Txns < filters.minH1Txns) return false;
-  if (launch.dexScreener.h1Sells < filters.minH1Sells) return false;
-
-  return true;
+/** Sum buys across all DEXScreener time buckets. */
+export function totalBuys(launch: TokenLaunch): number {
+  const txns = launch.dexScreener?.pair.txns;
+  if (!txns) return 0;
+  return (txns.m5?.buys ?? 0) + (txns.h1?.buys ?? 0) + (txns.h6?.buys ?? 0) + (txns.h24?.buys ?? 0);
 }
 
-/** Format a launch into a concise Telegram alert. */
+/**
+ * Alert trigger: any new ETH token launch that has 7 or more buys.
+ * Safety status is reported in the alert but never blocks it.
+ */
+export function shouldAlert(launch: TokenLaunch, minBuys: number): boolean {
+  if (!launch.dexScreener) return false;
+  if (!launch.metadata.complete) return false;
+  return totalBuys(launch) >= minBuys;
+}
+
+/** Format the initial launch alert. */
 export function formatAlert(launch: TokenLaunch): string {
   const ds = launch.dexScreener!;
   const pair = ds.pair;
   const age = formatAge(ds.ageMs);
   const s = launch.safety;
+  const buys = totalBuys(launch);
 
   const links = [
     `<a href="https://etherscan.io/token/${launch.tokenAddress}">Etherscan</a>`,
     `<a href="https://dexscreener.com/ethereum/${pair.pairAddress}">DEXScreener</a>`,
   ];
 
-  const mcap = pair.marketCap ? `$${formatNumber(pair.marketCap)}` : 'unknown';
-  const liquidity = pair.liquidity?.usd ? `$${formatNumber(pair.liquidity.usd)}` : 'unknown';
   const price = pair.priceUsd ? `$${Number(pair.priceUsd).toExponential(4)}` : 'unknown';
-  const tax = Number.isFinite(s.roundTripTaxBps) ? `${(s.roundTripTaxBps / 100).toFixed(2)}%` : 'unknown';
-  const lpStatus = s.lpLockedOrBurned ? 'locked/burned' : 'unlocked';
-  const ownership = s.ownershipRenounced ? 'renounced' : 'active';
-
-  const safetyFlags = [
-    s.sellable ? 'sellable' : 'NOT SELLABLE',
-    `tax ${tax}`,
-    `LP ${lpStatus}`,
-    `owner ${ownership}`,
-    s.hasAdminFunctions ? 'admin funcs' : 'no admin funcs',
-    s.concentrated ? `top holder ${s.topHolderPct.toFixed(1)}%` : 'supply not concentrated',
-  ].join(' · ');
+  const verdict = safetyVerdict(s);
 
   return (
-    `<b>SCANETH — Active new launch</b>\n\n` +
+    `<b>SCANETH — New launch hit ${buys} buys</b>\n\n` +
     `<b>${escapeHtml(launch.metadata.name)} (${escapeHtml(launch.metadata.symbol)})</b>\n` +
     `Address: <code>${launch.tokenAddress}</code>\n` +
     `Age: <b>${age}</b>\n` +
-    `Price: ${price}\n` +
-    `Market cap: ${mcap}\n` +
-    `Liquidity: ${liquidity}\n\n` +
-    `<b>Past hour activity</b>\n` +
-    `Txns: <b>${ds.h1Txns}</b>\n` +
-    `Buys: ${ds.h1Buys}\n` +
-    `Sells: <b>${ds.h1Sells}</b>\n\n` +
-    `<b>Safety check</b>\n` +
-    `Score: ${s.score}/100\n` +
-    `${safetyFlags}\n\n` +
-    `Risk score: ${launch.risk.score}/100 (${launch.risk.tier})\n\n` +
+    `Price: ${price}\n\n` +
+    `<b>Legitimacy check</b>\n` +
+    `${verdict}\n\n` +
+    `Risk score: ${launch.risk.score}/100 (${launch.risk.tier}) · Safety score: ${s.score}/100\n\n` +
     links.join(' · ')
   );
+}
+
+export function safetyVerdict(s: TokenLaunch['safety']): string {
+  if (!s.sellable) {
+    return '⚠️ Likely honeypot — sell simulation failed. NOT a good buy.';
+  }
+  if (s.score <= 20) {
+    return '✅ Looks legitimate — no major red flags. Potential good buy.';
+  }
+  if (s.score <= 50) {
+    return `⚠️ Some risk flags (${s.findings.slice(0, 2).map((f) => f.label).join('; ')}). Caution advised.`;
+  }
+  return `🚨 High rug risk — ${s.findings.slice(0, 2).map((f) => f.label).join('; ')}. NOT a good buy.`;
 }
 
 function formatNumber(n: number): string {
