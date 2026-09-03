@@ -47,7 +47,9 @@ export const BURN_ADDRESSES = new Set([
   '0xdead000000000000000042069420694206942069',
 ]);
 
-/** Factory deployments we watch for new pairs/pools. */
+/** Factory deployments we watch for new pairs/pools. The scanner also parses
+ *  PairCreated / PoolCreated events from any address, so this list is mainly
+ *  for friendly DEX naming and known-router safety simulations. */
 export const DEX_FACTORIES = {
   'uniswap-v2': {
     address: '0x5C69bEe701ef814a2B6a3EDD4B1652CB9cc5aA6f',
@@ -56,6 +58,14 @@ export const DEX_FACTORIES = {
   },
   'sushiswap-v2': {
     address: '0xC0AEe478e3658e2610c5F7A4A2E1777cE9e4f2Ac',
+    topic: '0x0d3648bd0f6ba80134a33ba9275ac585d9d315f0ad8355cddefde31afa28d0e7',
+  },
+  'pancakeswap-v2': {
+    address: '0x1097053Fd2f12Fadd0eEc915ebDA2C264c75fa73',
+    topic: '0x0d3648bd0f6ba80134a33ba9275ac585d9d315f0ad8355cddefde31afa28d0e7',
+  },
+  'shibaswap': {
+    address: '0x115934131916C8b277DD010Ee02de363c09d037c',
     topic: '0x0d3648bd0f6ba80134a33ba9275ac585d9d315f0ad8355cddefde31afa28d0e7',
   },
   'uniswap-v3': {

@@ -55,7 +55,9 @@ export interface SafetyReport {
   sellable: boolean;
   /** True if a buy simulation succeeded. */
   buyable: boolean;
-  /** Estimated buy+sell tax in basis points. NaN if simulation failed. */
+  /** True if the sell simulation was skipped because no router is known. */
+  simulationSkipped: boolean;
+  /** Estimated buy+sell tax in basis points. NaN if simulation failed or skipped. */
   roundTripTaxBps: number;
   /** True if LP tokens appear locked or burned. */
   lpLockedOrBurned: boolean;
@@ -219,6 +221,7 @@ export async function checkSafety(ctx: SafetyContext): Promise<SafetyReport> {
     score,
     sellable: sim.sellable,
     buyable: sim.buyable,
+    simulationSkipped: sim.simulationSkipped,
     roundTripTaxBps: sim.roundTripTaxBps,
     lpLockedOrBurned: lpLock,
     ownershipRenounced: ownership.ownershipRenounced,
@@ -234,6 +237,7 @@ export async function checkSafety(ctx: SafetyContext): Promise<SafetyReport> {
 interface SimResult {
   buyable: boolean;
   sellable: boolean;
+  simulationSkipped: boolean;
   roundTripTaxBps: number;
   /** Token amount received from simulated buy, used for max-tx checks. */
   tokenOut: bigint;
@@ -248,19 +252,27 @@ async function simulateRoundTrip(ctx: SafetyContext): Promise<SimResult> {
   const result: SimResult = {
     buyable: false,
     sellable: false,
+    simulationSkipped: false,
     roundTripTaxBps: Number.NaN,
     tokenOut: 0n,
   };
 
-  if (ctx.dex === 'uniswap-v3') {
+  if (ctx.dex === 'uniswap-v3' || ctx.dex === 'unknown-v3') {
     // V3 simulation is more complex; skip rather than mislabel.
+    result.simulationSkipped = true;
     result.buyable = true;
     result.sellable = true;
     return result;
   }
 
   const routerAddress = getV2Router(ctx.dex);
-  if (!routerAddress) return result;
+  if (!routerAddress) {
+    // Unknown router: we cannot verify sellability, so skip rather than flag as honeypot.
+    result.simulationSkipped = true;
+    result.buyable = true;
+    result.sellable = true;
+    return result;
+  }
 
   const router = new Contract(routerAddress, UNIV2_ROUTER_ABI, ctx.provider);
   const probeWei = BigInt(Math.floor(ctx.probeEth * 1e18));

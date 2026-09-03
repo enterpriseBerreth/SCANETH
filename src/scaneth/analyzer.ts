@@ -170,7 +170,7 @@ export function formatAlert(launch: TokenLaunch): string {
   const age = ds ? formatAge(ds.ageMs) : 'just launched';
   const s = launch.safety;
 
-  const rating = scamRating(s.score, s.sellable);
+  const rating = scamRating(s.score, s.sellable, s.simulationSkipped);
   const { pros, cons } = buildProsCons(launch);
 
   const links = [
@@ -196,11 +196,21 @@ export function formatAlert(launch: TokenLaunch): string {
   );
 }
 
-function scamRating(score: number, sellable: boolean): { label: string; explanation: string } {
+function scamRating(
+  score: number,
+  sellable: boolean,
+  simulationSkipped: boolean,
+): { label: string; explanation: string } {
   if (!sellable) {
     return {
       label: 'HONEYPOT',
       explanation: 'Sell simulation failed — you may not be able to exit. Treat as a scam.',
+    };
+  }
+  if (simulationSkipped) {
+    return {
+      label: score <= 50 ? 'UNVERIFIED' : 'RISKY / UNVERIFIED',
+      explanation: 'No known router for this DEX, so sellability could not be verified. DYOR.',
     };
   }
   if (score <= 20) {
@@ -232,8 +242,15 @@ function buildProsCons(launch: TokenLaunch): { pros: string[]; cons: string[] } 
   const cons: string[] = [];
   const s = launch.safety;
 
-  if (s.sellable) pros.push('✅ Sellable — simulated sell succeeded');
-  else cons.push('🚨 Not sellable — possible honeypot');
+  if (s.sellable) {
+    if (s.simulationSkipped) {
+      cons.push('⚠️ Sellability not verified — no known router for this DEX');
+    } else {
+      pros.push('✅ Sellable — simulated sell succeeded');
+    }
+  } else {
+    cons.push('🚨 Not sellable — possible honeypot');
+  }
 
   if (s.lpLockedOrBurned) pros.push('✅ Liquidity locked or burned');
   else cons.push('🚨 Liquidity unlocked');

@@ -142,50 +142,58 @@ export class BlockScanner {
     for (const logEntry of logs) {
       const address = logEntry.address.toLowerCase();
 
-      // Uniswap V2 / SushiSwap V2 PairCreated.
-      for (const [dex, factory] of Object.entries(DEX_FACTORIES)) {
-        if (dex === 'uniswap-v3') continue;
-        if (address !== factory.address.toLowerCase()) continue;
-        try {
-          const parsed = PAIR_CREATED_IFACE.parseLog(logEntry);
-          if (!parsed) continue;
+      // Try to parse any V2-style PairCreated event, regardless of factory address.
+      // This catches Uniswap V2 forks and clones that emit the same signature.
+      try {
+        const parsed = PAIR_CREATED_IFACE.parseLog(logEntry);
+        if (parsed) {
           const t0 = String(parsed.args.token0).toLowerCase();
           const t1 = String(parsed.args.token1).toLowerCase();
           const tokenAddress = this.identifyNewToken(t0, t1);
-          if (!tokenAddress) continue;
-          out.push({
-            tokenAddress,
-            dex,
-            pairAddress: String(parsed.args.pair),
-            txHash: logEntry.transactionHash,
-          });
-        } catch {
-          // ignore parse failures
+          if (tokenAddress) {
+            out.push({
+              tokenAddress,
+              dex: this.dexNameFromAddress(address, 'v2'),
+              pairAddress: String(parsed.args.pair),
+              txHash: logEntry.transactionHash,
+            });
+            continue;
+          }
         }
+      } catch {
+        // not a PairCreated event
       }
 
-      // Uniswap V3 PoolCreated.
-      if (address === DEX_FACTORIES['uniswap-v3'].address.toLowerCase()) {
-        try {
-          const parsed = POOL_CREATED_IFACE.parseLog(logEntry);
-          if (!parsed) continue;
+      // Try to parse any V3-style PoolCreated event, regardless of factory address.
+      try {
+        const parsed = POOL_CREATED_IFACE.parseLog(logEntry);
+        if (parsed) {
           const t0 = String(parsed.args.token0).toLowerCase();
           const t1 = String(parsed.args.token1).toLowerCase();
           const tokenAddress = this.identifyNewToken(t0, t1);
-          if (!tokenAddress) continue;
-          out.push({
-            tokenAddress,
-            dex: 'uniswap-v3',
-            pairAddress: String(parsed.args.pool),
-            txHash: logEntry.transactionHash,
-          });
-        } catch {
-          // ignore parse failures
+          if (tokenAddress) {
+            out.push({
+              tokenAddress,
+              dex: this.dexNameFromAddress(address, 'v3'),
+              pairAddress: String(parsed.args.pool),
+              txHash: logEntry.transactionHash,
+            });
+            continue;
+          }
         }
+      } catch {
+        // not a PoolCreated event
       }
     }
 
     return out;
+  }
+
+  private dexNameFromAddress(address: string, kind: 'v2' | 'v3'): string {
+    for (const [dex, factory] of Object.entries(DEX_FACTORIES)) {
+      if (factory.address.toLowerCase() === address) return dex;
+    }
+    return kind === 'v2' ? 'unknown-v2' : 'unknown-v3';
   }
 
   /**
