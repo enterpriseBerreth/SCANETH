@@ -158,9 +158,24 @@ export function tierForScore(score: number): import('./types').RiskTier {
   return 'critical';
 }
 
-/** Alert on every new launch with complete on-chain metadata. */
+const BLOCKING_FINDINGS = new Set([
+  'paused',
+  'blacklist_active',
+  'buy_failed',
+  'sell_failed',
+  'max_tx_blocks_sell',
+]);
+
+/**
+ * Alert on every new launch with complete on-chain metadata, UNLESS the token
+ * is 100% verified as untradable (honeypot, paused, blacklisted, etc.).
+ */
 export function shouldAlert(launch: TokenLaunch): boolean {
-  return launch.metadata.complete;
+  if (!launch.metadata.complete) return false;
+  const s = launch.safety;
+  if (!s.sellable && !s.simulationSkipped) return false;
+  if (s.findings.some((f) => BLOCKING_FINDINGS.has(f.key))) return false;
+  return true;
 }
 
 /** Format the immediate launch alert. */
