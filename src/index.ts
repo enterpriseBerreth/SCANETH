@@ -60,7 +60,7 @@ class ScanethBot {
       log.info(ok ? 'telegram test delivered' : 'telegram test failed');
     }
 
-    if (this.config.athTrackerEnabled) {
+    if (this.config.athTrackerEnabled || this.config.dailyReportEnabled) {
       this.tracker.start();
     }
 
@@ -94,6 +94,7 @@ class ScanethBot {
         maxTopHolderPct: this.config.maxTopHolderPct,
       },
       athTracker: this.config.athTrackerEnabled ? 'enabled' : 'disabled',
+      dailyReport: this.config.dailyReportEnabled ? 'enabled' : 'disabled',
       telegram: this.notifier.isEnabled ? 'enabled' : 'disabled',
     });
     log.info('research-only scanner — no transactions are ever sent');
@@ -139,7 +140,7 @@ class ScanethBot {
       if (this.notifier.isEnabled) {
         await this.notifier.alertLaunch(alert);
       }
-      if (this.config.athTrackerEnabled) {
+      if (this.config.athTrackerEnabled || this.config.dailyReportEnabled) {
         this.tracker.trackAlert(alert);
       }
     }

@@ -1,8 +1,9 @@
 /**
  * SCANETH Telegram connectivity test.
  *
- * Sends a test alert in the current format: token name, exact address,
- * scam rating, and pros/cons.
+ * Sends test alerts in the current formats:
+ *   1. New launch alert with scam rating and pros/cons.
+ *   2. Daily winners report with top 5 tokens, ATH, and PNL.
  */
 
 import { loadConfig } from '../config';
@@ -12,7 +13,7 @@ async function main(): Promise<void> {
   const config = loadConfig();
   const notifier = new ScanethNotifier(config);
 
-  const testMessage =
+  const launchAlert =
     `<b>SCANETH — New ETH token launched (test)</b>\n\n` +
     `<b>Example Token (EXAMPLE)</b>\n` +
     `Address: <code>0x1234567890123456789012345678901234567890</code>\n` +
@@ -31,13 +32,34 @@ async function main(): Promise<void> {
     `<a href="https://etherscan.io/token/0x1234567890123456789012345678901234567890">Etherscan</a> · ` +
     `<a href="https://dexscreener.com/ethereum/0x1234567890123456789012345678901234567890">DEXScreener</a>`;
 
-  const ok = await notifier.sendRaw(testMessage);
+  const dailyReport =
+    `<b>SCANETH — Daily winners report (test)</b>\n\n` +
+    `1. <b>MoonETH (MOON)</b>\n` +
+    `   Address: <code>0x1111111111111111111111111111111111111111</code>\n` +
+    `   Entry: $0.00000100 → ATH: $0.00004500\n` +
+    `   PNL: <b>+4400.00%</b>\n\n` +
+    `2. <b>RocketToken (RKT)</b>\n` +
+    `   Address: <code>0x2222222222222222222222222222222222222222</code>\n` +
+    `   Entry: $0.00000200 → ATH: $0.00002000\n` +
+    `   PNL: <b>+900.00%</b>\n\n` +
+    `3. <b>AlphaCoin (ALFA)</b>\n` +
+    `   Address: <code>0x3333333333333333333333333333333333333333</code>\n` +
+    `   Entry: $0.00000500 → ATH: $0.00003000\n` +
+    `   PNL: <b>+500.00%</b>`;
+
+  let ok = await notifier.sendRaw(launchAlert);
   if (!ok) {
-    console.error('Test alert failed');
+    console.error('Launch test alert failed');
     process.exit(1);
   }
 
-  console.log('Test alert delivered successfully');
+  ok = await notifier.sendRaw(dailyReport);
+  if (!ok) {
+    console.error('Daily report test alert failed');
+    process.exit(1);
+  }
+
+  console.log('Both test alerts delivered successfully');
   process.exit(0);
 }
 

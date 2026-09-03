@@ -57,6 +57,8 @@ export function startServer(deps: ServerDeps): Server {
             pollIntervalMs: deps.config.pollIntervalMs,
             athPollIntervalMs: deps.config.athPollIntervalMs,
             athTrackerEnabled: deps.config.athTrackerEnabled,
+            dailyReportEnabled: deps.config.dailyReportEnabled,
+            dailyReportHourUtc: deps.config.dailyReportHourUtc,
           },
           state: deps.state.snapshot(),
         }),

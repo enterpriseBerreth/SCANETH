@@ -51,10 +51,14 @@ export interface ScanethConfig {
   maxTopHolderPct: number;
   /** How often to poll for new blocks when no WebSocket is available. */
   pollIntervalMs: number;
-  /** How often to poll DEXScreener for ATH tracking on alerted tokens. */
+  /** How often to poll DEXScreener for price tracking on alerted tokens. */
   athPollIntervalMs: number;
   /** Enable ATH/PNL follow-up alerts. */
   athTrackerEnabled: boolean;
+  /** Enable daily 12:00am MST winners report. */
+  dailyReportEnabled: boolean;
+  /** UTC hour at which the daily report is sent. 12:00am MST = UTC-7 = 07:00 UTC. */
+  dailyReportHourUtc: number;
   /** Optional fixed starting block; if omitted the bot starts at the current head. */
   startBlock?: number;
   /** Optional historical scan range for backtesting. */
@@ -79,6 +83,8 @@ export function loadConfig(): ScanethConfig {
     pollIntervalMs: num('POLL_INTERVAL_MS', 12_000),
     athPollIntervalMs: num('ATH_POLL_INTERVAL_MS', 60_000),
     athTrackerEnabled: bool('ATH_TRACKER_ENABLED', false),
+    dailyReportEnabled: bool('DAILY_REPORT_ENABLED', true),
+    dailyReportHourUtc: num('DAILY_REPORT_HOUR_UTC', 7),
     startBlock: optionalStr('START_BLOCK') ? num('START_BLOCK', 0) : undefined,
     backtest: optionalStr('BACKTEST_FROM') && optionalStr('BACKTEST_TO')
       ? {
@@ -109,6 +115,9 @@ function validate(c: ScanethConfig): void {
   }
   if (c.athPollIntervalMs < 5_000) {
     problems.push('ATH_POLL_INTERVAL_MS below 5000 will hammer DEXScreener');
+  }
+  if (c.dailyReportHourUtc < 0 || c.dailyReportHourUtc > 23) {
+    problems.push('DAILY_REPORT_HOUR_UTC must be 0-23');
   }
   if (c.backtest && c.backtest.to < c.backtest.from) {
     problems.push('BACKTEST_TO must be greater than or equal to BACKTEST_FROM');
