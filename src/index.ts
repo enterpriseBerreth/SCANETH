@@ -1,11 +1,11 @@
 /**
  * SCANETH entry point.
  *
- * Wires the Ethereum block scanner, DEXScreener enrichment, Telegram notifier,
- * ATH/PNL tracker and HTTP server together. The bot streams every new Ethereum
- * block, detects new DEX pairs, enriches the non-quote token with DEXScreener
- * data, sends Telegram alerts when safety + activity filters are met, and then
- * tracks alerted tokens for daily ATH with unrealized PNL updates.
+ * Wires the Ethereum block scanner, DEXScreener enrichment, Telegram notifier
+ * and HTTP server together. The bot streams every new Ethereum block, detects
+ * new DEX pairs, and sends a Telegram alert for every newly-paired token with
+ * complete metadata. Each alert includes the token name, exact address, scam
+ * rating, and a pros/cons summary.
  */
 
 import { loadConfig, type ScanethConfig } from './config';
@@ -47,7 +47,6 @@ class ScanethBot {
 
     this.providers = createProviders(this.config.rpcUrl, this.config.wsUrl);
     this.scanner = new BlockScanner(this.providers.http, {
-      minBuys: this.config.minBuys,
       probeEth: this.config.probeEth,
       maxTaxBps: this.config.maxTaxBps,
       maxTopHolderPct: this.config.maxTopHolderPct,
@@ -90,7 +89,6 @@ class ScanethBot {
     log.info('SCANETH starting', {
       rpcUrl: this.config.rpcUrl.replace(/\/\/.*@/, '//***@'),
       filters: {
-        minBuys: this.config.minBuys,
         probeEth: this.config.probeEth,
         maxTaxBps: this.config.maxTaxBps,
         maxTopHolderPct: this.config.maxTopHolderPct,

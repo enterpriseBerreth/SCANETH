@@ -51,7 +51,6 @@ export function startServer(deps: ServerDeps): Server {
         json({
           config: {
             rpcUrl: deps.config.rpcUrl.replace(/\/\/.*@/, '//***@'),
-            minBuys: deps.config.minBuys,
             probeEth: deps.config.probeEth,
             maxTaxBps: deps.config.maxTaxBps,
             maxTopHolderPct: deps.config.maxTopHolderPct,

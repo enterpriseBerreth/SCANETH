@@ -2,10 +2,8 @@
  * SCANETH block scanner.
  *
  * Watches every Ethereum block for new DEX pairs (Uniswap V2, SushiSwap V2,
- * Uniswap V3). For each newly-paired token it queries DEXScreener to enrich
- * the launch with age, transaction counts, buys/sells, liquidity and market
- * cap. Alerts are emitted as soon as the token reaches 7 total buys;
- * safety/rug status is reported but never blocks the alert.
+ * Uniswap V3). Alerts are emitted immediately for every newly-paired token
+ * with complete on-chain metadata, regardless of buy count or safety score.
  */
 
 import { Interface, type Log, type Provider } from 'ethers';
@@ -32,8 +30,6 @@ export interface ScanResult {
 }
 
 export interface ScanFilters {
-  /** Minimum total buys across all buckets before alerting. */
-  minBuys: number;
   /** Simulated probe size in ETH for the safety check. */
   probeEth: number;
   /** Max acceptable round-trip tax in bps for the safety check. */
@@ -92,17 +88,18 @@ export class BlockScanner {
           if (!launch) continue;
 
           this.stats.tokensIdentified += 1;
+          this.stats.launchesDetected += 1;
           if (launch.dexScreener) {
             this.stats.dexScreenerHits += 1;
-            this.stats.launchesDetected += 1;
-            result.launches.push(launch);
-
-            if (shouldAlert(launch, this.filters.minBuys)) {
-              result.alerts.push(launch);
-              this.stats.alertsSent += 1;
-            }
           } else {
             this.stats.dexScreenerMisses += 1;
+          }
+
+          result.launches.push(launch);
+
+          if (shouldAlert(launch)) {
+            result.alerts.push(launch);
+            this.stats.alertsSent += 1;
           }
         } catch (err) {
           log.debug('token analysis failed', { address: tokenAddress, ...errMeta(err) });

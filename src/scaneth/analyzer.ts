@@ -1,9 +1,9 @@
 /**
  * SCANETH token analyzer and alert formatter.
  *
- * New plan: alert on every brand-new ETH token launch as soon as it reaches
- * 7 buys. Safety/rug checks are reported but never block the alert. An ATH/PNL
- * follow-up alert is sent later by the tracker.
+ * New plan: alert on EVERY new ETH token launch as soon as it is detected.
+ * The alert includes the token name, exact address, scam rating, and a short
+ * pros/cons list derived from on-chain safety and bytecode checks.
  */
 
 import { Contract, type Provider } from 'ethers';
@@ -158,70 +158,122 @@ export function tierForScore(score: number): import('./types').RiskTier {
   return 'critical';
 }
 
-/** Sum buys across all DEXScreener time buckets. */
-export function totalBuys(launch: TokenLaunch): number {
-  const txns = launch.dexScreener?.pair.txns;
-  if (!txns) return 0;
-  return (txns.m5?.buys ?? 0) + (txns.h1?.buys ?? 0) + (txns.h6?.buys ?? 0) + (txns.h24?.buys ?? 0);
+/** Alert on every new launch with complete on-chain metadata. */
+export function shouldAlert(launch: TokenLaunch): boolean {
+  return launch.metadata.complete;
 }
 
-/**
- * Alert trigger: any new ETH token launch that has 7 or more buys.
- * Safety status is reported in the alert but never blocks it.
- */
-export function shouldAlert(launch: TokenLaunch, minBuys: number): boolean {
-  if (!launch.dexScreener) return false;
-  if (!launch.metadata.complete) return false;
-  return totalBuys(launch) >= minBuys;
-}
-
-/** Format the initial launch alert. */
+/** Format the immediate launch alert. */
 export function formatAlert(launch: TokenLaunch): string {
-  const ds = launch.dexScreener!;
-  const pair = ds.pair;
-  const age = formatAge(ds.ageMs);
+  const ds = launch.dexScreener;
+  const pair = ds?.pair;
+  const age = ds ? formatAge(ds.ageMs) : 'just launched';
   const s = launch.safety;
-  const buys = totalBuys(launch);
+
+  const rating = scamRating(s.score, s.sellable);
+  const { pros, cons } = buildProsCons(launch);
 
   const links = [
     `<a href="https://etherscan.io/token/${launch.tokenAddress}">Etherscan</a>`,
-    `<a href="https://dexscreener.com/ethereum/${pair.pairAddress}">DEXScreener</a>`,
   ];
+  if (pair?.pairAddress) {
+    links.push(`<a href="https://dexscreener.com/ethereum/${pair.pairAddress}">DEXScreener</a>`);
+  }
 
-  const price = pair.priceUsd ? `$${Number(pair.priceUsd).toExponential(4)}` : 'unknown';
-  const verdict = safetyVerdict(s);
+  const price = pair?.priceUsd ? `$${Number(pair.priceUsd).toExponential(4)}` : 'unknown';
 
   return (
-    `<b>SCANETH — New launch hit ${buys} buys</b>\n\n` +
+    `<b>SCANETH — New ETH token launched</b>\n\n` +
     `<b>${escapeHtml(launch.metadata.name)} (${escapeHtml(launch.metadata.symbol)})</b>\n` +
     `Address: <code>${launch.tokenAddress}</code>\n` +
     `Age: <b>${age}</b>\n` +
     `Price: ${price}\n\n` +
-    `<b>Legitimacy check</b>\n` +
-    `${verdict}\n\n` +
-    `Risk score: ${launch.risk.score}/100 (${launch.risk.tier}) · Safety score: ${s.score}/100\n\n` +
+    `<b>Scam rating: ${s.score}/100 — ${rating.label}</b>\n` +
+    `${rating.explanation}\n\n` +
+    (pros.length ? `<b>Pros</b>\n${pros.join('\n')}\n\n` : '') +
+    (cons.length ? `<b>Cons</b>\n${cons.join('\n')}\n\n` : '') +
     links.join(' · ')
   );
 }
 
-export function safetyVerdict(s: TokenLaunch['safety']): string {
-  if (!s.sellable) {
-    return '⚠️ Likely honeypot — sell simulation failed. NOT a good buy.';
+function scamRating(score: number, sellable: boolean): { label: string; explanation: string } {
+  if (!sellable) {
+    return {
+      label: 'HONEYPOT',
+      explanation: 'Sell simulation failed — you may not be able to exit. Treat as a scam.',
+    };
   }
-  if (s.score <= 20) {
-    return '✅ Looks legitimate — no major red flags. Potential good buy.';
+  if (score <= 20) {
+    return {
+      label: 'LOW RISK',
+      explanation: 'No major red flags detected. Still DYOR before buying.',
+    };
   }
-  if (s.score <= 50) {
-    return `⚠️ Some risk flags (${s.findings.slice(0, 2).map((f) => f.label).join('; ')}). Caution advised.`;
+  if (score <= 50) {
+    return {
+      label: 'CAUTION',
+      explanation: 'Some risk flags present. Consider a small position only.',
+    };
   }
-  return `🚨 High rug risk — ${s.findings.slice(0, 2).map((f) => f.label).join('; ')}. NOT a good buy.`;
+  if (score <= 75) {
+    return {
+      label: 'RISKY',
+      explanation: 'Several red flags. High chance of loss.',
+    };
+  }
+  return {
+    label: 'LIKELY SCAM',
+    explanation: 'Multiple severe red flags. Avoid or treat as a gamble.',
+  };
 }
 
-function formatNumber(n: number): string {
-  if (n >= 1_000_000_000) return `${(n / 1_000_000_000).toFixed(2)}B`;
-  if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(2)}M`;
-  if (n >= 1_000) return `${(n / 1_000).toFixed(2)}K`;
-  return n.toFixed(2);
+function buildProsCons(launch: TokenLaunch): { pros: string[]; cons: string[] } {
+  const pros: string[] = [];
+  const cons: string[] = [];
+  const s = launch.safety;
+
+  if (s.sellable) pros.push('✅ Sellable — simulated sell succeeded');
+  else cons.push('🚨 Not sellable — possible honeypot');
+
+  if (s.lpLockedOrBurned) pros.push('✅ Liquidity locked or burned');
+  else cons.push('🚨 Liquidity unlocked');
+
+  if (s.ownershipRenounced) pros.push('✅ Ownership renounced');
+  else if (s.hasAdminFunctions) cons.push('🚨 Active owner + admin functions');
+
+  if (!s.hasAdminFunctions && !s.ownershipRenounced) pros.push('✅ No admin functions detected');
+
+  if (!s.concentrated) pros.push('✅ Supply not overly concentrated');
+  else cons.push(`🚨 Top holder owns ${s.topHolderPct.toFixed(1)}%`);
+
+  const tax = Number.isFinite(s.roundTripTaxBps) ? s.roundTripTaxBps / 100 : null;
+  if (tax !== null) {
+    if (tax <= 5) pros.push(`✅ Low tax (${tax.toFixed(2)}%)`);
+    else if (tax >= 20) cons.push(`🚨 High tax (${tax.toFixed(2)}%)`);
+    else cons.push(`⚠️ Moderate tax (${tax.toFixed(2)}%)`);
+  }
+
+  for (const finding of launch.risk.findings) {
+    cons.push(`🚨 ${finding.label}`);
+  }
+
+  for (const finding of s.findings) {
+    if (finding.key === 'high_tax') {
+      // already covered above
+      continue;
+    }
+    if (finding.key === 'concentrated_supply') {
+      // already covered above
+      continue;
+    }
+    if (finding.key === 'renounced') {
+      // already covered above
+      continue;
+    }
+    cons.push(`🚨 ${finding.label}`);
+  }
+
+  return { pros, cons };
 }
 
 function escapeHtml(value: string): string {

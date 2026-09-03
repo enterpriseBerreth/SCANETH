@@ -1,8 +1,8 @@
 /**
  * SCANETH environment parsing and validation.
  *
- * New plan: alert on any new ETH token launch that reaches MIN_BUYS buys.
- * Safety checks run and are reported, but they never block alerts.
+ * New plan: alert on EVERY new ETH token launch as soon as the pair is created.
+ * Safety checks run and are reported in the alert.
  */
 
 import 'dotenv/config';
@@ -43,8 +43,6 @@ export interface ScanethConfig {
   wsUrl?: string;
   /** HTTP server port for healthchecks. */
   port: number;
-  /** Minimum total buys before sending an alert. */
-  minBuys: number;
   /** ETH amount used for buy/sell simulation. */
   probeEth: number;
   /** Max acceptable round-trip tax in bps for the safety check. */
@@ -75,13 +73,12 @@ export function loadConfig(): ScanethConfig {
     rpcUrl: str('ETHEREUM_RPC_URL', 'https://ethereum-rpc.publicnode.com'),
     wsUrl: optionalStr('ETHEREUM_WS_URL'),
     port: num('PORT', 3000),
-    minBuys: num('MIN_BUYS', 7),
     probeEth: num('PROBE_ETH', 0.001),
     maxTaxBps: num('MAX_TAX_BPS', 1000),
     maxTopHolderPct: num('MAX_TOP_HOLDER_PCT', 50),
     pollIntervalMs: num('POLL_INTERVAL_MS', 12_000),
     athPollIntervalMs: num('ATH_POLL_INTERVAL_MS', 60_000),
-    athTrackerEnabled: bool('ATH_TRACKER_ENABLED', true),
+    athTrackerEnabled: bool('ATH_TRACKER_ENABLED', false),
     startBlock: optionalStr('START_BLOCK') ? num('START_BLOCK', 0) : undefined,
     backtest: optionalStr('BACKTEST_FROM') && optionalStr('BACKTEST_TO')
       ? {
@@ -102,7 +99,6 @@ export function loadConfig(): ScanethConfig {
 function validate(c: ScanethConfig): void {
   const problems: string[] = [];
 
-  if (c.minBuys < 1) problems.push('MIN_BUYS must be >= 1');
   if (c.probeEth <= 0) problems.push('PROBE_ETH must be > 0');
   if (c.maxTaxBps < 0) problems.push('MAX_TAX_BPS cannot be negative');
   if (c.maxTopHolderPct < 0 || c.maxTopHolderPct > 100) {
