@@ -4,6 +4,7 @@
  * Sends test alerts in the current formats:
  *   1. New launch alert with scam rating and pros/cons.
  *   2. Daily winners report with top 5 tokens, ATH, and PNL.
+ *   3. Paper copytrade BUY and SELL alerts.
  */
 
 import { loadConfig } from '../config';
@@ -47,19 +48,42 @@ async function main(): Promise<void> {
     `   Entry: $0.00000500 → ATH: $0.00003000\n` +
     `   PNL: <b>+500.00%</b>`;
 
-  let ok = await notifier.sendRaw(launchAlert);
-  if (!ok) {
-    console.error('Launch test alert failed');
-    process.exit(1);
+  const copyBuyAlert =
+    `<b>SCANETH — Paper copytrade BUY</b>\n\n` +
+    `Copied wallet: <code>0x8888888888888888888888888888888888888888</code>\n` +
+    `Token: <b>MoonETH (MOON)</b>\n` +
+    `Address: <code>0x1111111111111111111111111111111111111111</code>\n\n` +
+    `<b>Our paper trade</b>\n` +
+    `Bought: 20000.0000 MOON\n` +
+    `Amount: $20.00\n` +
+    `Price: $1.0000e-3\n\n` +
+    `<a href="https://etherscan.io/tx/0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa">Tx</a> · ` +
+    `<a href="https://etherscan.io/token/0x1111111111111111111111111111111111111111">Token</a>`;
+
+  const copySellAlert =
+    `<b>SCANETH — Paper copytrade SELL</b>\n\n` +
+    `Copied wallet: <code>0x8888888888888888888888888888888888888888</code>\n` +
+    `Token: <b>MoonETH (MOON)</b>\n` +
+    `Address: <code>0x1111111111111111111111111111111111111111</code>\n\n` +
+    `<b>Our paper trade</b>\n` +
+    `Sold: 4000.0000 MOON\n` +
+    `Amount: $80.00\n` +
+    `Price: $2.0000e-2\n` +
+    `Mirrored sell: 20.00% of copied position\n` +
+    `Trade PNL: <b>+$60.00</b>\n\n` +
+    `<a href="https://etherscan.io/tx/0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb">Tx</a> · ` +
+    `<a href="https://etherscan.io/token/0x1111111111111111111111111111111111111111">Token</a>`;
+
+  const alerts = [launchAlert, dailyReport, copyBuyAlert, copySellAlert];
+  for (const alert of alerts) {
+    const ok = await notifier.sendRaw(alert);
+    if (!ok) {
+      console.error('Test alert failed');
+      process.exit(1);
+    }
   }
 
-  ok = await notifier.sendRaw(dailyReport);
-  if (!ok) {
-    console.error('Daily report test alert failed');
-    process.exit(1);
-  }
-
-  console.log('Both test alerts delivered successfully');
+  console.log('All test alerts delivered successfully');
   process.exit(0);
 }
 

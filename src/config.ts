@@ -68,8 +68,23 @@ export interface ScanethConfig {
   telegramChatId?: string;
   /** Send a test alert on boot. */
   telegramTestOnBoot: boolean;
+  /** Enable paper copytrader. */
+  copytraderEnabled: boolean;
+  /** Comma-separated list of wallet addresses to copy. */
+  copytraderWatchedWallets: string[];
+  /** USD amount to simulate on each copied buy. */
+  copytraderBuyAmountUsd: number;
   /** True when the bot should actually process blocks; false for dry-run. */
   enabled: boolean;
+}
+
+function addressList(key: string): string[] {
+  const raw = optionalStr(key);
+  if (!raw) return [];
+  return raw
+    .split(',')
+    .map((a) => a.trim())
+    .filter((a) => a.startsWith('0x') && a.length === 42);
 }
 
 export function loadConfig(): ScanethConfig {
@@ -85,6 +100,9 @@ export function loadConfig(): ScanethConfig {
     athTrackerEnabled: bool('ATH_TRACKER_ENABLED', false),
     dailyReportEnabled: bool('DAILY_REPORT_ENABLED', true),
     dailyReportHourUtc: num('DAILY_REPORT_HOUR_UTC', 7),
+    copytraderEnabled: bool('COPYTRADER_ENABLED', false),
+    copytraderWatchedWallets: addressList('COPYTRADER_WATCHED_WALLETS'),
+    copytraderBuyAmountUsd: num('COPYTRADER_BUY_AMOUNT_USD', 20),
     startBlock: optionalStr('START_BLOCK') ? num('START_BLOCK', 0) : undefined,
     backtest: optionalStr('BACKTEST_FROM') && optionalStr('BACKTEST_TO')
       ? {
@@ -118,6 +136,9 @@ function validate(c: ScanethConfig): void {
   }
   if (c.dailyReportHourUtc < 0 || c.dailyReportHourUtc > 23) {
     problems.push('DAILY_REPORT_HOUR_UTC must be 0-23');
+  }
+  if (c.copytraderBuyAmountUsd <= 0) {
+    problems.push('COPYTRADER_BUY_AMOUNT_USD must be > 0');
   }
   if (c.backtest && c.backtest.to < c.backtest.from) {
     problems.push('BACKTEST_TO must be greater than or equal to BACKTEST_FROM');

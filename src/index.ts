@@ -16,6 +16,7 @@ import { ScanethNotifier } from './scaneth/notifier';
 import { BlockScanner } from './scaneth/scanner';
 import { createProviders, destroyProviders, type ProviderPair } from './scaneth/provider';
 import { AthTracker } from './scaneth/tracker';
+import { CopyTrader } from './scaneth/copytrader';
 import type { TokenLaunch } from './scaneth/types';
 import type { Server } from 'node:http';
 
@@ -27,6 +28,7 @@ class ScanethBot {
   private readonly tracker: AthTracker;
   private providers?: ProviderPair;
   private scanner?: BlockScanner;
+  private copytrader?: CopyTrader;
   private httpServer?: Server;
   private stopping = false;
   private pollTimer?: NodeJS.Timeout;
@@ -51,6 +53,7 @@ class ScanethBot {
       maxTaxBps: this.config.maxTaxBps,
       maxTopHolderPct: this.config.maxTopHolderPct,
     });
+    this.copytrader = new CopyTrader(this.config, this.providers.http, this.notifier);
 
     const network = await this.providers.http.getNetwork();
     log.info('connected', { chainId: network.chainId, name: network.name });
@@ -62,6 +65,10 @@ class ScanethBot {
 
     if (this.config.athTrackerEnabled || this.config.dailyReportEnabled) {
       this.tracker.start();
+    }
+
+    if (this.config.copytraderEnabled) {
+      this.copytrader.start();
     }
 
     if (this.config.backtest) {
@@ -95,6 +102,7 @@ class ScanethBot {
       },
       athTracker: this.config.athTrackerEnabled ? 'enabled' : 'disabled',
       dailyReport: this.config.dailyReportEnabled ? 'enabled' : 'disabled',
+      copytrader: this.config.copytraderEnabled ? 'enabled' : 'disabled',
       telegram: this.notifier.isEnabled ? 'enabled' : 'disabled',
     });
     log.info('research-only scanner — no transactions are ever sent');
@@ -118,6 +126,9 @@ class ScanethBot {
     if (!this.scanner) return;
     const result = await this.scanner.processBlock(blockNumber);
     await this.handleResult(result);
+    if (this.copytrader) {
+      await this.copytrader.processBlock(blockNumber);
+    }
   }
 
   private async handleResult(result: import('./scaneth/scanner').ScanResult): Promise<void> {
@@ -153,6 +164,7 @@ class ScanethBot {
 
     if (this.pollTimer) clearTimeout(this.pollTimer);
     this.tracker.stop();
+    this.copytrader?.stop();
 
     if (this.providers) {
       destroyProviders(this.providers);
