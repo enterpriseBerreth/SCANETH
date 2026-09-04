@@ -103,6 +103,8 @@ export class CopyTrader {
   private readonly walletPortfolios = new Map<string, Map<string, WalletPosition>>(); // wallet -> token -> position
   private readonly walletDailyStats = new Map<string, Map<string, WalletDailyStats>>(); // wallet -> day -> stats
   private readonly positions = new Map<string, PaperPosition>(); // token -> aggregated position
+  /** Token -> the watched wallet whose buy we copied. Only that wallet's sells are followed. */
+  private readonly positionSourceWallet = new Map<string, string>();
   private ethUsdPrice = 0;
   private priceTimer?: NodeJS.Timeout;
   private reportTimer?: NodeJS.Timeout;
@@ -165,6 +167,8 @@ export class CopyTrader {
       const block = await this.provider.getBlock(blockNumber, true);
       if (!block) return;
 
+      const trades: CopyTrade[] = [];
+
       for (const tx of block.prefetchedTransactions) {
         const from = tx.from?.toLowerCase();
         if (!from || !this.watchedWallets.has(from)) continue;
@@ -174,16 +178,78 @@ export class CopyTrader {
           if (!receipt || receipt.status !== 1) continue;
 
           const trade = await this.parseTrade(tx, receipt, from);
-          if (trade) {
-            await this.executePaperTrade(trade);
-          }
+          if (trade) trades.push(trade);
         } catch (err) {
           log.debug('copytrade inspection failed', { txHash: tx.hash, ...errMeta(err) });
         }
       }
+
+      // Resolve duplicate token buys within the same block by wallet rank.
+      const buysByToken = new Map<string, CopyTrade[]>();
+      const sells: CopyTrade[] = [];
+
+      for (const trade of trades) {
+        if (trade.type === 'buy') {
+          const key = trade.tokenAddress.toLowerCase();
+          const list = buysByToken.get(key) ?? [];
+          list.push(trade);
+          buysByToken.set(key, list);
+        } else {
+          sells.push(trade);
+        }
+      }
+
+      for (const list of buysByToken.values()) {
+        list.sort((a, b) => this.walletRank(b.wallet) - this.walletRank(a.wallet));
+        const best = list[0];
+        if (best) await this.executePaperTrade(best);
+      }
+
+      for (const sell of sells) {
+        await this.executePaperTrade(sell);
+      }
     } catch (err) {
       log.error('copytrader block scan failed', { blockNumber, ...errMeta(err) });
     }
+  }
+
+  /**
+   * Rank wallets by lifetime total PNL (realized + unrealized).
+   * Higher number = more profitable = higher priority.
+   */
+  private walletRank(wallet: string): number {
+    const walletKey = wallet.toLowerCase();
+    let realized = 0;
+
+    const days = this.walletDailyStats.get(walletKey);
+    if (days) {
+      for (const stats of days.values()) {
+        realized += stats.realizedPnlUsd;
+      }
+    }
+
+    return realized + this.calculateWalletUnrealized(walletKey);
+  }
+
+  private calculateWalletUnrealized(walletKey: string): number {
+    const portfolio = this.walletPortfolios.get(walletKey);
+    if (!portfolio) return 0;
+
+    let unrealized = 0;
+    for (const [tokenLower, pos] of portfolio) {
+      if (pos.balance <= 0n) continue;
+      const decimals = this.getDecimalsFromPositions(tokenLower) ?? 18;
+      const qty = Number(pos.balance) / Math.pow(10, decimals);
+      // For ranking speed, use last known token price from aggregated positions if available.
+      const currentPrice = this.getLastKnownPrice(tokenLower);
+      if (!Number.isFinite(currentPrice) || currentPrice <= 0) continue;
+      unrealized += qty * (currentPrice - pos.avgEntryPriceUsd);
+    }
+    return unrealized;
+  }
+
+  private getLastKnownPrice(tokenAddress: string): number {
+    return this.positions.get(tokenAddress.toLowerCase())?.avgEntryPriceUsd ?? 0;
   }
 
   private scheduleDailyWalletReport(): void {
@@ -438,6 +504,15 @@ export class CopyTrader {
   }
 
   private async executePaperBuy(trade: CopyTrade): Promise<void> {
+    const key = trade.tokenAddress.toLowerCase();
+
+    // Do not buy the same token again just because multiple wallets bought it.
+    if (this.positions.has(key)) {
+      log.debug('paper buy skipped — already holding token', { token: trade.tokenAddress, wallet: trade.wallet });
+      await this.sendObservedAlert(trade, 'Already holding this token — no duplicate buys');
+      return;
+    }
+
     const buyAmountUsd = this.config.copytraderBuyAmountUsd;
     const tokenQty = buyAmountUsd / trade.tokenPriceUsd;
     const tokenAmountBigInt = BigInt(Math.floor(tokenQty * Math.pow(10, trade.tokenDecimals)));
@@ -456,7 +531,6 @@ export class CopyTrader {
     this.updateWalletPortfolioBuy(trade.wallet, trade.tokenAddress, tokenAmountBigInt, buyAmountUsd, trade.tokenDecimals);
 
     // Update paper position.
-    const key = trade.tokenAddress.toLowerCase();
     let pos = this.positions.get(key);
     if (!pos) {
       pos = {
@@ -481,6 +555,9 @@ export class CopyTrader {
     pos.balance = newBalance;
     pos.updatedAt = trade.timestamp;
 
+    // Record which watched wallet's buy we followed for this token.
+    this.positionSourceWallet.set(key, trade.wallet.toLowerCase());
+
     // Track daily cost basis for the wallet.
     const day = currentMstDay();
     const dayStats = this.getWalletDayStats(trade.wallet, day);
@@ -501,6 +578,19 @@ export class CopyTrader {
     const pos = this.positions.get(key);
     if (!pos || pos.balance <= 0n) {
       log.debug('paper sell ignored — no position', { token: trade.tokenAddress });
+      await this.sendObservedAlert(trade, 'No paper position in this token');
+      return;
+    }
+
+    // Only follow the wallet whose buy we actually copied for this token.
+    const sourceWallet = this.positionSourceWallet.get(key);
+    if (sourceWallet !== trade.wallet.toLowerCase()) {
+      log.debug('paper sell ignored — not source wallet', {
+        token: trade.tokenAddress,
+        sourceWallet,
+        sellingWallet: trade.wallet,
+      });
+      await this.sendObservedAlert(trade, `Position copied from ${sourceWallet ?? 'another wallet'} — only its sells are mirrored`);
       return;
     }
 
@@ -552,6 +642,7 @@ export class CopyTrader {
     // Clean up empty positions.
     if (pos.balance <= 0n) {
       this.positions.delete(key);
+      this.positionSourceWallet.delete(key);
     }
   }
 
@@ -671,6 +762,32 @@ export class CopyTrader {
     const ok = await this.notifier.sendRaw(lines.join('\n'));
     if (!ok) {
       log.warn('copytrade alert failed', { txHash: trade.txHash });
+    }
+  }
+
+  /** Alert on a watched-wallet trade we detected but did not mirror. */
+  private async sendObservedAlert(trade: CopyTrade, reason: string): Promise<void> {
+    const isBuy = trade.type === 'buy';
+    const tokenQty = Number(trade.tokenAmount) / Math.pow(10, trade.tokenDecimals);
+    const ethQty = Number(trade.ethAmount) / 1e18;
+
+    const lines = [
+      `<b>SCANETH — Watched wallet ${isBuy ? 'BUY' : 'SELL'} (not copied)</b>`,
+      '',
+      `Wallet: <code>${trade.wallet}</code>`,
+      `Token: <b>${escapeHtml(trade.tokenName)} (${escapeHtml(trade.tokenSymbol)})</b>`,
+      `Address: <code>${trade.tokenAddress}</code>`,
+      '',
+      `Their trade: ${tokenQty.toPrecision(4)} ${escapeHtml(trade.tokenSymbol)} for ~${ethQty.toFixed(4)} ETH`,
+      `Reason: ${escapeHtml(reason)}`,
+      '',
+      `<a href="https://etherscan.io/tx/${trade.txHash}">Tx</a> · ` +
+        `<a href="https://etherscan.io/token/${trade.tokenAddress}">Token</a>`,
+    ];
+
+    const ok = await this.notifier.sendRaw(lines.join('\n'));
+    if (!ok) {
+      log.warn('observed trade alert failed', { txHash: trade.txHash });
     }
   }
 
