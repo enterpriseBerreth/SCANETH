@@ -6,6 +6,9 @@
  *   - When a watched wallet sells a token, simulate selling the same percentage
  *     of our paper position.
  *
+ * Also tracks per-wallet PNL and sends a daily 12:00am MST ranking report of
+ * best-to-worst copied wallets with $ and % PNL.
+ *
  * No real transactions are sent. This is a simulation layer only.
  */
 
@@ -13,6 +16,7 @@ import { Contract, Interface, type Provider, type TransactionReceipt, type Trans
 import { createLogger, errMeta } from '../logger';
 import type { ScanethConfig } from '../config';
 import type { ScanethNotifier } from './notifier';
+import { fetchTokenPairs, pickBestPair } from './dexscreener';
 
 const log = createLogger('scaneth:copytrader');
 
@@ -55,6 +59,17 @@ export interface PaperPosition {
   updatedAt: number;
 }
 
+interface WalletPosition {
+  balance: bigint;
+  costBasisUsd: number;
+  avgEntryPriceUsd: number;
+}
+
+interface WalletDailyStats {
+  realizedPnlUsd: number;
+  costBasisUsd: number;
+}
+
 export interface CopyTrade {
   wallet: string;
   type: 'buy' | 'sell';
@@ -85,9 +100,12 @@ export interface CopyTraderStats {
 export class CopyTrader {
   private readonly watchedWallets = new Set<string>();
   private readonly walletBalances = new Map<string, Map<string, bigint>>(); // wallet -> token -> balance
-  private readonly positions = new Map<string, PaperPosition>(); // token -> position
+  private readonly walletPortfolios = new Map<string, Map<string, WalletPosition>>(); // wallet -> token -> position
+  private readonly walletDailyStats = new Map<string, Map<string, WalletDailyStats>>(); // wallet -> day -> stats
+  private readonly positions = new Map<string, PaperPosition>(); // token -> aggregated position
   private ethUsdPrice = 0;
   private priceTimer?: NodeJS.Timeout;
+  private reportTimer?: NodeJS.Timeout;
   private running = false;
 
   constructor(
@@ -130,11 +148,13 @@ export class CopyTrader {
       buyAmountUsd: this.config.copytraderBuyAmountUsd,
     });
     void this.refreshEthPrice();
+    this.scheduleDailyWalletReport();
   }
 
   stop(): void {
     this.running = false;
     if (this.priceTimer) clearTimeout(this.priceTimer);
+    if (this.reportTimer) clearTimeout(this.reportTimer);
   }
 
   /** Inspect all transactions in a block for watched-wallet activity. */
@@ -163,6 +183,85 @@ export class CopyTrader {
       }
     } catch (err) {
       log.error('copytrader block scan failed', { blockNumber, ...errMeta(err) });
+    }
+  }
+
+  private scheduleDailyWalletReport(): void {
+    if (!this.running) return;
+    const next = nextUtcOccurrence(this.config.dailyReportHourUtc, 0);
+    const msUntil = next.getTime() - Date.now();
+    log.debug('next wallet ranking report scheduled', { at: next.toISOString(), msUntil });
+    this.reportTimer = setTimeout(() => {
+      void this.sendDailyWalletReport();
+      this.scheduleDailyWalletReport();
+    }, Math.max(1_000, msUntil));
+  }
+
+  private async sendDailyWalletReport(): Promise<void> {
+    const previousDay = previousMstDay(this.config.dailyReportHourUtc);
+    const walletPnls: Array<{ wallet: string; realizedUsd: number; unrealizedUsd: number; totalPnlUsd: number; pnlPct: number }> = [];
+
+    for (const wallet of this.watchedWallets) {
+      const dayStats = this.getWalletDayStats(wallet, previousDay);
+      const portfolio = this.walletPortfolios.get(wallet);
+
+      let unrealizedUsd = 0;
+      let openCostBasisUsd = 0;
+
+      if (portfolio) {
+        for (const [tokenLower, pos] of portfolio) {
+          if (pos.balance <= 0n) continue;
+          const currentPrice = await this.getCurrentTokenPrice(tokenLower);
+          if (!Number.isFinite(currentPrice) || currentPrice <= 0) continue;
+          const tokenQty = Number(pos.balance) / Math.pow(10, this.getDecimalsFromPositions(tokenLower) ?? 18);
+          const marketValue = tokenQty * currentPrice;
+          const cost = tokenQty * pos.avgEntryPriceUsd;
+          unrealizedUsd += marketValue - cost;
+          openCostBasisUsd += cost;
+        }
+      }
+
+      const totalPnlUsd = dayStats.realizedPnlUsd + unrealizedUsd;
+      const invested = dayStats.costBasisUsd + openCostBasisUsd;
+      const pnlPct = invested > 0 ? (totalPnlUsd / invested) * 100 : 0;
+
+      walletPnls.push({
+        wallet,
+        realizedUsd: dayStats.realizedPnlUsd,
+        unrealizedUsd,
+        totalPnlUsd,
+        pnlPct,
+      });
+    }
+
+    walletPnls.sort((a, b) => b.totalPnlUsd - a.totalPnlUsd);
+
+    if (walletPnls.length === 0) {
+      const message =
+        `<b>SCANETH — Copied wallet rankings (${previousDay})</b>\n\n` +
+        `No wallets are being copied yet.`;
+      await this.notifier.sendRaw(message);
+      return;
+    }
+
+    const lines = walletPnls.map((w, idx) => {
+      const sign = w.totalPnlUsd >= 0 ? '+' : '';
+      const pctSign = w.pnlPct >= 0 ? '+' : '';
+      const emoji = w.totalPnlUsd >= 0 ? '🟢' : '🔴';
+      return (
+        `${idx + 1}. ${emoji} <code>${w.wallet}</code>\n` +
+        `   PNL: <b>${sign}$${w.totalPnlUsd.toFixed(2)} (${pctSign}${w.pnlPct.toFixed(2)}%)</b>\n` +
+        `   Realized: $${w.realizedUsd.toFixed(2)} · Unrealized: $${w.unrealizedUsd.toFixed(2)}`
+      );
+    });
+
+    const message =
+      `<b>SCANETH — Copied wallet rankings (${previousDay})</b>\n\n` +
+      lines.join('\n\n');
+
+    const ok = await this.notifier.sendRaw(message);
+    if (ok) {
+      log.info('wallet ranking report sent', { previousDay, wallets: walletPnls.length });
     }
   }
 
@@ -353,6 +452,9 @@ export class CopyTrader {
     const prevBalance = walletBalances.get(trade.tokenAddress) ?? 0n;
     walletBalances.set(trade.tokenAddress, prevBalance + trade.tokenAmount);
 
+    // Update wallet portfolio.
+    this.updateWalletPortfolioBuy(trade.wallet, trade.tokenAddress, tokenAmountBigInt, buyAmountUsd, trade.tokenDecimals);
+
     // Update paper position.
     const key = trade.tokenAddress.toLowerCase();
     let pos = this.positions.get(key);
@@ -378,6 +480,11 @@ export class CopyTrader {
     pos.costBasisUsd = newCost;
     pos.balance = newBalance;
     pos.updatedAt = trade.timestamp;
+
+    // Track daily cost basis for the wallet.
+    const day = currentMstDay();
+    const dayStats = this.getWalletDayStats(trade.wallet, day);
+    dayStats.costBasisUsd += buyAmountUsd;
 
     log.info('paper buy executed', {
       wallet: trade.wallet,
@@ -424,6 +531,14 @@ export class CopyTrader {
     // Update watched wallet balance.
     walletBalances.set(key, walletBalanceBefore - trade.tokenAmount);
 
+    // Update wallet portfolio.
+    this.updateWalletPortfolioSell(trade.wallet, key, ourSellAmount, pnlUsd);
+
+    // Track daily realized PNL.
+    const day = currentMstDay();
+    const dayStats = this.getWalletDayStats(trade.wallet, day);
+    dayStats.realizedPnlUsd += pnlUsd;
+
     log.info('paper sell executed', {
       wallet: trade.wallet,
       token: trade.tokenSymbol,
@@ -438,6 +553,82 @@ export class CopyTrader {
     if (pos.balance <= 0n) {
       this.positions.delete(key);
     }
+  }
+
+  private updateWalletPortfolioBuy(
+    wallet: string,
+    tokenAddress: string,
+    tokenAmount: bigint,
+    buyAmountUsd: number,
+    decimals: number,
+  ): void {
+    const walletKey = wallet.toLowerCase();
+    const tokenKey = tokenAddress.toLowerCase();
+    let portfolio = this.walletPortfolios.get(walletKey);
+    if (!portfolio) {
+      portfolio = new Map<string, WalletPosition>();
+      this.walletPortfolios.set(walletKey, portfolio);
+    }
+
+    let pos = portfolio.get(tokenKey);
+    if (!pos) {
+      pos = { balance: 0n, costBasisUsd: 0, avgEntryPriceUsd: 0 };
+      portfolio.set(tokenKey, pos);
+    }
+
+    const newCost = pos.costBasisUsd + buyAmountUsd;
+    const newBalance = pos.balance + tokenAmount;
+    pos.avgEntryPriceUsd = newCost / (Number(newBalance) / Math.pow(10, decimals));
+    pos.costBasisUsd = newCost;
+    pos.balance = newBalance;
+  }
+
+  private updateWalletPortfolioSell(wallet: string, tokenKey: string, sellAmount: bigint, pnlUsd: number): void {
+    const walletKey = wallet.toLowerCase();
+    const portfolio = this.walletPortfolios.get(walletKey);
+    if (!portfolio) return;
+
+    const pos = portfolio.get(tokenKey);
+    if (!pos) return;
+
+    const costBasisSold = (Number(sellAmount) / Number(pos.balance)) * pos.costBasisUsd;
+    pos.balance -= sellAmount;
+    pos.costBasisUsd = Math.max(0, pos.costBasisUsd - costBasisSold);
+
+    if (pos.balance <= 0n) {
+      portfolio.delete(tokenKey);
+    }
+  }
+
+  private getWalletDayStats(wallet: string, day: string): WalletDailyStats {
+    const walletKey = wallet.toLowerCase();
+    let days = this.walletDailyStats.get(walletKey);
+    if (!days) {
+      days = new Map<string, WalletDailyStats>();
+      this.walletDailyStats.set(walletKey, days);
+    }
+
+    let stats = days.get(day);
+    if (!stats) {
+      stats = { realizedPnlUsd: 0, costBasisUsd: 0 };
+      days.set(day, stats);
+    }
+    return stats;
+  }
+
+  private async getCurrentTokenPrice(tokenAddress: string): Promise<number> {
+    try {
+      const pairs = await fetchTokenPairs(tokenAddress);
+      const best = pickBestPair(pairs, tokenAddress);
+      if (best?.priceUsd) return Number(best.priceUsd);
+    } catch (err) {
+      log.debug('current price fetch failed', { address: tokenAddress, ...errMeta(err) });
+    }
+    return 0;
+  }
+
+  private getDecimalsFromPositions(tokenAddress: string): number | undefined {
+    return this.positions.get(tokenAddress)?.decimals;
   }
 
   private async sendTradeAlert(
@@ -519,6 +710,36 @@ export class CopyTrader {
       return '???';
     }
   }
+}
+
+/** Current MST day string YYYY-MM-DD. MST = UTC-7. */
+function currentMstDay(): string {
+  return dayStringAtOffset(-7);
+}
+
+function previousMstDay(reportHourUtc: number): string {
+  const now = new Date();
+  const prev = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate(), reportHourUtc, 0, 0, 0));
+  if (prev.getTime() >= now.getTime()) {
+    prev.setUTCDate(prev.getUTCDate() - 1);
+  }
+  const mst = new Date(prev.getTime() - 7 * 3_600_000);
+  return `${mst.getUTCFullYear()}-${String(mst.getUTCMonth() + 1).padStart(2, '0')}-${String(mst.getUTCDate()).padStart(2, '0')}`;
+}
+
+function dayStringAtOffset(offsetHours: number): string {
+  const now = new Date();
+  const shifted = new Date(now.getTime() + offsetHours * 3_600_000);
+  return `${shifted.getUTCFullYear()}-${String(shifted.getUTCMonth() + 1).padStart(2, '0')}-${String(shifted.getUTCDate()).padStart(2, '0')}`;
+}
+
+function nextUtcOccurrence(hourUtc: number, minuteUtc: number): Date {
+  const now = new Date();
+  const next = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate(), hourUtc, minuteUtc, 0, 0));
+  if (next.getTime() <= now.getTime()) {
+    next.setUTCDate(next.getUTCDate() + 1);
+  }
+  return next;
 }
 
 function escapeHtml(value: string): string {

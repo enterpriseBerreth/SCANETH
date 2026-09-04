@@ -5,6 +5,7 @@
  *   1. New launch alert with scam rating and pros/cons.
  *   2. Daily winners report with top 5 tokens, ATH, and PNL.
  *   3. Paper copytrade BUY and SELL alerts.
+ *   4. Copied wallet ranking report with $ and % PNL.
  */
 
 import { loadConfig } from '../config';
@@ -74,7 +75,19 @@ async function main(): Promise<void> {
     `<a href="https://etherscan.io/tx/0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb">Tx</a> · ` +
     `<a href="https://etherscan.io/token/0x1111111111111111111111111111111111111111">Token</a>`;
 
-  const alerts = [launchAlert, dailyReport, copyBuyAlert, copySellAlert];
+  const walletRankingReport =
+    `<b>SCANETH — Copied wallet rankings (test)</b>\n\n` +
+    `1. 🟢 <code>0x8888888888888888888888888888888888888888</code>\n` +
+    `   PNL: <b>+$120.00 (+300.00%)</b>\n` +
+    `   Realized: $80.00 · Unrealized: $40.00\n\n` +
+    `2. 🟢 <code>0x7777777777777777777777777777777777777777</code>\n` +
+    `   PNL: <b>+$25.00 (+50.00%)</b>\n` +
+    `   Realized: $10.00 · Unrealized: $15.00\n\n` +
+    `3. 🔴 <code>0x6666666666666666666666666666666666666666</code>\n` +
+    `   PNL: <b>-$15.00 (-30.00%)</b>\n` +
+    `   Realized: -$5.00 · Unrealized: -$10.00`;
+
+  const alerts = [launchAlert, dailyReport, copyBuyAlert, copySellAlert, walletRankingReport];
   for (const alert of alerts) {
     const ok = await notifier.sendRaw(alert);
     if (!ok) {
