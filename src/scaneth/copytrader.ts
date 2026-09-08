@@ -43,6 +43,8 @@ export interface PaperPosition {
   avgEntryPriceUsd: number;
   /** Realized PNL in USD. */
   realizedPnlUsd: number;
+  /** Latest market price in USD (DexScreener, refreshed periodically). */
+  currentPriceUsd: number;
   /** First buy timestamp. */
   openedAt: number;
   /** Last activity timestamp. */
@@ -81,6 +83,14 @@ export interface CopyTrade {
 export interface CopyTraderStats {
   watchedWallets: string[];
   positionCount: number;
+  maxConcurrentTrades: number;
+  buyAmountUsd: number;
+  startingBudgetUsd: number;
+  cashUsd: number;
+  openPositionsValueUsd: number;
+  equityUsd: number;
+  totalPnlUsd: number;
+  totalPnlPct: number;
   totalCostBasisUsd: number;
   totalRealizedPnlUsd: number;
   totalUnrealizedPnlUsd: number;
@@ -96,6 +106,8 @@ export class CopyTrader {
   /** Token -> the watched wallet whose buy we copied. Only that wallet's sells are followed. */
   private readonly positionSourceWallet = new Map<string, string>();
   private tradeCount = 0;
+  /** Remaining paper cash. Starts at the configured budget, decreases on buys, grows on sells. */
+  private cashUsd: number;
   private ethUsdPrice = 0;
   private priceTimer?: NodeJS.Timeout;
   private reportTimer?: NodeJS.Timeout;
@@ -109,23 +121,43 @@ export class CopyTrader {
     for (const w of config.copytraderWatchedWallets) {
       this.watchedWallets.add(w.toLowerCase());
     }
+    this.cashUsd = config.copytraderStartingBudgetUsd;
   }
 
   getStats(): CopyTraderStats {
     let totalCostBasis = 0;
     let totalRealized = 0;
     let totalUnrealized = 0;
+    let openValue = 0;
 
     for (const pos of this.positions.values()) {
       totalCostBasis += pos.costBasisUsd;
       totalRealized += pos.realizedPnlUsd;
-      const currentValue = Number(pos.balance) * pos.avgEntryPriceUsd / Math.pow(10, pos.decimals);
-      totalUnrealized += currentValue - pos.costBasisUsd;
+      const price = pos.currentPriceUsd > 0 ? pos.currentPriceUsd : pos.avgEntryPriceUsd;
+      const marketValue = (Number(pos.balance) / Math.pow(10, pos.decimals)) * price;
+      openValue += marketValue;
+      totalUnrealized += marketValue - pos.costBasisUsd;
     }
+
+    // Paper equity = remaining cash + market value of open positions.
+    // Total PNL is measured against the starting budget, exactly what the
+    // account would show if these trades were real.
+    const equity = this.cashUsd + openValue;
+    const totalPnl = equity - this.config.copytraderStartingBudgetUsd;
 
     return {
       watchedWallets: [...this.watchedWallets],
       positionCount: this.positions.size,
+      maxConcurrentTrades: this.config.copytraderMaxConcurrentTrades,
+      buyAmountUsd: this.config.copytraderBuyAmountUsd,
+      startingBudgetUsd: this.config.copytraderStartingBudgetUsd,
+      cashUsd: this.cashUsd,
+      openPositionsValueUsd: openValue,
+      equityUsd: equity,
+      totalPnlUsd: totalPnl,
+      totalPnlPct: this.config.copytraderStartingBudgetUsd > 0
+        ? (totalPnl / this.config.copytraderStartingBudgetUsd) * 100
+        : 0,
       totalCostBasisUsd: totalCostBasis,
       totalRealizedPnlUsd: totalRealized,
       totalUnrealizedPnlUsd: totalUnrealized,
@@ -334,7 +366,36 @@ export class CopyTrader {
       log.debug('ETH/USD price refresh failed', errMeta(err));
     }
 
+    // Mark open paper positions to market so unrealized PNL reflects reality.
+    await this.refreshPositionPrices();
+
     this.priceTimer = setTimeout(() => void this.refreshEthPrice(), 60_000);
+  }
+
+  /** Refresh current prices of open paper positions via DexScreener. */
+  private async refreshPositionPrices(): Promise<void> {
+    if (this.positions.size === 0) return;
+
+    const entries = [...this.positions.entries()];
+    // DexScreener supports up to 30 comma-separated addresses per request.
+    for (let i = 0; i < entries.length; i += 30) {
+      const batch = entries.slice(i, i + 30);
+      const query = batch.map(([token]) => token).join(',');
+      try {
+        const pairs = await fetchTokenPairs(query);
+        for (const [token, pos] of batch) {
+          const best = pickBestPair(pairs, token);
+          if (best?.priceUsd) {
+            const price = parseFloat(best.priceUsd);
+            if (Number.isFinite(price) && price > 0) {
+              pos.currentPriceUsd = price;
+            }
+          }
+        }
+      } catch (err) {
+        log.debug('position price refresh failed', { query, ...errMeta(err) });
+      }
+    }
   }
 
   /**
@@ -482,6 +543,31 @@ export class CopyTrader {
     }
 
     const buyAmountUsd = this.config.copytraderBuyAmountUsd;
+
+    // Respect the concurrent position cap.
+    if (this.positions.size >= this.config.copytraderMaxConcurrentTrades) {
+      log.debug('paper buy skipped — position cap reached', {
+        token: trade.tokenAddress,
+        open: this.positions.size,
+        cap: this.config.copytraderMaxConcurrentTrades,
+      });
+      await this.sendObservedAlert(
+        trade,
+        `Position limit reached (${this.config.copytraderMaxConcurrentTrades} concurrent) — not copying`,
+      );
+      return;
+    }
+
+    // Respect the paper cash budget.
+    if (this.cashUsd < buyAmountUsd) {
+      log.debug('paper buy skipped — out of cash', { token: trade.tokenAddress, cashUsd: this.cashUsd });
+      await this.sendObservedAlert(
+        trade,
+        `Out of paper cash ($${this.cashUsd.toFixed(2)} left of $${this.config.copytraderStartingBudgetUsd} budget) — not copying`,
+      );
+      return;
+    }
+
     const tokenQty = buyAmountUsd / trade.tokenPriceUsd;
     const tokenAmountBigInt = BigInt(Math.floor(tokenQty * Math.pow(10, trade.tokenDecimals)));
 
@@ -502,6 +588,7 @@ export class CopyTrader {
         costBasisUsd: 0,
         avgEntryPriceUsd: 0,
         realizedPnlUsd: 0,
+        currentPriceUsd: trade.tokenPriceUsd,
         openedAt: trade.timestamp,
         updatedAt: trade.timestamp,
       };
@@ -513,7 +600,11 @@ export class CopyTrader {
     pos.avgEntryPriceUsd = newCost / (Number(newBalance) / Math.pow(10, trade.tokenDecimals));
     pos.costBasisUsd = newCost;
     pos.balance = newBalance;
+    pos.currentPriceUsd = trade.tokenPriceUsd;
     pos.updatedAt = trade.timestamp;
+
+    // Deduct from the paper cash budget.
+    this.cashUsd -= buyAmountUsd;
 
     // Record which watched wallet's buy we followed for this token.
     this.positionSourceWallet.set(key, trade.wallet.toLowerCase());
@@ -576,7 +667,11 @@ export class CopyTrader {
     pos.balance -= ourSellAmount;
     pos.realizedPnlUsd += pnlUsd;
     pos.costBasisUsd = Math.max(0, pos.costBasisUsd - costBasisSold);
+    pos.currentPriceUsd = trade.tokenPriceUsd;
     pos.updatedAt = trade.timestamp;
+
+    // Credit sale proceeds back to the paper cash budget.
+    this.cashUsd += proceedsUsd;
 
     // Update wallet portfolio.
     this.updateWalletPortfolioSell(trade.wallet, key, trade.tokenAmount, pnlUsd);
