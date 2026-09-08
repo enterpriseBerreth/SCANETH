@@ -45,6 +45,7 @@ class ScanethBot {
       config: this.config,
       state: this.state,
       recentAlerts: () => this.state.recentAlerts,
+      copytraderStats: () => this.copytrader?.getStats(),
     });
 
     this.providers = createProviders(this.config.rpcUrl, this.config.wsUrl);
@@ -111,14 +112,21 @@ class ScanethBot {
   private schedulePoll(expectedBlock: number): void {
     if (this.stopping) return;
     this.pollTimer = setTimeout(async () => {
+      let next = expectedBlock + 1;
       try {
         const latest = await this.providers!.http.getBlockNumber();
-        const target = Math.max(expectedBlock, latest);
-        await this.processBlock(target);
+        // Process every block since the last poll. Cap catch-up so a long
+        // downtime doesn't trigger a huge loop; beyond the cap we skip ahead.
+        const end = Math.min(latest, expectedBlock + 30);
+        for (let b = expectedBlock; b <= end; b++) {
+          if (this.stopping) return;
+          await this.processBlock(b);
+        }
+        next = end + 1;
       } catch (err) {
         log.error('poll failed', errMeta(err));
       }
-      this.schedulePoll(expectedBlock + 1);
+      this.schedulePoll(next);
     }, this.config.pollIntervalMs);
   }
 

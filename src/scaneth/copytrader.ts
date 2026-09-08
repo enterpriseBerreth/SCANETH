@@ -12,7 +12,7 @@
  * No real transactions are sent. This is a simulation layer only.
  */
 
-import { Contract, Interface, type Provider, type TransactionReceipt, type TransactionResponse } from 'ethers';
+import { Contract, type Provider, type TransactionReceipt, type TransactionResponse } from 'ethers';
 import { createLogger, errMeta } from '../logger';
 import type { ScanethConfig } from '../config';
 import type { ScanethNotifier } from './notifier';
@@ -21,24 +21,14 @@ import { fetchTokenPairs, pickBestPair } from './dexscreener';
 const log = createLogger('scaneth:copytrader');
 
 const WETH = '0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2'.toLowerCase();
-const NATIVE_ETH_SENTINEL = '0x0000000000000000000000000000000000000000';
 
 const CHAINLINK_ETH_USD_FEED = '0x5f4eC3Df9cbd43714FE2740f5E3616155c5b8419';
 const CHAINLINK_FEED_ABI = ['function latestAnswer() view returns (int256)'];
 
-const UNIV2_ROUTER_ABI = [
-  'function swapExactETHForTokens(uint amountOutMin, address[] path, address to, uint deadline) payable',
-  'function swapETHForExactTokens(uint amountOut, address[] path, address to, uint deadline) payable',
-  'function swapExactTokensForETH(uint amountIn, uint amountOutMin, address[] path, address to, uint deadline)',
-  'function swapTokensForExactETH(uint amountOut, uint amountInMax, address[] path, address to, uint deadline)',
-  'function swapExactTokensForTokens(uint amountIn, uint amountOutMin, address[] path, address to, uint deadline)',
-  'function swapTokensForExactTokens(uint amountOut, uint amountInMax, address[] path, address to, uint deadline)',
-];
-
-const UNIV3_ROUTER_ABI = [
-  'function exactInputSingle((address tokenIn, address tokenOut, uint24 fee, address recipient, uint256 deadline, uint256 amountIn, uint256 amountOutMinimum, uint160 sqrtPriceLimitX96)) payable returns (uint256 amountOut)',
-  'function exactOutputSingle((address tokenIn, address tokenOut, uint24 fee, address recipient, uint256 deadline, uint256 amountOut, uint256 amountInMaximum, uint160 sqrtPriceLimitX96)) payable returns (uint256 amountIn)',
-];
+/** ERC-20 Transfer(address,address,uint256) topic0. */
+const TRANSFER_TOPIC = '0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef';
+/** WETH Withdrawal(address,uint256) topic0 — emitted when WETH is unwrapped to ETH. */
+const WETH_WITHDRAWAL_TOPIC = '0x7fcf532c15f0a6db0bd6d0e038bea71d30d808c7d98cb3bf7268a95bf5081b65';
 
 export interface PaperPosition {
   tokenAddress: string;
@@ -105,6 +95,7 @@ export class CopyTrader {
   private readonly positions = new Map<string, PaperPosition>(); // token -> aggregated position
   /** Token -> the watched wallet whose buy we copied. Only that wallet's sells are followed. */
   private readonly positionSourceWallet = new Map<string, string>();
+  private tradeCount = 0;
   private ethUsdPrice = 0;
   private priceTimer?: NodeJS.Timeout;
   private reportTimer?: NodeJS.Timeout;
@@ -138,7 +129,7 @@ export class CopyTrader {
       totalCostBasisUsd: totalCostBasis,
       totalRealizedPnlUsd: totalRealized,
       totalUnrealizedPnlUsd: totalUnrealized,
-      tradeCount: 0, // could track separately if needed
+      tradeCount: this.tradeCount,
     };
   }
 
@@ -346,122 +337,90 @@ export class CopyTrader {
     this.priceTimer = setTimeout(() => void this.refreshEthPrice(), 60_000);
   }
 
+  /**
+   * Detect a buy/sell from ERC-20 Transfer events in the transaction receipt.
+   *
+   * This works for ANY router or aggregator (Uniswap V2/V3/Universal Router,
+   * 1inch, LiFi, custom trading bots, EIP-7702 delegated calls) because every
+   * DEX swap emits Transfer events touching the trader's wallet:
+   *   Buy:  wallet receives a non-WETH token and pays ETH (msg.value) or WETH.
+   *   Sell: wallet sends a non-WETH token and receives WETH, or the router
+   *         unwraps WETH to native ETH for the wallet.
+   */
   private async parseTrade(
     tx: TransactionResponse,
-    _receipt: TransactionReceipt,
+    receipt: TransactionReceipt,
     wallet: string,
   ): Promise<CopyTrade | null> {
-    const routerV2 = new Interface(UNIV2_ROUTER_ABI);
-    const routerV3 = new Interface(UNIV3_ROUTER_ABI);
+    const tokenIn = new Map<string, bigint>();
+    const tokenOut = new Map<string, bigint>();
+    let wethIn = 0n;
+    let wethOut = 0n;
+    let ethUnwrapped = 0n;
 
-    let parsed: { name: string; args: { [key: string]: unknown } } | null = null;
-    let protocol: 'v2' | 'v3' | null = null;
-
-    try {
-      parsed = routerV2.parseTransaction({ data: tx.data, value: tx.value }) as unknown as {
-        name: string;
-        args: { [key: string]: unknown };
-      };
-      protocol = 'v2';
-    } catch {
-      try {
-        parsed = routerV3.parseTransaction({ data: tx.data, value: tx.value }) as unknown as {
-          name: string;
-          args: { [key: string]: unknown };
-        };
-        protocol = 'v3';
-      } catch {
-        return null;
+    for (const lg of receipt.logs) {
+      const topic0 = lg.topics[0];
+      if (topic0 === TRANSFER_TOPIC && lg.topics.length >= 3) {
+        const topic1 = lg.topics[1];
+        const topic2 = lg.topics[2];
+        if (!topic1 || !topic2) continue;
+        const from = '0x' + topic1.slice(26);
+        const to = '0x' + topic2.slice(26);
+        let amount: bigint;
+        try {
+          amount = BigInt(lg.data);
+        } catch {
+          continue;
+        }
+        if (amount === 0n || from === to) continue;
+        const token = lg.address.toLowerCase();
+        if (token === WETH) {
+          if (to === wallet) wethIn += amount;
+          else if (from === wallet) wethOut += amount;
+        } else if (to === wallet) {
+          tokenIn.set(token, (tokenIn.get(token) ?? 0n) + amount);
+        } else if (from === wallet) {
+          tokenOut.set(token, (tokenOut.get(token) ?? 0n) + amount);
+        }
+      } else if (topic0 === WETH_WITHDRAWAL_TOPIC && lg.address.toLowerCase() === WETH) {
+        try {
+          ethUnwrapped += BigInt(lg.data);
+        } catch {
+          // ignore malformed data
+        }
       }
     }
 
-    if (!parsed) return null;
+    const ethPriceUsd = this.ethUsdPrice || 2500;
 
-    const method = parsed.name.toLowerCase();
-
-    // V2 path-based swaps.
-    if (protocol === 'v2') {
-      const path = parsed.args.path as string[] | undefined;
-      if (!path || path.length < 2) return null;
-
-      const tokenIn = path[0]?.toLowerCase();
-      const tokenOut = path[path.length - 1]?.toLowerCase();
-      if (!tokenIn || !tokenOut) return null;
-
-      const isBuy = tokenIn === WETH || tokenIn === NATIVE_ETH_SENTINEL;
-      const isSell = tokenOut === WETH || tokenOut === NATIVE_ETH_SENTINEL;
-
-      // Ignore token-to-token swaps for the MVP.
-      if (!isBuy && !isSell) return null;
-
-      const tokenAddress = isBuy ? tokenOut : tokenIn;
-      const tokenDecimals = await this.getDecimals(tokenAddress);
-
-      let ethAmount: bigint;
-      let tokenAmount: bigint;
-
-      if (isBuy) {
-        ethAmount = tx.value;
-        tokenAmount =
-          method === 'swapethforexacttokens'
-            ? BigInt(String(parsed.args.amountOut))
-            : BigInt(String(parsed.args.amountOutMin));
-      } else {
-        // Sell
-        tokenAmount =
-          method === 'swaptokensforexacteth'
-            ? BigInt(String(parsed.args.amountInMax))
-            : BigInt(String(parsed.args.amountIn));
-        ethAmount = BigInt(String(parsed.args.amountOutMin ?? parsed.args.amountOut));
-      }
-
-      if (ethAmount === 0n || tokenAmount === 0n) return null;
-
-      const ethPriceUsd = this.ethUsdPrice || 2500;
-      const tokenPriceUsd = (Number(ethAmount) * ethPriceUsd) / (Number(tokenAmount) / Math.pow(10, tokenDecimals));
-
-      return this.buildTrade(wallet, isBuy ? 'buy' : 'sell', tokenAddress, tokenDecimals, tokenAmount, ethAmount, ethPriceUsd, tokenPriceUsd, tx);
+    // Buy: wallet paid ETH or WETH and received a non-WETH token.
+    const bought = [...tokenIn.entries()][0];
+    if (bought && (tx.value > 0n || wethOut > 0n)) {
+      const [tokenAddress, tokenAmount] = bought;
+      const ethAmount = tx.value + wethOut;
+      if (tokenAmount <= 0n) return null;
+      const decimals = await this.getDecimals(tokenAddress);
+      const tokenPriceUsd = (Number(ethAmount) * ethPriceUsd) / (Number(tokenAmount) / Math.pow(10, decimals));
+      if (!Number.isFinite(tokenPriceUsd) || tokenPriceUsd <= 0) return null;
+      return this.buildTrade(wallet, 'buy', tokenAddress, decimals, tokenAmount, ethAmount, ethPriceUsd, tokenPriceUsd, tx);
     }
 
-    // V3 single-hop swaps.
-    if (protocol === 'v3') {
-      const params = parsed.args.params as {
-        tokenIn: string;
-        tokenOut: string;
-        amountIn: bigint;
-        amountOut: bigint;
-        amountInMaximum?: bigint;
-        amountOutMinimum?: bigint;
-      } | undefined;
-      if (!params) return null;
-
-      const tokenIn = params.tokenIn.toLowerCase();
-      const tokenOut = params.tokenOut.toLowerCase();
-      const isBuy = tokenIn === WETH;
-      const isSell = tokenOut === WETH;
-      if (!isBuy && !isSell) return null;
-
-      const tokenAddress = isBuy ? tokenOut : tokenIn;
-      const tokenDecimals = await this.getDecimals(tokenAddress);
-
-      let ethAmount: bigint;
-      let tokenAmount: bigint;
-
-      if (method.includes('exactinput')) {
-        ethAmount = isBuy ? params.amountIn : params.amountOut;
-        tokenAmount = isBuy ? params.amountOut : params.amountIn;
+    // Sell: wallet sent a non-WETH token in a swap (received WETH, another
+    // token back, or the router unwrapped WETH to native ETH for it).
+    const sold = [...tokenOut.entries()][0];
+    if (sold && (wethIn > 0n || ethUnwrapped > 0n || tokenIn.size > 0)) {
+      const [tokenAddress, tokenAmount] = sold;
+      if (tokenAmount <= 0n) return null;
+      const ethAmount = wethIn > 0n ? wethIn : ethUnwrapped;
+      const decimals = await this.getDecimals(tokenAddress);
+      let tokenPriceUsd: number;
+      if (ethAmount > 0n) {
+        tokenPriceUsd = (Number(ethAmount) * ethPriceUsd) / (Number(tokenAmount) / Math.pow(10, decimals));
       } else {
-        // exactOutput: amountOut is fixed, amountIn is max
-        ethAmount = isBuy ? (params.amountInMaximum ?? 0n) : params.amountOut;
-        tokenAmount = isBuy ? params.amountOut : (params.amountInMaximum ?? 0n);
+        tokenPriceUsd = await this.getCurrentTokenPrice(tokenAddress);
       }
-
-      if (ethAmount === 0n || tokenAmount === 0n) return null;
-
-      const ethPriceUsd = this.ethUsdPrice || 2500;
-      const tokenPriceUsd = (Number(ethAmount) * ethPriceUsd) / (Number(tokenAmount) / Math.pow(10, tokenDecimals));
-
-      return this.buildTrade(wallet, isBuy ? 'buy' : 'sell', tokenAddress, tokenDecimals, tokenAmount, ethAmount, ethPriceUsd, tokenPriceUsd, tx);
+      if (!Number.isFinite(tokenPriceUsd) || tokenPriceUsd <= 0) return null;
+      return this.buildTrade(wallet, 'sell', tokenAddress, decimals, tokenAmount, ethAmount, ethPriceUsd, tokenPriceUsd, tx);
     }
 
     return null;
@@ -496,6 +455,7 @@ export class CopyTrader {
   }
 
   private async executePaperTrade(trade: CopyTrade): Promise<void> {
+    this.tradeCount++;
     if (trade.type === 'buy') {
       await this.executePaperBuy(trade);
     } else {
@@ -505,6 +465,14 @@ export class CopyTrader {
 
   private async executePaperBuy(trade: CopyTrade): Promise<void> {
     const key = trade.tokenAddress.toLowerCase();
+
+    // Track the watched wallet's own balance/portfolio for EVERY detected buy,
+    // whether or not we mirror it (needed for proportional sell sizing).
+    const walletBalances = this.getWalletBalanceMap(trade.wallet);
+    const prevBalance = walletBalances.get(key) ?? 0n;
+    walletBalances.set(key, prevBalance + trade.tokenAmount);
+    const theirQty = Number(trade.tokenAmount) / Math.pow(10, trade.tokenDecimals);
+    this.updateWalletPortfolioBuy(trade.wallet, trade.tokenAddress, trade.tokenAmount, theirQty * trade.tokenPriceUsd, trade.tokenDecimals);
 
     // Do not buy the same token again just because multiple wallets bought it.
     if (this.positions.has(key)) {
@@ -521,14 +489,6 @@ export class CopyTrader {
       log.debug('paper buy too small', { token: trade.tokenAddress, price: trade.tokenPriceUsd });
       return;
     }
-
-    // Update watched wallet's tracked balance.
-    const walletBalances = this.getWalletBalanceMap(trade.wallet);
-    const prevBalance = walletBalances.get(trade.tokenAddress) ?? 0n;
-    walletBalances.set(trade.tokenAddress, prevBalance + trade.tokenAmount);
-
-    // Update wallet portfolio.
-    this.updateWalletPortfolioBuy(trade.wallet, trade.tokenAddress, tokenAmountBigInt, buyAmountUsd, trade.tokenDecimals);
 
     // Update paper position.
     let pos = this.positions.get(key);
@@ -575,6 +535,12 @@ export class CopyTrader {
 
   private async executePaperSell(trade: CopyTrade): Promise<void> {
     const key = trade.tokenAddress.toLowerCase();
+
+    // Track the watched wallet's own balance for EVERY detected sell.
+    const walletBalances = this.getWalletBalanceMap(trade.wallet);
+    const walletBalanceBefore = walletBalances.get(key) ?? 0n;
+    walletBalances.set(key, walletBalanceBefore > trade.tokenAmount ? walletBalanceBefore - trade.tokenAmount : 0n);
+
     const pos = this.positions.get(key);
     if (!pos || pos.balance <= 0n) {
       log.debug('paper sell ignored — no position', { token: trade.tokenAddress });
@@ -594,14 +560,8 @@ export class CopyTrader {
       return;
     }
 
-    const walletBalances = this.getWalletBalanceMap(trade.wallet);
-    const walletBalanceBefore = walletBalances.get(key) ?? trade.tokenAmount;
-    if (walletBalanceBefore <= 0n) {
-      log.debug('paper sell ignored — wallet balance zero', { token: trade.tokenAddress });
-      return;
-    }
-
-    const sellPct = Math.min(1, Number(trade.tokenAmount) / Number(walletBalanceBefore));
+    // Proportional sell: mirror the fraction of THEIR position that they sold.
+    const sellPct = walletBalanceBefore > 0n ? Math.min(1, Number(trade.tokenAmount) / Number(walletBalanceBefore)) : 1;
     const ourSellAmount = BigInt(Math.floor(Number(pos.balance) * sellPct));
 
     if (ourSellAmount <= 0n) {
@@ -618,11 +578,8 @@ export class CopyTrader {
     pos.costBasisUsd = Math.max(0, pos.costBasisUsd - costBasisSold);
     pos.updatedAt = trade.timestamp;
 
-    // Update watched wallet balance.
-    walletBalances.set(key, walletBalanceBefore - trade.tokenAmount);
-
     // Update wallet portfolio.
-    this.updateWalletPortfolioSell(trade.wallet, key, ourSellAmount, pnlUsd);
+    this.updateWalletPortfolioSell(trade.wallet, key, trade.tokenAmount, pnlUsd);
 
     // Track daily realized PNL.
     const day = currentMstDay();
