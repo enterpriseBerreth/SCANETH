@@ -5,7 +5,9 @@
  *   1. New launch alert with scam rating and pros/cons.
  *   2. Daily winners report with top 5 tokens, ATH, and PNL.
  *   3. Paper copytrade BUY and SELL alerts.
- *   4. Copied wallet ranking report with $ and % PNL.
+ *   4. Watched-wallet trade (not copied) alert.
+ *   5. Position-cap and out-of-cash skip alerts.
+ *   6. Copied wallet ranking report with $ and % PNL.
  */
 
 import { loadConfig } from '../config';
@@ -75,6 +77,36 @@ async function main(): Promise<void> {
     `<a href="https://etherscan.io/tx/0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb">Tx</a> · ` +
     `<a href="https://etherscan.io/token/0x1111111111111111111111111111111111111111">Token</a>`;
 
+  const notCopiedAlert =
+    `<b>SCANETH — Watched wallet BUY (not copied)</b>\n\n` +
+    `Wallet: <code>0x7777777777777777777777777777777777777777</code>\n` +
+    `Token: <b>MoonETH (MOON)</b>\n` +
+    `Address: <code>0x1111111111111111111111111111111111111111</code>\n\n` +
+    `Their trade: 25000.0 MOON for ~0.5000 ETH\n` +
+    `Reason: Already holding this token — no duplicate buys\n\n` +
+    `<a href="https://etherscan.io/tx/0xcccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc">Tx</a> · ` +
+    `<a href="https://etherscan.io/token/0x1111111111111111111111111111111111111111">Token</a>`;
+
+  const positionCapAlert =
+    `<b>SCANETH — Watched wallet BUY (not copied)</b>\n\n` +
+    `Wallet: <code>0x6666666666666666666666666666666666666666</code>\n` +
+    `Token: <b>AlphaCoin (ALFA)</b>\n` +
+    `Address: <code>0x3333333333333333333333333333333333333333</code>\n\n` +
+    `Their trade: 12000.0 ALFA for ~0.2000 ETH\n` +
+    `Reason: Position limit reached (15 concurrent) — not copying\n\n` +
+    `<a href="https://etherscan.io/tx/0xdddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd">Tx</a> · ` +
+    `<a href="https://etherscan.io/token/0x3333333333333333333333333333333333333333">Token</a>`;
+
+  const outOfCashAlert =
+    `<b>SCANETH — Watched wallet BUY (not copied)</b>\n\n` +
+    `Wallet: <code>0x5555555555555555555555555555555555555555</code>\n` +
+    `Token: <b>RocketToken (RKT)</b>\n` +
+    `Address: <code>0x2222222222222222222222222222222222222222</code>\n\n` +
+    `Their trade: 9000.0 RKT for ~0.1000 ETH\n` +
+    `Reason: Out of paper cash ($8.40 left of $1000 budget) — not copying\n\n` +
+    `<a href="https://etherscan.io/tx/0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee">Tx</a> · ` +
+    `<a href="https://etherscan.io/token/0x2222222222222222222222222222222222222222">Token</a>`;
+
   const walletRankingReport =
     `<b>SCANETH — Copied wallet rankings (test)</b>\n\n` +
     `1. 🟢 <code>0x8888888888888888888888888888888888888888</code>\n` +
@@ -87,7 +119,16 @@ async function main(): Promise<void> {
     `   PNL: <b>-$15.00 (-30.00%)</b>\n` +
     `   Realized: -$5.00 · Unrealized: -$10.00`;
 
-  const alerts = [launchAlert, dailyReport, copyBuyAlert, copySellAlert, walletRankingReport];
+  const alerts = [
+    launchAlert,
+    dailyReport,
+    copyBuyAlert,
+    copySellAlert,
+    notCopiedAlert,
+    positionCapAlert,
+    outOfCashAlert,
+    walletRankingReport,
+  ];
   for (const alert of alerts) {
     const ok = await notifier.sendRaw(alert);
     if (!ok) {
