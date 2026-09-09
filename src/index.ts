@@ -17,6 +17,7 @@ import { BlockScanner } from './scaneth/scanner';
 import { createProviders, destroyProviders, type ProviderPair } from './scaneth/provider';
 import { AthTracker } from './scaneth/tracker';
 import { CopyTrader } from './scaneth/copytrader';
+import { WalletScout } from './scaneth/wallet-scout';
 import type { TokenLaunch } from './scaneth/types';
 import type { Server } from 'node:http';
 
@@ -29,6 +30,7 @@ class ScanethBot {
   private providers?: ProviderPair;
   private scanner?: BlockScanner;
   private copytrader?: CopyTrader;
+  private walletScout?: WalletScout;
   private httpServer?: Server;
   private stopping = false;
   private pollTimer?: NodeJS.Timeout;
@@ -46,6 +48,7 @@ class ScanethBot {
       state: this.state,
       recentAlerts: () => this.state.recentAlerts,
       copytraderStats: () => this.copytrader?.getStats(),
+      scoutStats: () => this.walletScout?.getStats(),
     });
 
     this.providers = createProviders(this.config.rpcUrl, this.config.wsUrl);
@@ -70,6 +73,8 @@ class ScanethBot {
 
     if (this.config.copytraderEnabled) {
       this.copytrader.start();
+      this.walletScout = new WalletScout(this.config, this.providers.http, this.notifier, this.copytrader);
+      this.walletScout.start();
     }
 
     if (this.config.backtest) {
@@ -173,6 +178,7 @@ class ScanethBot {
     if (this.pollTimer) clearTimeout(this.pollTimer);
     this.tracker.stop();
     this.copytrader?.stop();
+    this.walletScout?.stop();
 
     if (this.providers) {
       destroyProviders(this.providers);

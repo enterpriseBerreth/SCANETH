@@ -109,6 +109,8 @@ export class CopyTrader {
   /** Token -> the watched wallet whose buy we copied. Only that wallet's sells are followed. */
   private readonly positionSourceWallet = new Map<string, string>();
   private tradeCount = 0;
+  /** Trades observed per watched wallet (for scout ranking). */
+  private readonly walletTradeCounts = new Map<string, number>();
   /** Remaining paper cash. Starts at the configured budget, decreases on buys, grows on sells. */
   private cashUsd: number;
   private ethUsdPrice = 0;
@@ -519,11 +521,61 @@ export class CopyTrader {
 
   private async executePaperTrade(trade: CopyTrade): Promise<void> {
     this.tradeCount++;
+    const wKey = trade.wallet.toLowerCase();
+    this.walletTradeCounts.set(wKey, (this.walletTradeCounts.get(wKey) ?? 0) + 1);
     if (trade.type === 'buy') {
       await this.executePaperBuy(trade);
     } else {
       await this.executePaperSell(trade);
     }
+  }
+
+  /** Add a wallet to the watched set (scout engine). Returns false if already watched. */
+  addWatchedWallet(wallet: string): boolean {
+    const key = wallet.toLowerCase();
+    if (this.watchedWallets.has(key)) return false;
+    this.watchedWallets.add(key);
+    log.info('scout added wallet', { wallet: key });
+    return true;
+  }
+
+  /** Remove a wallet from the watched set (scout engine). */
+  removeWatchedWallet(wallet: string): boolean {
+    const key = wallet.toLowerCase();
+    if (!this.watchedWallets.has(key)) return false;
+    this.watchedWallets.delete(key);
+    log.info('scout removed wallet', { wallet: key });
+    return true;
+  }
+
+  /** Per-wallet performance across all observed trades (for scout ranking). */
+  getWalletPerformance(): Map<string, { realizedPnlUsd: number; unrealizedPnlUsd: number; trades: number }> {
+    const result = new Map<string, { realizedPnlUsd: number; unrealizedPnlUsd: number; trades: number }>();
+    for (const wallet of this.watchedWallets) {
+      let realized = 0;
+      const days = this.walletDailyStats.get(wallet);
+      if (days) {
+        for (const stats of days.values()) realized += stats.realizedPnlUsd;
+      }
+
+      let unrealized = 0;
+      const portfolio = this.walletPortfolios.get(wallet);
+      if (portfolio) {
+        for (const [token, pos] of portfolio) {
+          if (pos.balance <= 0n) continue;
+          const live = this.positions.get(token);
+          const price = live && live.currentPriceUsd > 0 ? live.currentPriceUsd : pos.avgEntryPriceUsd;
+          unrealized += (Number(pos.balance) / Math.pow(10, live?.decimals ?? 18)) * (price - pos.avgEntryPriceUsd);
+        }
+      }
+
+      result.set(wallet, {
+        realizedPnlUsd: realized,
+        unrealizedPnlUsd: unrealized,
+        trades: this.walletTradeCounts.get(wallet) ?? 0,
+      });
+    }
+    return result;
   }
 
   private async executePaperBuy(trade: CopyTrade): Promise<void> {

@@ -76,6 +76,12 @@ export interface ScanethConfig {
   copytraderBuyAmountUsd: number;
   /** Paper trading budget. Buys stop when cash is exhausted. */
   copytraderStartingBudgetUsd: number;
+  /** Auto-scout engine: discover profitable wallets and replace underperformers. */
+  copytraderAutoScoutEnabled: boolean;
+  /** Maximum number of wallets the copytrader may watch. */
+  copytraderMaxWallets: number;
+  /** Hours between scout cycles. */
+  copytraderScoutIntervalHours: number;
   /** True when the bot should actually process blocks; false for dry-run. */
   enabled: boolean;
 }
@@ -106,6 +112,9 @@ export function loadConfig(): ScanethConfig {
     copytraderWatchedWallets: addressList('COPYTRADER_WATCHED_WALLETS'),
     copytraderBuyAmountUsd: num('COPYTRADER_BUY_AMOUNT_USD', 20),
     copytraderStartingBudgetUsd: num('COPYTRADER_STARTING_BUDGET_USD', 1000),
+    copytraderAutoScoutEnabled: bool('COPYTRADER_AUTO_SCOUT_ENABLED', true),
+    copytraderMaxWallets: num('COPYTRADER_MAX_WALLETS', 12),
+    copytraderScoutIntervalHours: num('COPYTRADER_SCOUT_INTERVAL_HOURS', 12),
     startBlock: optionalStr('START_BLOCK') ? num('START_BLOCK', 0) : undefined,
     backtest: optionalStr('BACKTEST_FROM') && optionalStr('BACKTEST_TO')
       ? {

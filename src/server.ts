@@ -11,6 +11,7 @@ import type { BotState } from './state';
 import type { ScanethConfig } from './config';
 import type { TokenLaunch } from './scaneth/types';
 import type { CopyTraderStats } from './scaneth/copytrader';
+import type { ScoutStats } from './scaneth/wallet-scout';
 
 const log = createLogger('server');
 
@@ -19,6 +20,7 @@ export interface ServerDeps {
   state: BotState;
   recentAlerts: () => TokenLaunch[];
   copytraderStats?: () => CopyTraderStats | undefined;
+  scoutStats?: () => ScoutStats | undefined;
 }
 
 function json(value: unknown): string {
@@ -67,6 +69,7 @@ export function startServer(deps: ServerDeps): Server {
           },
           state: deps.state.snapshot(),
           copytrader: deps.copytraderStats?.(),
+          scout: deps.scoutStats?.(),
         }),
       );
       return;
