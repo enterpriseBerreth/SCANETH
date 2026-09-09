@@ -774,14 +774,33 @@ export class CopyTrader {
     return this.positions.get(tokenAddress)?.decimals;
   }
 
+  /**
+   * Single alert per copied trade, with the paper account snapshot:
+   * wallet, token, amount paper traded, PNL $/%, starting and ending capital.
+   * Called AFTER paper state (cash/positions) has been updated.
+   */
   private async sendTradeAlert(
     trade: CopyTrade,
     ourTokenAmount: bigint,
     ourUsdAmount: number,
     pnlUsd?: number,
   ): Promise<void> {
-    const tokenQty = Number(ourTokenAmount) / Math.pow(10, trade.tokenDecimals);
     const isBuy = trade.type === 'buy';
+    const startingCapital = this.config.copytraderStartingBudgetUsd;
+
+    // Ending capital: cash + market value of open positions, after this trade.
+    let openValue = 0;
+    for (const pos of this.positions.values()) {
+      const price = pos.currentPriceUsd > 0 ? pos.currentPriceUsd : pos.avgEntryPriceUsd;
+      openValue += (Number(pos.balance) / Math.pow(10, pos.decimals)) * price;
+    }
+    const endingCapital = this.cashUsd + openValue;
+
+    // PNL: 0 for a fresh buy (realized on sell); % relative to the cost basis sold.
+    const tradePnl = pnlUsd ?? 0;
+    const costBasisSold = isBuy ? 0 : Math.max(1e-9, ourUsdAmount - tradePnl);
+    const pnlPct = isBuy ? 0 : (tradePnl / costBasisSold) * 100;
+    const pnlSign = tradePnl >= 0 ? '+' : '';
 
     const lines = [
       `<b>SCANETH — Paper copytrade ${isBuy ? 'BUY' : 'SELL'}</b>`,
@@ -790,26 +809,14 @@ export class CopyTrader {
       `Token: <b>${escapeHtml(trade.tokenName)} (${escapeHtml(trade.tokenSymbol)})</b>`,
       `Address: <code>${trade.tokenAddress}</code>`,
       '',
-      `<b>Our paper trade</b>`,
-      `${isBuy ? 'Bought' : 'Sold'}: ${tokenQty.toFixed(4)} ${escapeHtml(trade.tokenSymbol)}`,
-      `Amount: $${ourUsdAmount.toFixed(2)}`,
-      `Price: $${trade.tokenPriceUsd.toExponential(4)}`,
-    ];
-
-    if (!isBuy && trade.sellPct !== undefined) {
-      lines.push(`Mirrored sell: ${(trade.sellPct * 100).toFixed(2)}% of copied position`);
-    }
-
-    if (pnlUsd !== undefined) {
-      const sign = pnlUsd >= 0 ? '+' : '';
-      lines.push(`Trade PNL: <b>${sign}$${pnlUsd.toFixed(2)}</b>`);
-    }
-
-    lines.push('');
-    lines.push(
+      `Amount paper traded: <b>$${ourUsdAmount.toFixed(2)}</b>`,
+      `PNL: <b>${pnlSign}$${tradePnl.toFixed(2)} (${pnlSign}${pnlPct.toFixed(2)}%)</b>`,
+      `Starting capital: $${startingCapital.toFixed(2)}`,
+      `Ending capital: <b>$${endingCapital.toFixed(2)}</b>`,
+      '',
       `<a href="https://etherscan.io/tx/${trade.txHash}">Tx</a> · ` +
         `<a href="https://etherscan.io/token/${trade.tokenAddress}">Token</a>`,
-    );
+    ];
 
     const ok = await this.notifier.sendRaw(lines.join('\n'));
     if (!ok) {

@@ -56,10 +56,10 @@ async function main(): Promise<void> {
     `Copied wallet: <code>0x8888888888888888888888888888888888888888</code>\n` +
     `Token: <b>MoonETH (MOON)</b>\n` +
     `Address: <code>0x1111111111111111111111111111111111111111</code>\n\n` +
-    `<b>Our paper trade</b>\n` +
-    `Bought: 20000.0000 MOON\n` +
-    `Amount: $20.00\n` +
-    `Price: $1.0000e-3\n\n` +
+    `Amount paper traded: <b>$20.00</b>\n` +
+    `PNL: <b>$0.00 (0.00%)</b>\n` +
+    `Starting capital: $1000.00\n` +
+    `Ending capital: <b>$980.00</b>\n\n` +
     `<a href="https://etherscan.io/tx/0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa">Tx</a> · ` +
     `<a href="https://etherscan.io/token/0x1111111111111111111111111111111111111111">Token</a>`;
 
@@ -68,12 +68,10 @@ async function main(): Promise<void> {
     `Copied wallet: <code>0x8888888888888888888888888888888888888888</code>\n` +
     `Token: <b>MoonETH (MOON)</b>\n` +
     `Address: <code>0x1111111111111111111111111111111111111111</code>\n\n` +
-    `<b>Our paper trade</b>\n` +
-    `Sold: 4000.0000 MOON\n` +
-    `Amount: $80.00\n` +
-    `Price: $2.0000e-2\n` +
-    `Mirrored sell: 20.00% of copied position\n` +
-    `Trade PNL: <b>+$60.00</b>\n\n` +
+    `Amount paper traded: <b>$16.00</b>\n` +
+    `PNL: <b>+$60.00 (+375.00%)</b>\n` +
+    `Starting capital: $1000.00\n` +
+    `Ending capital: <b>$1056.00</b>\n\n` +
     `<a href="https://etherscan.io/tx/0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb">Tx</a> · ` +
     `<a href="https://etherscan.io/token/0x1111111111111111111111111111111111111111">Token</a>`;
 
