@@ -76,8 +76,6 @@ export interface ScanethConfig {
   copytraderBuyAmountUsd: number;
   /** Paper trading budget. Buys stop when cash is exhausted. */
   copytraderStartingBudgetUsd: number;
-  /** Maximum number of concurrent open paper positions. */
-  copytraderMaxConcurrentTrades: number;
   /** True when the bot should actually process blocks; false for dry-run. */
   enabled: boolean;
 }
@@ -108,7 +106,6 @@ export function loadConfig(): ScanethConfig {
     copytraderWatchedWallets: addressList('COPYTRADER_WATCHED_WALLETS'),
     copytraderBuyAmountUsd: num('COPYTRADER_BUY_AMOUNT_USD', 20),
     copytraderStartingBudgetUsd: num('COPYTRADER_STARTING_BUDGET_USD', 1000),
-    copytraderMaxConcurrentTrades: num('COPYTRADER_MAX_CONCURRENT_TRADES', 15),
     startBlock: optionalStr('START_BLOCK') ? num('START_BLOCK', 0) : undefined,
     backtest: optionalStr('BACKTEST_FROM') && optionalStr('BACKTEST_TO')
       ? {
@@ -148,9 +145,6 @@ function validate(c: ScanethConfig): void {
   }
   if (c.copytraderStartingBudgetUsd <= 0) {
     problems.push('COPYTRADER_STARTING_BUDGET_USD must be > 0');
-  }
-  if (c.copytraderMaxConcurrentTrades <= 0) {
-    problems.push('COPYTRADER_MAX_CONCURRENT_TRADES must be > 0');
   }
   if (c.backtest && c.backtest.to < c.backtest.from) {
     problems.push('BACKTEST_TO must be greater than or equal to BACKTEST_FROM');

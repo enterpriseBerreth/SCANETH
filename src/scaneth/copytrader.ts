@@ -87,7 +87,6 @@ export interface CopyTrade {
 export interface CopyTraderStats {
   watchedWallets: string[];
   positionCount: number;
-  maxConcurrentTrades: number;
   buyAmountUsd: number;
   startingBudgetUsd: number;
   cashUsd: number;
@@ -152,7 +151,6 @@ export class CopyTrader {
     return {
       watchedWallets: [...this.watchedWallets],
       positionCount: this.positions.size,
-      maxConcurrentTrades: this.config.copytraderMaxConcurrentTrades,
       buyAmountUsd: this.config.copytraderBuyAmountUsd,
       startingBudgetUsd: this.config.copytraderStartingBudgetUsd,
       cashUsd: this.cashUsd,
@@ -547,20 +545,6 @@ export class CopyTrader {
     }
 
     const buyAmountUsd = this.config.copytraderBuyAmountUsd;
-
-    // Respect the concurrent position cap.
-    if (this.positions.size >= this.config.copytraderMaxConcurrentTrades) {
-      log.debug('paper buy skipped — position cap reached', {
-        token: trade.tokenAddress,
-        open: this.positions.size,
-        cap: this.config.copytraderMaxConcurrentTrades,
-      });
-      await this.sendObservedAlert(
-        trade,
-        `Position limit reached (${this.config.copytraderMaxConcurrentTrades} concurrent) — not copying`,
-      );
-      return;
-    }
 
     // Respect the paper cash budget.
     if (this.cashUsd < buyAmountUsd) {

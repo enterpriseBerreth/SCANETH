@@ -6,7 +6,7 @@
  *   2. Daily winners report with top 5 tokens, ATH, and PNL.
  *   3. Paper copytrade SELL alert (single alert per trade, fired after the sell).
  *   4. Watched-wallet trade (not copied) alert.
- *   5. Position-cap and out-of-cash skip alerts.
+ *   5. Out-of-cash skip alert.
  *   6. Copied wallet ranking report with $ and % PNL.
  */
 
@@ -76,16 +76,6 @@ async function main(): Promise<void> {
     `<a href="https://etherscan.io/tx/0xcccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc">Tx</a> · ` +
     `<a href="https://etherscan.io/token/0x1111111111111111111111111111111111111111">Token</a>`;
 
-  const positionCapAlert =
-    `<b>SCANETH — Watched wallet BUY (not copied)</b>\n\n` +
-    `Wallet: <code>0x6666666666666666666666666666666666666666</code>\n` +
-    `Token: <b>AlphaCoin (ALFA)</b>\n` +
-    `Address: <code>0x3333333333333333333333333333333333333333</code>\n\n` +
-    `Their trade: 12000.0 ALFA for ~0.2000 ETH\n` +
-    `Reason: Position limit reached (15 concurrent) — not copying\n\n` +
-    `<a href="https://etherscan.io/tx/0xdddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd">Tx</a> · ` +
-    `<a href="https://etherscan.io/token/0x3333333333333333333333333333333333333333">Token</a>`;
-
   const outOfCashAlert =
     `<b>SCANETH — Watched wallet BUY (not copied)</b>\n\n` +
     `Wallet: <code>0x5555555555555555555555555555555555555555</code>\n` +
@@ -113,7 +103,6 @@ async function main(): Promise<void> {
     dailyReport,
     copySellAlert,
     notCopiedAlert,
-    positionCapAlert,
     outOfCashAlert,
     walletRankingReport,
   ];
