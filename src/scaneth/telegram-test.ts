@@ -4,7 +4,7 @@
  * Sends test alerts in the current formats:
  *   1. New launch alert with scam rating and pros/cons.
  *   2. Daily winners report with top 5 tokens, ATH, and PNL.
- *   3. Paper copytrade BUY and SELL alerts.
+ *   3. Paper copytrade SELL alert (single alert per trade, fired after the sell).
  *   4. Watched-wallet trade (not copied) alert.
  *   5. Position-cap and out-of-cash skip alerts.
  *   6. Copied wallet ranking report with $ and % PNL.
@@ -51,27 +51,18 @@ async function main(): Promise<void> {
     `   Entry: $0.00000500 → ATH: $0.00003000\n` +
     `   PNL: <b>+500.00%</b>`;
 
-  const copyBuyAlert =
-    `<b>SCANETH — Paper copytrade BUY</b>\n\n` +
-    `Copied wallet: <code>0x8888888888888888888888888888888888888888</code>\n` +
-    `Token: <b>MoonETH (MOON)</b>\n` +
-    `Address: <code>0x1111111111111111111111111111111111111111</code>\n\n` +
-    `Amount paper traded: <b>$20.00</b>\n` +
-    `PNL: <b>$0.00 (0.00%)</b>\n` +
-    `Starting capital: $1000.00\n` +
-    `Ending capital: <b>$980.00</b>\n\n` +
-    `<a href="https://etherscan.io/tx/0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa">Tx</a> · ` +
-    `<a href="https://etherscan.io/token/0x1111111111111111111111111111111111111111">Token</a>`;
-
   const copySellAlert =
     `<b>SCANETH — Paper copytrade SELL</b>\n\n` +
     `Copied wallet: <code>0x8888888888888888888888888888888888888888</code>\n` +
     `Token: <b>MoonETH (MOON)</b>\n` +
     `Address: <code>0x1111111111111111111111111111111111111111</code>\n\n` +
-    `Amount paper traded: <b>$16.00</b>\n` +
-    `PNL: <b>+$60.00 (+375.00%)</b>\n` +
+    `Entry: $1.0000e-3 → Exit: $4.7500e-3\n` +
+    `Mirrored sell: 100.00% of position\n` +
+    `Amount paper traded: <b>$95.00</b>\n` +
+    `PNL: <b>+$75.00 (+375.00%)</b>\n` +
     `Starting capital: $1000.00\n` +
-    `Ending capital: <b>$1056.00</b>\n\n` +
+    `Ending capital: <b>$1075.00</b>\n\n` +
+    `✅ Position fully closed\n\n` +
     `<a href="https://etherscan.io/tx/0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb">Tx</a> · ` +
     `<a href="https://etherscan.io/token/0x1111111111111111111111111111111111111111">Token</a>`;
 
@@ -120,7 +111,6 @@ async function main(): Promise<void> {
   const alerts = [
     launchAlert,
     dailyReport,
-    copyBuyAlert,
     copySellAlert,
     notCopiedAlert,
     positionCapAlert,
