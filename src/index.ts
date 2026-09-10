@@ -120,14 +120,25 @@ class ScanethBot {
       let next = expectedBlock + 1;
       try {
         const latest = await this.providers!.http.getBlockNumber();
-        // Process every block since the last poll. Cap catch-up so a long
-        // downtime doesn't trigger a huge loop; beyond the cap we skip ahead.
-        const end = Math.min(latest, expectedBlock + 30);
-        for (let b = expectedBlock; b <= end; b++) {
-          if (this.stopping) return;
-          await this.processBlock(b);
+        // If we've fallen too far behind, jump to the chain head. Grinding
+        // through old blocks is both slow and rejected by free RPCs (archive
+        // gating), which would leave the scanner permanently stuck.
+        const lag = latest - expectedBlock;
+        if (lag > 15) {
+          log.warn('scanner too far behind — jumping to chain head', {
+            expectedBlock,
+            latest,
+            skipped: lag,
+          });
+          next = latest;
+        } else {
+          const end = Math.min(latest, expectedBlock + 30);
+          for (let b = expectedBlock; b <= end; b++) {
+            if (this.stopping) return;
+            await this.processBlock(b);
+          }
+          next = end + 1;
         }
-        next = end + 1;
       } catch (err) {
         log.error('poll failed', errMeta(err));
       }
