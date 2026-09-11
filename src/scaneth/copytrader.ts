@@ -492,8 +492,7 @@ export class CopyTrader {
       const [tokenAddress, tokenAmount] = bought;
       const ethAmount = tx.value + wethOut;
       if (tokenAmount <= 0n) return null;
-      const decimals = await this.getDecimals(tokenAddress);
-      const tokenPriceUsd = (Number(ethAmount) * ethPriceUsd) / (Number(tokenAmount) / Math.pow(10, decimals));
+      const { decimals, tokenPriceUsd } = await this.resolveDecimalsAndPrice(tokenAddress, tokenAmount, ethAmount, ethPriceUsd);
       if (!Number.isFinite(tokenPriceUsd) || tokenPriceUsd <= 0) return null;
       return this.buildTrade(wallet, 'buy', tokenAddress, decimals, tokenAmount, ethAmount, ethPriceUsd, tokenPriceUsd, tx);
     }
@@ -505,11 +504,12 @@ export class CopyTrader {
       const [tokenAddress, tokenAmount] = sold;
       if (tokenAmount <= 0n) return null;
       const ethAmount = wethIn > 0n ? wethIn : ethUnwrapped;
-      const decimals = await this.getDecimals(tokenAddress);
+      let decimals: number;
       let tokenPriceUsd: number;
       if (ethAmount > 0n) {
-        tokenPriceUsd = (Number(ethAmount) * ethPriceUsd) / (Number(tokenAmount) / Math.pow(10, decimals));
+        ({ decimals, tokenPriceUsd } = await this.resolveDecimalsAndPrice(tokenAddress, tokenAmount, ethAmount, ethPriceUsd));
       } else {
+        decimals = await this.getDecimals(tokenAddress);
         tokenPriceUsd = await this.getCurrentTokenPrice(tokenAddress);
       }
       if (!Number.isFinite(tokenPriceUsd) || tokenPriceUsd <= 0) return null;
@@ -824,6 +824,63 @@ export class CopyTrader {
       log.debug('current price fetch failed', { address: tokenAddress, ...errMeta(err) });
     }
     return 0;
+  }
+
+  /**
+   * Resolve token decimals and a sane USD price for a detected trade.
+   *
+   * Some tokens revert on decimals(); the 18-decimal fallback then produces an
+   * absurd implied price (e.g. $1e18 per token for a 0-decimal token), which
+   * corrupts position sizing and trips the stop-loss instantly. We cross-check
+   * the implied price against DexScreener: if it is off by >~30x, we pick the
+   * decimals value (0-18) whose implied price best matches the market price.
+   */
+  private async resolveDecimalsAndPrice(
+    tokenAddress: string,
+    tokenAmountRaw: bigint,
+    ethAmount: bigint,
+    ethPriceUsd: number,
+  ): Promise<{ decimals: number; tokenPriceUsd: number }> {
+    let decimals = await this.getDecimals(tokenAddress);
+    const dexPrice = await this.getCurrentTokenPrice(tokenAddress);
+
+    const impliedPrice = (d: number): number => {
+      const qty = Number(tokenAmountRaw) / Math.pow(10, d);
+      if (!(qty > 0)) return NaN;
+      return (Number(ethAmount) * ethPriceUsd) / qty;
+    };
+
+    let price = impliedPrice(decimals);
+    if (dexPrice > 0 && Number.isFinite(price) && price > 0) {
+      const offBy = Math.abs(Math.log10(price / dexPrice));
+      if (offBy > 1.5) {
+        let best = decimals;
+        let bestOff = offBy;
+        for (let d = 0; d <= 18; d++) {
+          const p = impliedPrice(d);
+          if (!Number.isFinite(p) || p <= 0) continue;
+          const off = Math.abs(Math.log10(p / dexPrice));
+          if (off < bestOff) {
+            bestOff = off;
+            best = d;
+          }
+        }
+        log.warn('decimals corrected against market price', {
+          token: tokenAddress,
+          reported: decimals,
+          corrected: best,
+          impliedPrice: price,
+          dexPrice,
+        });
+        decimals = best;
+        price = impliedPrice(decimals);
+      }
+    }
+
+    if (!Number.isFinite(price) || price <= 0) {
+      price = dexPrice > 0 ? dexPrice : 0;
+    }
+    return { decimals, tokenPriceUsd: price };
   }
 
   private getDecimalsFromPositions(tokenAddress: string): number | undefined {
