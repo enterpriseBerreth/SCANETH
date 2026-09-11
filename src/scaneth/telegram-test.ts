@@ -7,7 +7,8 @@
  *   3. Paper copytrade SELL alert (single alert per trade, fired after the sell).
  *   4. Watched-wallet trade (not copied) alert.
  *   5. Out-of-cash skip alert.
- *   6. Copied wallet ranking report with $ and % PNL.
+ *   6. Stop-loss exit alert.
+ *   7. Copied wallet ranking report with $ and % PNL.
  */
 
 import { loadConfig } from '../config';
@@ -67,14 +68,27 @@ async function main(): Promise<void> {
     `<a href="https://etherscan.io/token/0x1111111111111111111111111111111111111111">Token</a>`;
 
   const notCopiedAlert =
-    `<b>SCANETH — Watched wallet BUY (not copied)</b>\n\n` +
+    `<b>SCANETH — Watched wallet SELL (not copied)</b>\n\n` +
     `Wallet: <code>0x7777777777777777777777777777777777777777</code>\n` +
     `Token: <b>MoonETH (MOON)</b>\n` +
     `Address: <code>0x1111111111111111111111111111111111111111</code>\n\n` +
     `Their trade: 25000.0 MOON for ~0.5000 ETH\n` +
-    `Reason: Already holding this token — no duplicate buys\n\n` +
+    `Reason: No paper position in this token\n\n` +
     `<a href="https://etherscan.io/tx/0xcccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc">Tx</a> · ` +
     `<a href="https://etherscan.io/token/0x1111111111111111111111111111111111111111">Token</a>`;
+
+  const stopLossAlert =
+    `<b>SCANETH — Paper copytrade SELL (stop-loss)</b>\n\n` +
+    `Token: <b>DeadToken (DEAD)</b>\n` +
+    `Address: <code>0x4444444444444444444444444444444444444444</code>\n\n` +
+    `Entry: $2.0000e-3 → Exit: $1.0000e-3\n` +
+    `Mirrored sell: 100.00% of position\n` +
+    `Amount paper traded: <b>$10.00</b>\n` +
+    `PNL: <b>-$10.00 (-50.00%)</b>\n` +
+    `Starting capital: $1000.00\n` +
+    `Ending capital: <b>$990.00</b>\n\n` +
+    `⛔ Auto-exited at −50% stop-loss — no wallet exit was detected\n\n` +
+    `<a href="https://etherscan.io/token/0x4444444444444444444444444444444444444444">Token</a>`;
 
   const outOfCashAlert =
     `<b>SCANETH — Watched wallet BUY (not copied)</b>\n\n` +
@@ -104,6 +118,7 @@ async function main(): Promise<void> {
     copySellAlert,
     notCopiedAlert,
     outOfCashAlert,
+    stopLossAlert,
     walletRankingReport,
   ];
   for (const alert of alerts) {

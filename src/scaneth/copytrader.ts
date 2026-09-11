@@ -106,8 +106,6 @@ export class CopyTrader {
   private readonly walletPortfolios = new Map<string, Map<string, WalletPosition>>(); // wallet -> token -> position
   private readonly walletDailyStats = new Map<string, Map<string, WalletDailyStats>>(); // wallet -> day -> stats
   private readonly positions = new Map<string, PaperPosition>(); // token -> aggregated position
-  /** Token -> the watched wallet whose buy we copied. Only that wallet's sells are followed. */
-  private readonly positionSourceWallet = new Map<string, string>();
   private tradeCount = 0;
   /** Trades observed per watched wallet (for scout ranking). */
   private readonly walletTradeCounts = new Map<string, number>();
@@ -211,72 +209,13 @@ export class CopyTrader {
         }
       }
 
-      // Resolve duplicate token buys within the same block by wallet rank.
-      const buysByToken = new Map<string, CopyTrade[]>();
-      const sells: CopyTrade[] = [];
-
+      // Execute every detected trade — no duplicate-token filtering.
       for (const trade of trades) {
-        if (trade.type === 'buy') {
-          const key = trade.tokenAddress.toLowerCase();
-          const list = buysByToken.get(key) ?? [];
-          list.push(trade);
-          buysByToken.set(key, list);
-        } else {
-          sells.push(trade);
-        }
-      }
-
-      for (const list of buysByToken.values()) {
-        list.sort((a, b) => this.walletRank(b.wallet) - this.walletRank(a.wallet));
-        const best = list[0];
-        if (best) await this.executePaperTrade(best);
-      }
-
-      for (const sell of sells) {
-        await this.executePaperTrade(sell);
+        await this.executePaperTrade(trade);
       }
     } catch (err) {
       log.error('copytrader block scan failed', { blockNumber, ...errMeta(err) });
     }
-  }
-
-  /**
-   * Rank wallets by lifetime total PNL (realized + unrealized).
-   * Higher number = more profitable = higher priority.
-   */
-  private walletRank(wallet: string): number {
-    const walletKey = wallet.toLowerCase();
-    let realized = 0;
-
-    const days = this.walletDailyStats.get(walletKey);
-    if (days) {
-      for (const stats of days.values()) {
-        realized += stats.realizedPnlUsd;
-      }
-    }
-
-    return realized + this.calculateWalletUnrealized(walletKey);
-  }
-
-  private calculateWalletUnrealized(walletKey: string): number {
-    const portfolio = this.walletPortfolios.get(walletKey);
-    if (!portfolio) return 0;
-
-    let unrealized = 0;
-    for (const [tokenLower, pos] of portfolio) {
-      if (pos.balance <= 0n) continue;
-      const decimals = this.getDecimalsFromPositions(tokenLower) ?? 18;
-      const qty = Number(pos.balance) / Math.pow(10, decimals);
-      // For ranking speed, use last known token price from aggregated positions if available.
-      const currentPrice = this.getLastKnownPrice(tokenLower);
-      if (!Number.isFinite(currentPrice) || currentPrice <= 0) continue;
-      unrealized += qty * (currentPrice - pos.avgEntryPriceUsd);
-    }
-    return unrealized;
-  }
-
-  private getLastKnownPrice(tokenAddress: string): number {
-    return this.positions.get(tokenAddress.toLowerCase())?.avgEntryPriceUsd ?? 0;
   }
 
   private scheduleDailyWalletReport(): void {
@@ -373,7 +312,96 @@ export class CopyTrader {
     // Mark open paper positions to market so unrealized PNL reflects reality.
     await this.refreshPositionPrices();
 
+    // Auto-sell positions that have dropped past the stop-loss threshold.
+    await this.enforceStopLoss();
+
     this.priceTimer = setTimeout(() => void this.refreshEthPrice(), 60_000);
+  }
+
+  /** Paper equity: remaining cash + market value of open positions. */
+  private paperEquity(): number {
+    let openValue = 0;
+    for (const pos of this.positions.values()) {
+      const price = pos.currentPriceUsd > 0 ? pos.currentPriceUsd : pos.avgEntryPriceUsd;
+      openValue += (Number(pos.balance) / Math.pow(10, pos.decimals)) * price;
+    }
+    return this.cashUsd + openValue;
+  }
+
+  /**
+   * Auto-sell any open position trading below entry by the stop-loss percent.
+   * Runs after every mark-to-market cycle (every 60s). Disabled at 0.
+   */
+  private async enforceStopLoss(): Promise<void> {
+    const stopPct = this.config.copytraderStopLossPct;
+    if (stopPct <= 0) return;
+
+    for (const [key, pos] of [...this.positions]) {
+      if (pos.balance <= 0n) continue;
+      const price = pos.currentPriceUsd;
+      if (!(price > 0) || !(pos.avgEntryPriceUsd > 0)) continue;
+      const dropPct = ((price - pos.avgEntryPriceUsd) / pos.avgEntryPriceUsd) * 100;
+      if (dropPct > -stopPct) continue;
+
+      // Exit the entire position at the current market price.
+      const qty = Number(pos.balance) / Math.pow(10, pos.decimals);
+      const proceedsUsd = qty * price;
+      const pnlUsd = proceedsUsd - pos.costBasisUsd;
+
+      pos.balance = 0n;
+      pos.realizedPnlUsd += pnlUsd;
+      pos.costBasisUsd = 0;
+      pos.updatedAt = Date.now();
+      this.cashUsd += proceedsUsd;
+      this.positions.delete(key);
+
+      log.warn('stop-loss triggered', {
+        token: pos.symbol,
+        entry: pos.avgEntryPriceUsd,
+        exit: price,
+        dropPct,
+        proceedsUsd,
+        pnlUsd,
+      });
+
+      await this.sendStopLossAlert(pos, price, proceedsUsd, pnlUsd);
+    }
+  }
+
+  /** Alert for a stop-loss exit of a paper position. */
+  private async sendStopLossAlert(
+    pos: PaperPosition,
+    exitPrice: number,
+    proceedsUsd: number,
+    pnlUsd: number,
+  ): Promise<void> {
+    const costBasisSold = Math.max(1e-9, proceedsUsd - pnlUsd);
+    const pnlPct = (pnlUsd / costBasisSold) * 100;
+    const pnlSign = pnlUsd >= 0 ? '+' : '';
+    const endingCapital = this.paperEquity();
+
+    const lines = [
+      `<b>SCANETH — Paper copytrade SELL (stop-loss)</b>`,
+      '',
+      `Token: <b>${escapeHtml(pos.name)} (${escapeHtml(pos.symbol)})</b>`,
+      `Address: <code>${pos.tokenAddress}</code>`,
+      '',
+      `Entry: $${pos.avgEntryPriceUsd.toExponential(4)} → Exit: $${exitPrice.toExponential(4)}`,
+      `Mirrored sell: 100.00% of position`,
+      `Amount paper traded: <b>$${proceedsUsd.toFixed(2)}</b>`,
+      `PNL: <b>${pnlSign}$${pnlUsd.toFixed(2)} (${pnlPct.toFixed(2)}%)</b>`,
+      `Starting capital: $${this.config.copytraderStartingBudgetUsd.toFixed(2)}`,
+      `Ending capital: <b>$${endingCapital.toFixed(2)}</b>`,
+      '',
+      `⛔ Auto-exited at −${this.config.copytraderStopLossPct}% stop-loss — no wallet exit was detected`,
+      '',
+      `<a href="https://etherscan.io/token/${pos.tokenAddress}">Token</a>`,
+    ];
+
+    const ok = await this.notifier.sendRaw(lines.join('\n'));
+    if (!ok) {
+      log.warn('stop-loss alert failed', { token: pos.tokenAddress });
+    }
   }
 
   /** Refresh current prices of open paper positions via DexScreener. */
@@ -589,13 +617,6 @@ export class CopyTrader {
     const theirQty = Number(trade.tokenAmount) / Math.pow(10, trade.tokenDecimals);
     this.updateWalletPortfolioBuy(trade.wallet, trade.tokenAddress, trade.tokenAmount, theirQty * trade.tokenPriceUsd, trade.tokenDecimals);
 
-    // Do not buy the same token again just because multiple wallets bought it.
-    if (this.positions.has(key)) {
-      log.debug('paper buy skipped — already holding token', { token: trade.tokenAddress, wallet: trade.wallet });
-      await this.sendObservedAlert(trade, 'Already holding this token — no duplicate buys');
-      return;
-    }
-
     const buyAmountUsd = this.config.copytraderBuyAmountUsd;
 
     // Respect the paper cash budget.
@@ -646,9 +667,6 @@ export class CopyTrader {
     // Deduct from the paper cash budget.
     this.cashUsd -= buyAmountUsd;
 
-    // Record which watched wallet's buy we followed for this token.
-    this.positionSourceWallet.set(key, trade.wallet.toLowerCase());
-
     // Track daily cost basis for the wallet.
     const day = currentMstDay();
     const dayStats = this.getWalletDayStats(trade.wallet, day);
@@ -679,19 +697,8 @@ export class CopyTrader {
       return;
     }
 
-    // Only follow the wallet whose buy we actually copied for this token.
-    const sourceWallet = this.positionSourceWallet.get(key);
-    if (sourceWallet !== trade.wallet.toLowerCase()) {
-      log.debug('paper sell ignored — not source wallet', {
-        token: trade.tokenAddress,
-        sourceWallet,
-        sellingWallet: trade.wallet,
-      });
-      await this.sendObservedAlert(trade, `Position copied from ${sourceWallet ?? 'another wallet'} — only its sells are mirrored`);
-      return;
-    }
-
-    // Proportional sell: mirror the fraction of THEIR position that they sold.
+    // Any watched wallet's exit counts: mirror the fraction of THEIR
+    // position that they sold, applied to our aggregated position.
     const sellPct = walletBalanceBefore > 0n ? Math.min(1, Number(trade.tokenAmount) / Number(walletBalanceBefore)) : 1;
     const ourSellAmount = BigInt(Math.floor(Number(pos.balance) * sellPct));
 
@@ -744,7 +751,6 @@ export class CopyTrader {
     // Clean up empty positions.
     if (pos.balance <= 0n) {
       this.positions.delete(key);
-      this.positionSourceWallet.delete(key);
     }
   }
 
