@@ -107,6 +107,8 @@ export class CopyTrader {
   private readonly walletDailyStats = new Map<string, Map<string, WalletDailyStats>>(); // wallet -> day -> stats
   private readonly positions = new Map<string, PaperPosition>(); // token -> aggregated position
   private tradeCount = 0;
+  /** All realized PNL since start, including closed/deleted positions. */
+  private cumulativeRealizedUsd = 0;
   /** Trades observed per watched wallet (for scout ranking). */
   private readonly walletTradeCounts = new Map<string, number>();
   /** Remaining paper cash. Starts at the configured budget, decreases on buys, grows on sells. */
@@ -129,13 +131,11 @@ export class CopyTrader {
 
   getStats(): CopyTraderStats {
     let totalCostBasis = 0;
-    let totalRealized = 0;
     let totalUnrealized = 0;
     let openValue = 0;
 
     for (const pos of this.positions.values()) {
       totalCostBasis += pos.costBasisUsd;
-      totalRealized += pos.realizedPnlUsd;
       const price = pos.currentPriceUsd > 0 ? pos.currentPriceUsd : pos.avgEntryPriceUsd;
       const marketValue = (Number(pos.balance) / Math.pow(10, pos.decimals)) * price;
       openValue += marketValue;
@@ -161,7 +161,7 @@ export class CopyTrader {
         ? (totalPnl / this.config.copytraderStartingBudgetUsd) * 100
         : 0,
       totalCostBasisUsd: totalCostBasis,
-      totalRealizedPnlUsd: totalRealized,
+      totalRealizedPnlUsd: this.cumulativeRealizedUsd,
       totalUnrealizedPnlUsd: totalUnrealized,
       tradeCount: this.tradeCount,
     };
@@ -350,6 +350,7 @@ export class CopyTrader {
 
       pos.balance = 0n;
       pos.realizedPnlUsd += pnlUsd;
+      this.cumulativeRealizedUsd += pnlUsd;
       pos.costBasisUsd = 0;
       pos.updatedAt = Date.now();
       this.cashUsd += proceedsUsd;
@@ -713,6 +714,7 @@ export class CopyTrader {
 
     pos.balance -= ourSellAmount;
     pos.realizedPnlUsd += pnlUsd;
+    this.cumulativeRealizedUsd += pnlUsd;
     pos.costBasisUsd = Math.max(0, pos.costBasisUsd - costBasisSold);
     pos.currentPriceUsd = trade.tokenPriceUsd;
     pos.updatedAt = trade.timestamp;
