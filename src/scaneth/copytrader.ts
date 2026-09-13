@@ -234,7 +234,7 @@ export class CopyTrader {
 
   private async sendDailyWalletReport(): Promise<void> {
     const previousDay = previousMstDay(this.config.dailyReportHourUtc);
-    const walletPnls: Array<{ wallet: string; realizedUsd: number; unrealizedUsd: number; totalPnlUsd: number; pnlPct: number; trades: number }> = [];
+    const walletPnls: Array<{ wallet: string; realizedUsd: number; unrealizedUsd: number; totalPnlUsd: number; pnlPct: number; trades: number; investedUsd: number }> = [];
 
     for (const wallet of this.watchedWallets) {
       const dayStats = this.getWalletDayStats(wallet, previousDay);
@@ -267,10 +267,17 @@ export class CopyTrader {
         totalPnlUsd,
         pnlPct,
         trades: dayStats.trades,
+        investedUsd: invested,
       });
     }
 
     walletPnls.sort((a, b) => b.totalPnlUsd - a.totalPnlUsd);
+
+    // Day totals: all copied trades combined into one PNL figure.
+    const dayTotalPnlUsd = walletPnls.reduce((sum, w) => sum + w.totalPnlUsd, 0);
+    const dayInvestedUsd = walletPnls.reduce((sum, w) => sum + w.investedUsd, 0);
+    const dayTotalPnlPct = dayInvestedUsd > 0 ? (dayTotalPnlUsd / dayInvestedUsd) * 100 : 0;
+    const dayTrades = walletPnls.reduce((sum, w) => sum + w.trades, 0);
 
     if (walletPnls.length === 0) {
       const message =
@@ -299,10 +306,18 @@ export class CopyTrader {
         cutCandidates.map((w) => `<code>${w.wallet}</code> (${w.totalPnlUsd.toFixed(2)})`).join('\n');
     }
 
+    const dayTotalsSign = dayTotalPnlUsd >= 0 ? '+' : '';
+    const dayTotalsPctSign = dayTotalPnlPct >= 0 ? '+' : '';
+    const dayTotalsSection =
+      `\n\n<b>📊 Day totals (all trades combined)</b>\n` +
+      `PNL: <b>${dayTotalsSign}$${dayTotalPnlUsd.toFixed(2)} (${dayTotalsPctSign}${dayTotalPnlPct.toFixed(2)}%)</b>\n` +
+      `Trades copied: ${dayTrades}`;
+
     const message =
       `<b>SCANETH — Copied wallet rankings (${previousDay})</b>\n\n` +
       lines.join('\n\n') +
-      cutSection;
+      cutSection +
+      dayTotalsSection;
 
     const ok = await this.notifier.sendRaw(message);
     if (ok) {

@@ -75,7 +75,10 @@ async function main(): Promise<void> {
     `3. 🔴 <code>0x6666666666666666666666666666666666666666</code>\n` +
     `   PNL: <b>-$15.00 (-30.00%)</b> · Trades: 6` +
     `\n\n<b>✂️ Cut candidates (negative PNL — scout will replace):</b>\n` +
-    `<code>0x6666666666666666666666666666666666666666</code> (-15.00)`;
+    `<code>0x6666666666666666666666666666666666666666</code> (-15.00)` +
+    `\n\n<b>📊 Day totals (all trades combined)</b>\n` +
+    `PNL: <b>+$130.00 (+43.33%)</b>\n` +
+    `Trades copied: 29`;
 
   const alerts = [
     launchAlert,
