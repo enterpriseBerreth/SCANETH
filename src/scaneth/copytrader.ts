@@ -55,6 +55,8 @@ interface WalletPosition {
   balance: bigint;
   costBasisUsd: number;
   avgEntryPriceUsd: number;
+  /** Token decimals from the trade that created/updated this position. */
+  decimals: number;
 }
 
 interface WalletDailyStats {
@@ -245,7 +247,7 @@ export class CopyTrader {
           if (pos.balance <= 0n) continue;
           const currentPrice = await this.getCurrentTokenPrice(tokenLower);
           if (!Number.isFinite(currentPrice) || currentPrice <= 0) continue;
-          const tokenQty = Number(pos.balance) / Math.pow(10, this.getDecimalsFromPositions(tokenLower) ?? 18);
+          const tokenQty = Number(pos.balance) / Math.pow(10, pos.decimals || 18);
           const marketValue = tokenQty * currentPrice;
           const cost = tokenQty * pos.avgEntryPriceUsd;
           unrealizedUsd += marketValue - cost;
@@ -594,7 +596,7 @@ export class CopyTrader {
           if (pos.balance <= 0n) continue;
           const live = this.positions.get(token);
           const price = live && live.currentPriceUsd > 0 ? live.currentPriceUsd : pos.avgEntryPriceUsd;
-          unrealized += (Number(pos.balance) / Math.pow(10, live?.decimals ?? 18)) * (price - pos.avgEntryPriceUsd);
+          unrealized += (Number(pos.balance) / Math.pow(10, pos.decimals || 18)) * (price - pos.avgEntryPriceUsd);
         }
       }
 
@@ -773,9 +775,10 @@ export class CopyTrader {
 
     let pos = portfolio.get(tokenKey);
     if (!pos) {
-      pos = { balance: 0n, costBasisUsd: 0, avgEntryPriceUsd: 0 };
+      pos = { balance: 0n, costBasisUsd: 0, avgEntryPriceUsd: 0, decimals };
       portfolio.set(tokenKey, pos);
     }
+    pos.decimals = decimals;
 
     const newCost = pos.costBasisUsd + buyAmountUsd;
     const newBalance = pos.balance + tokenAmount;
@@ -883,10 +886,6 @@ export class CopyTrader {
       price = dexPrice > 0 ? dexPrice : 0;
     }
     return { decimals, tokenPriceUsd: price };
-  }
-
-  private getDecimalsFromPositions(tokenAddress: string): number | undefined {
-    return this.positions.get(tokenAddress)?.decimals;
   }
 
   /**
