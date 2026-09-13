@@ -20,6 +20,10 @@ const UNIV2_ROUTER_ABI = [
   'function getAmountsOut(uint amountIn, address[] calldata path) external view returns (uint[] memory amounts)',
 ];
 
+const ERC20_TRANSFER_ABI = [
+  'function transfer(address to, uint256 amount) returns (bool)',
+];
+
 const ERC20_ABI = [
   'function balanceOf(address) view returns (uint256)',
   'function totalSupply() view returns (uint256)',
@@ -303,11 +307,20 @@ async function simulateRoundTrip(ctx: SafetyContext): Promise<SimResult> {
     const sellAmounts = (await router.getAmountsOut!(tokenOut, [ctx.tokenAddress, ETHEREUM.wrappedNative])) as bigint[];
     const ethBack = sellAmounts[sellAmounts.length - 1] ?? 0n;
 
+    // A router-level sell staticCall is not usable: static calls have no side
+    // effects, so the probe buyer never actually holds the token and the sell
+    // always reverts with TRANSFER_FROM_FAILED — even for healthy tokens.
+    // Instead, verify the token can transfer out of an address that provably
+    // holds a real balance — the pair itself — with the probe address as the
+    // recipient (catches blacklist/only-sell-to-deployer/pausable honeypots).
+    const token = new Contract(ctx.tokenAddress, ERC20_TRANSFER_ABI, ctx.provider);
     try {
-      await router.swapExactTokensForETH!.staticCall(tokenOut, 0, [ctx.tokenAddress, ETHEREUM.wrappedNative], buyer, deadline);
+      await (token.transfer as unknown as {
+        staticCall: (to: string, amount: bigint, overrides: { from: string }) => Promise<boolean>;
+      }).staticCall(buyer, tokenOut, { from: ctx.pairAddress });
       result.sellable = true;
     } catch {
-      // Sell reverts — honeypot.
+      // Transfer out of the pair reverts — sell-blocking honeypot pattern.
       return result;
     }
 

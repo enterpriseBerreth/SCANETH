@@ -17,11 +17,14 @@ export interface ProviderPair {
 /**
  * Build providers from environment. SCANETH prefers a WebSocket URL for
  * real-time block streaming and falls back to HTTP polling.
+ *
+ * JSON-RPC batching is capped at 3 requests: dRPC (and other free tiers)
+ * reject batches larger than 3, which silently killed parallel probes.
  */
 export function createProviders(rpcUrl: string, wsUrl?: string): ProviderPair {
   const http = new JsonRpcProvider(rpcUrl, undefined, {
     staticNetwork: true,
-    batchMaxCount: 100,
+    batchMaxCount: 3,
     batchStallTime: 50,
   });
 
@@ -32,11 +35,11 @@ export function createProviders(rpcUrl: string, wsUrl?: string): ProviderPair {
       log.info('using websocket provider');
     } catch (err) {
       log.warn('websocket provider failed, falling back to http polling', errMeta(err));
-      main = new JsonRpcProvider(rpcUrl, undefined, { staticNetwork: true });
+      main = new JsonRpcProvider(rpcUrl, undefined, { staticNetwork: true, batchMaxCount: 3 });
     }
   } else {
     log.info('no websocket url, using http polling provider');
-    main = new JsonRpcProvider(rpcUrl, undefined, { staticNetwork: true });
+    main = new JsonRpcProvider(rpcUrl, undefined, { staticNetwork: true, batchMaxCount: 3 });
   }
 
   return { main, http };
