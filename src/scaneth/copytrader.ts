@@ -62,6 +62,7 @@ interface WalletPosition {
 interface WalletDailyStats {
   realizedPnlUsd: number;
   costBasisUsd: number;
+  trades: number;
 }
 
 export interface CopyTrade {
@@ -233,7 +234,7 @@ export class CopyTrader {
 
   private async sendDailyWalletReport(): Promise<void> {
     const previousDay = previousMstDay(this.config.dailyReportHourUtc);
-    const walletPnls: Array<{ wallet: string; realizedUsd: number; unrealizedUsd: number; totalPnlUsd: number; pnlPct: number }> = [];
+    const walletPnls: Array<{ wallet: string; realizedUsd: number; unrealizedUsd: number; totalPnlUsd: number; pnlPct: number; trades: number }> = [];
 
     for (const wallet of this.watchedWallets) {
       const dayStats = this.getWalletDayStats(wallet, previousDay);
@@ -265,6 +266,7 @@ export class CopyTrader {
         unrealizedUsd,
         totalPnlUsd,
         pnlPct,
+        trades: dayStats.trades,
       });
     }
 
@@ -284,14 +286,23 @@ export class CopyTrader {
       const emoji = w.totalPnlUsd >= 0 ? '🟢' : '🔴';
       return (
         `${idx + 1}. ${emoji} <code>${w.wallet}</code>\n` +
-        `   PNL: <b>${sign}$${w.totalPnlUsd.toFixed(2)} (${pctSign}${w.pnlPct.toFixed(2)}%)</b>\n` +
-        `   Realized: $${w.realizedUsd.toFixed(2)} · Unrealized: $${w.unrealizedUsd.toFixed(2)}`
+        `   PNL: <b>${sign}$${w.totalPnlUsd.toFixed(2)} (${pctSign}${w.pnlPct.toFixed(2)}%)</b> · Trades: ${w.trades}`
       );
     });
 
+    // Cut list: wallets with negative PNL for the day, worst first.
+    const cutCandidates = [...walletPnls].reverse().filter((w) => w.totalPnlUsd < 0);
+    let cutSection = '';
+    if (cutCandidates.length > 0) {
+      cutSection =
+        `\n\n<b>✂️ Cut candidates (negative PNL — scout will replace):</b>\n` +
+        cutCandidates.map((w) => `<code>${w.wallet}</code> (${w.totalPnlUsd.toFixed(2)})`).join('\n');
+    }
+
     const message =
       `<b>SCANETH — Copied wallet rankings (${previousDay})</b>\n\n` +
-      lines.join('\n\n');
+      lines.join('\n\n') +
+      cutSection;
 
     const ok = await this.notifier.sendRaw(message);
     if (ok) {
@@ -349,6 +360,7 @@ export class CopyTrader {
       const qty = Number(pos.balance) / Math.pow(10, pos.decimals);
       const proceedsUsd = qty * price;
       const pnlUsd = proceedsUsd - pos.costBasisUsd;
+      const capitalBefore = this.paperEquity();
 
       pos.balance = 0n;
       pos.realizedPnlUsd += pnlUsd;
@@ -367,16 +379,16 @@ export class CopyTrader {
         pnlUsd,
       });
 
-      await this.sendStopLossAlert(pos, price, proceedsUsd, pnlUsd);
+      await this.sendStopLossAlert(pos, proceedsUsd, pnlUsd, capitalBefore);
     }
   }
 
-  /** Alert for a stop-loss exit of a paper position. */
+  /** Alert for a stop-loss exit of a paper position (minimal format). */
   private async sendStopLossAlert(
     pos: PaperPosition,
-    exitPrice: number,
     proceedsUsd: number,
     pnlUsd: number,
+    capitalBefore: number,
   ): Promise<void> {
     const costBasisSold = Math.max(1e-9, proceedsUsd - pnlUsd);
     const pnlPct = (pnlUsd / costBasisSold) * 100;
@@ -386,19 +398,13 @@ export class CopyTrader {
     const lines = [
       `<b>SCANETH — Paper copytrade SELL (stop-loss)</b>`,
       '',
-      `Token: <b>${escapeHtml(pos.name)} (${escapeHtml(pos.symbol)})</b>`,
-      `Address: <code>${pos.tokenAddress}</code>`,
+      `Token: <code>${pos.tokenAddress}</code>`,
       '',
-      `Entry: $${pos.avgEntryPriceUsd.toExponential(4)} → Exit: $${exitPrice.toExponential(4)}`,
-      `Mirrored sell: 100.00% of position`,
-      `Amount paper traded: <b>$${proceedsUsd.toFixed(2)}</b>`,
       `PNL: <b>${pnlSign}$${pnlUsd.toFixed(2)} (${pnlPct.toFixed(2)}%)</b>`,
-      `Starting capital: $${this.config.copytraderStartingBudgetUsd.toFixed(2)}`,
-      `Ending capital: <b>$${endingCapital.toFixed(2)}</b>`,
+      `Capital before trade: $${capitalBefore.toFixed(2)}`,
+      `Capital after trade: <b>$${endingCapital.toFixed(2)}</b>`,
       '',
-      `⛔ Auto-exited at −${this.config.copytraderStopLossPct}% stop-loss — no wallet exit was detected`,
-      '',
-      `<a href="https://etherscan.io/token/${pos.tokenAddress}">Token</a>`,
+      `⛔ Auto-exited at −${this.config.copytraderStopLossPct}% stop-loss`,
     ];
 
     const ok = await this.notifier.sendRaw(lines.join('\n'));
@@ -554,6 +560,7 @@ export class CopyTrader {
     this.tradeCount++;
     const wKey = trade.wallet.toLowerCase();
     this.walletTradeCounts.set(wKey, (this.walletTradeCounts.get(wKey) ?? 0) + 1);
+    this.getWalletDayStats(trade.wallet, currentMstDay()).trades++;
     if (trade.type === 'buy') {
       await this.executePaperBuy(trade);
     } else {
@@ -625,10 +632,6 @@ export class CopyTrader {
     // Respect the paper cash budget.
     if (this.cashUsd < buyAmountUsd) {
       log.debug('paper buy skipped — out of cash', { token: trade.tokenAddress, cashUsd: this.cashUsd });
-      await this.sendObservedAlert(
-        trade,
-        `Out of paper cash ($${this.cashUsd.toFixed(2)} left of $${this.config.copytraderStartingBudgetUsd} budget) — not copying`,
-      );
       return;
     }
 
@@ -696,9 +699,11 @@ export class CopyTrader {
     const pos = this.positions.get(key);
     if (!pos || pos.balance <= 0n) {
       log.debug('paper sell ignored — no position', { token: trade.tokenAddress });
-      await this.sendObservedAlert(trade, 'No paper position in this token');
       return;
     }
+
+    // Account snapshot before the trade (for the alert).
+    const capitalBefore = this.paperEquity();
 
     // Any watched wallet's exit counts: mirror the fraction of THEIR
     // position that they sold, applied to our aggregated position.
@@ -750,6 +755,7 @@ export class CopyTrader {
       ourSellAmount,
       proceedsUsd,
       pnlUsd,
+      capitalBefore,
     );
 
     // Clean up empty positions.
@@ -814,7 +820,7 @@ export class CopyTrader {
 
     let stats = days.get(day);
     if (!stats) {
-      stats = { realizedPnlUsd: 0, costBasisUsd: 0 };
+      stats = { realizedPnlUsd: 0, costBasisUsd: 0, trades: 0 };
       days.set(day, stats);
     }
     return stats;
@@ -890,95 +896,35 @@ export class CopyTrader {
 
   /**
    * Single alert per copied trade, sent AFTER the sell executes.
-   * Includes the paper account snapshot: wallet, token, entry/exit,
-   * amount paper traded, PNL $/%, starting and ending capital.
-   * Called AFTER paper state (cash/positions) has been updated.
+   * Contains only: token address, copied wallet, PNL $/%, capital
+   * before and after the trade. Called AFTER paper state is updated.
    */
   private async sendTradeAlert(
     trade: CopyTrade,
-    ourTokenAmount: bigint,
-    ourUsdAmount: number,
-    pnlUsd?: number,
+    _ourTokenAmount: bigint,
+    _ourUsdAmount: number,
+    pnlUsd: number,
+    capitalBefore: number,
   ): Promise<void> {
-    const isBuy = trade.type === 'buy';
-    const startingCapital = this.config.copytraderStartingBudgetUsd;
-
-    // Ending capital: cash + market value of open positions, after this trade.
-    let openValue = 0;
-    for (const pos of this.positions.values()) {
-      const price = pos.currentPriceUsd > 0 ? pos.currentPriceUsd : pos.avgEntryPriceUsd;
-      openValue += (Number(pos.balance) / Math.pow(10, pos.decimals)) * price;
-    }
-    const endingCapital = this.cashUsd + openValue;
-
-    // PNL: 0 for a fresh buy (realized on sell); % relative to the cost basis sold.
-    const tradePnl = pnlUsd ?? 0;
-    const costBasisSold = isBuy ? 0 : Math.max(1e-9, ourUsdAmount - tradePnl);
-    const pnlPct = isBuy ? 0 : (tradePnl / costBasisSold) * 100;
-    const pnlSign = tradePnl >= 0 ? '+' : '';
+    const endingCapital = this.paperEquity();
+    const costBasisSold = Math.max(1e-9, _ourUsdAmount - pnlUsd);
+    const pnlPct = (pnlUsd / costBasisSold) * 100;
+    const pnlSign = pnlUsd >= 0 ? '+' : '';
 
     const lines = [
       `<b>SCANETH — Paper copytrade SELL</b>`,
       '',
+      `Token: <code>${trade.tokenAddress}</code>`,
       `Copied wallet: <code>${trade.wallet}</code>`,
-      `Token: <b>${escapeHtml(trade.tokenName)} (${escapeHtml(trade.tokenSymbol)})</b>`,
-      `Address: <code>${trade.tokenAddress}</code>`,
       '',
+      `PNL: <b>${pnlSign}$${pnlUsd.toFixed(2)} (${pnlSign}${pnlPct.toFixed(2)}%)</b>`,
+      `Capital before trade: $${capitalBefore.toFixed(2)}`,
+      `Capital after trade: <b>$${endingCapital.toFixed(2)}</b>`,
     ];
-
-    if (trade.entryPriceUsd !== undefined) {
-      lines.push(`Entry: $${trade.entryPriceUsd.toExponential(4)} → Exit: $${trade.tokenPriceUsd.toExponential(4)}`);
-    }
-    if (trade.sellPct !== undefined) {
-      lines.push(`Mirrored sell: ${(trade.sellPct * 100).toFixed(2)}% of position`);
-    }
-
-    lines.push(
-      `Amount paper traded: <b>$${ourUsdAmount.toFixed(2)}</b>`,
-      `PNL: <b>${pnlSign}$${tradePnl.toFixed(2)} (${pnlSign}${pnlPct.toFixed(2)}%)</b>`,
-      `Starting capital: $${startingCapital.toFixed(2)}`,
-      `Ending capital: <b>$${endingCapital.toFixed(2)}</b>`,
-    );
-
-    if (trade.positionClosed) {
-      lines.push('', `✅ Position fully closed`);
-    }
-
-    lines.push(
-      '',
-      `<a href="https://etherscan.io/tx/${trade.txHash}">Tx</a> · ` +
-        `<a href="https://etherscan.io/token/${trade.tokenAddress}">Token</a>`,
-    );
 
     const ok = await this.notifier.sendRaw(lines.join('\n'));
     if (!ok) {
       log.warn('copytrade alert failed', { txHash: trade.txHash });
-    }
-  }
-
-  /** Alert on a watched-wallet trade we detected but did not mirror. */
-  private async sendObservedAlert(trade: CopyTrade, reason: string): Promise<void> {
-    const isBuy = trade.type === 'buy';
-    const tokenQty = Number(trade.tokenAmount) / Math.pow(10, trade.tokenDecimals);
-    const ethQty = Number(trade.ethAmount) / 1e18;
-
-    const lines = [
-      `<b>SCANETH — Watched wallet ${isBuy ? 'BUY' : 'SELL'} (not copied)</b>`,
-      '',
-      `Wallet: <code>${trade.wallet}</code>`,
-      `Token: <b>${escapeHtml(trade.tokenName)} (${escapeHtml(trade.tokenSymbol)})</b>`,
-      `Address: <code>${trade.tokenAddress}</code>`,
-      '',
-      `Their trade: ${tokenQty.toPrecision(4)} ${escapeHtml(trade.tokenSymbol)} for ~${ethQty.toFixed(4)} ETH`,
-      `Reason: ${escapeHtml(reason)}`,
-      '',
-      `<a href="https://etherscan.io/tx/${trade.txHash}">Tx</a> · ` +
-        `<a href="https://etherscan.io/token/${trade.tokenAddress}">Token</a>`,
-    ];
-
-    const ok = await this.notifier.sendRaw(lines.join('\n'));
-    if (!ok) {
-      log.warn('observed trade alert failed', { txHash: trade.txHash });
     }
   }
 

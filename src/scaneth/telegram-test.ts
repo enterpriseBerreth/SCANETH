@@ -4,11 +4,9 @@
  * Sends test alerts in the current formats:
  *   1. New launch alert with scam rating and pros/cons.
  *   2. Daily winners report with top 5 tokens, ATH, and PNL.
- *   3. Paper copytrade SELL alert (single alert per trade, fired after the sell).
- *   4. Watched-wallet trade (not copied) alert.
- *   5. Out-of-cash skip alert.
- *   6. Stop-loss exit alert.
- *   7. Copied wallet ranking report with $ and % PNL.
+ *   3. Paper copytrade SELL alert (minimal: token, wallet, PNL, capital).
+ *   4. Stop-loss exit alert.
+ *   5. Copied wallet ranking report with trades and cut candidates.
  */
 
 import { loadConfig } from '../config';
@@ -54,70 +52,35 @@ async function main(): Promise<void> {
 
   const copySellAlert =
     `<b>SCANETH — Paper copytrade SELL</b>\n\n` +
-    `Copied wallet: <code>0x8888888888888888888888888888888888888888</code>\n` +
-    `Token: <b>MoonETH (MOON)</b>\n` +
-    `Address: <code>0x1111111111111111111111111111111111111111</code>\n\n` +
-    `Entry: $1.0000e-3 → Exit: $4.7500e-3\n` +
-    `Mirrored sell: 100.00% of position\n` +
-    `Amount paper traded: <b>$95.00</b>\n` +
+    `Token: <code>0x1111111111111111111111111111111111111111</code>\n` +
+    `Copied wallet: <code>0x8888888888888888888888888888888888888888</code>\n\n` +
     `PNL: <b>+$75.00 (+375.00%)</b>\n` +
-    `Starting capital: $1000.00\n` +
-    `Ending capital: <b>$1075.00</b>\n\n` +
-    `✅ Position fully closed\n\n` +
-    `<a href="https://etherscan.io/tx/0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb">Tx</a> · ` +
-    `<a href="https://etherscan.io/token/0x1111111111111111111111111111111111111111">Token</a>`;
-
-  const notCopiedAlert =
-    `<b>SCANETH — Watched wallet SELL (not copied)</b>\n\n` +
-    `Wallet: <code>0x7777777777777777777777777777777777777777</code>\n` +
-    `Token: <b>MoonETH (MOON)</b>\n` +
-    `Address: <code>0x1111111111111111111111111111111111111111</code>\n\n` +
-    `Their trade: 25000.0 MOON for ~0.5000 ETH\n` +
-    `Reason: No paper position in this token\n\n` +
-    `<a href="https://etherscan.io/tx/0xcccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc">Tx</a> · ` +
-    `<a href="https://etherscan.io/token/0x1111111111111111111111111111111111111111">Token</a>`;
+    `Capital before trade: $1000.00\n` +
+    `Capital after trade: <b>$1075.00</b>`;
 
   const stopLossAlert =
     `<b>SCANETH — Paper copytrade SELL (stop-loss)</b>\n\n` +
-    `Token: <b>DeadToken (DEAD)</b>\n` +
-    `Address: <code>0x4444444444444444444444444444444444444444</code>\n\n` +
-    `Entry: $2.0000e-3 → Exit: $1.0000e-3\n` +
-    `Mirrored sell: 100.00% of position\n` +
-    `Amount paper traded: <b>$10.00</b>\n` +
-    `PNL: <b>-$10.00 (-50.00%)</b>\n` +
-    `Starting capital: $1000.00\n` +
-    `Ending capital: <b>$990.00</b>\n\n` +
-    `⛔ Auto-exited at −50% stop-loss — no wallet exit was detected\n\n` +
-    `<a href="https://etherscan.io/token/0x4444444444444444444444444444444444444444">Token</a>`;
-
-  const outOfCashAlert =
-    `<b>SCANETH — Watched wallet BUY (not copied)</b>\n\n` +
-    `Wallet: <code>0x5555555555555555555555555555555555555555</code>\n` +
-    `Token: <b>RocketToken (RKT)</b>\n` +
-    `Address: <code>0x2222222222222222222222222222222222222222</code>\n\n` +
-    `Their trade: 9000.0 RKT for ~0.1000 ETH\n` +
-    `Reason: Out of paper cash ($8.40 left of $1000 budget) — not copying\n\n` +
-    `<a href="https://etherscan.io/tx/0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee">Tx</a> · ` +
-    `<a href="https://etherscan.io/token/0x2222222222222222222222222222222222222222">Token</a>`;
+    `Token: <code>0x4444444444444444444444444444444444444444</code>\n\n` +
+    `PNL: <b>-$8.00 (-40.00%)</b>\n` +
+    `Capital before trade: $1008.00\n` +
+    `Capital after trade: <b>$1000.00</b>\n\n` +
+    `⛔ Auto-exited at −40% stop-loss`;
 
   const walletRankingReport =
     `<b>SCANETH — Copied wallet rankings (test)</b>\n\n` +
     `1. 🟢 <code>0x8888888888888888888888888888888888888888</code>\n` +
-    `   PNL: <b>+$120.00 (+300.00%)</b>\n` +
-    `   Realized: $80.00 · Unrealized: $40.00\n\n` +
+    `   PNL: <b>+$120.00 (+300.00%)</b> · Trades: 14\n\n` +
     `2. 🟢 <code>0x7777777777777777777777777777777777777777</code>\n` +
-    `   PNL: <b>+$25.00 (+50.00%)</b>\n` +
-    `   Realized: $10.00 · Unrealized: $15.00\n\n` +
+    `   PNL: <b>+$25.00 (+50.00%)</b> · Trades: 9\n\n` +
     `3. 🔴 <code>0x6666666666666666666666666666666666666666</code>\n` +
-    `   PNL: <b>-$15.00 (-30.00%)</b>\n` +
-    `   Realized: -$5.00 · Unrealized: -$10.00`;
+    `   PNL: <b>-$15.00 (-30.00%)</b> · Trades: 6` +
+    `\n\n<b>✂️ Cut candidates (negative PNL — scout will replace):</b>\n` +
+    `<code>0x6666666666666666666666666666666666666666</code> (-15.00)`;
 
   const alerts = [
     launchAlert,
     dailyReport,
     copySellAlert,
-    notCopiedAlert,
-    outOfCashAlert,
     stopLossAlert,
     walletRankingReport,
   ];
