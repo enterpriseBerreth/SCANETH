@@ -158,23 +158,17 @@ export function tierForScore(score: number): import('./types').RiskTier {
   return 'critical';
 }
 
-const BLOCKING_FINDINGS = new Set([
-  'paused',
-  'blacklist_active',
-  'buy_failed',
-  'sell_failed',
-  'max_tx_blocks_sell',
-]);
-
 /**
- * Alert on every new launch with complete on-chain metadata, UNLESS the token
- * is 100% verified as untradable (honeypot, paused, blacklisted, etc.).
+ * Alert on every new launch with complete on-chain metadata, even when it
+ * merely looks risky (unlocked LP, admin functions, concentrated supply, etc.).
+ * The ONLY hard gate is a completed sell simulation that failed — a verified
+ * honeypot. When the simulation could not run (no router / no liquidity yet),
+ * the token is treated as unverified and still alerts.
  */
 export function shouldAlert(launch: TokenLaunch): boolean {
   if (!launch.metadata.complete) return false;
   const s = launch.safety;
-  if (!s.sellable && !s.simulationSkipped) return false;
-  if (s.findings.some((f) => BLOCKING_FINDINGS.has(f.key))) return false;
+  if (!s.simulationSkipped && !s.sellable) return false;
   return true;
 }
 

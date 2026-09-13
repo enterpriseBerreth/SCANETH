@@ -283,7 +283,13 @@ async function simulateRoundTrip(ctx: SafetyContext): Promise<SimResult> {
     const buyAmounts = (await router.getAmountsOut!(probeWei, [ETHEREUM.wrappedNative, ctx.tokenAddress])) as bigint[];
     const tokenOut = buyAmounts[buyAmounts.length - 1] ?? 0n;
     result.tokenOut = tokenOut;
-    if (tokenOut <= 0n) return result;
+    if (tokenOut <= 0n) {
+      // No liquidity to quote against — cannot verify sellability either way.
+      result.simulationSkipped = true;
+      result.buyable = true;
+      result.sellable = true;
+      return result;
+    }
     result.buyable = true;
 
     try {
@@ -310,7 +316,12 @@ async function simulateRoundTrip(ctx: SafetyContext): Promise<SimResult> {
       result.roundTripTaxBps = Number((loss * 10_000n) / probeWei);
     }
   } catch (err) {
+    // Quote/buy leg failed (e.g. pair has no liquidity yet or RPC hiccup).
+    // This is NOT a verified honeypot — mark as unverified rather than unsafe.
     log.debug('round-trip simulation failed', { address: ctx.tokenAddress, ...errMeta(err) });
+    result.simulationSkipped = true;
+    result.buyable = true;
+    result.sellable = true;
   }
 
   return result;
