@@ -52,10 +52,32 @@ export class BlockScanner {
     lastBlockAt: 0,
   };
 
+  /**
+   * Many launches ship anti-bot protection that blocks sells for the first
+   * minutes, then unlocks. A failed sell simulation at the launch block is
+   * therefore NOT a final honeypot verdict: failed tokens are re-tested on a
+   * delay and alerted if they become sellable. After MAX_RECHECKS failures
+   * they are dropped silently.
+   */
+  private static readonly RECHECK_DELAY_MS = 90_000;
+  private static readonly MAX_RECHECKS = 3;
+  private readonly recheckQueue = new Map<string, { dex: string; pairAddress: string; txHash: string; blockNumber: number; attempts: number; nextAt: number }>();
+  private recheckTimer?: NodeJS.Timeout;
+
+  /** Called when a previously-failed token becomes sellable on a later probe. */
+  onLateAlert?: (launch: TokenLaunch) => Promise<void>;
+
   constructor(
     private readonly provider: Provider,
     private readonly filters: ScanFilters,
   ) {}
+
+  stop(): void {
+    if (this.recheckTimer) {
+      clearInterval(this.recheckTimer);
+      this.recheckTimer = undefined;
+    }
+  }
 
   getStats(): ScanStats {
     return { ...this.stats };
@@ -100,6 +122,10 @@ export class BlockScanner {
           if (shouldAlert(launch)) {
             result.alerts.push(launch);
             this.stats.alertsSent += 1;
+          } else if (launch.metadata.complete && !launch.safety.sellable && !launch.safety.simulationSkipped) {
+            // Sell simulation failed — likely an anti-bot launch window.
+            // Re-test later instead of silencing permanently.
+            this.scheduleRecheck(tokenAddress, dex, pairAddress, txHash, blockNumber);
           }
         } catch (err) {
           log.debug('token analysis failed', { address: tokenAddress, ...errMeta(err) });
@@ -132,6 +158,65 @@ export class BlockScanner {
       merged.alerts.push(...r.alerts);
     }
     return merged;
+  }
+
+  private scheduleRecheck(
+    tokenAddress: string,
+    dex: string,
+    pairAddress: string,
+    txHash: string,
+    blockNumber: number,
+  ): void {
+    if (this.recheckQueue.has(tokenAddress)) return;
+    this.recheckQueue.set(tokenAddress, {
+      dex,
+      pairAddress,
+      txHash,
+      blockNumber,
+      attempts: 0,
+      nextAt: Date.now() + BlockScanner.RECHECK_DELAY_MS,
+    });
+    if (!this.recheckTimer) {
+      this.recheckTimer = setInterval(() => void this.processRechecks(), 30_000);
+    }
+    log.info('sell sim failed — scheduled recheck', { token: tokenAddress, attemptsMax: BlockScanner.MAX_RECHECKS });
+  }
+
+  private async processRechecks(): Promise<void> {
+    const now = Date.now();
+    const due = [...this.recheckQueue.entries()].filter(([, item]) => item.nextAt <= now);
+    for (const [tokenAddress, item] of due) {
+      this.recheckQueue.delete(tokenAddress);
+      try {
+        const fresh = await this.buildLaunch(tokenAddress, item.dex, item.pairAddress, item.txHash, item.blockNumber);
+        if (fresh && shouldAlert(fresh)) {
+          this.stats.alertsSent += 1;
+          log.info('late alert — token became sellable after anti-bot window', {
+            token: tokenAddress,
+            attempt: item.attempts + 1,
+          });
+          await this.onLateAlert?.(fresh);
+          continue;
+        }
+        item.attempts += 1;
+        if (item.attempts >= BlockScanner.MAX_RECHECKS) {
+          log.info('token still fails sell simulation after retries — dropping silently', {
+            token: tokenAddress,
+            attempts: item.attempts,
+          });
+          continue;
+        }
+        item.nextAt = now + BlockScanner.RECHECK_DELAY_MS * (item.attempts + 1);
+        this.recheckQueue.set(tokenAddress, item);
+      } catch (err) {
+        log.debug('sell recheck failed', { token: tokenAddress, ...errMeta(err) });
+        item.attempts += 1;
+        if (item.attempts < BlockScanner.MAX_RECHECKS) {
+          item.nextAt = now + BlockScanner.RECHECK_DELAY_MS;
+          this.recheckQueue.set(tokenAddress, item);
+        }
+      }
+    }
   }
 
   private extractNewPairs(

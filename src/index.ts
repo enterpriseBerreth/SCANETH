@@ -57,6 +57,7 @@ class ScanethBot {
       maxTaxBps: this.config.maxTaxBps,
       maxTopHolderPct: this.config.maxTopHolderPct,
     });
+    this.scanner.onLateAlert = (launch) => this.emitAlert(launch);
     this.copytrader = new CopyTrader(this.config, this.providers.http, this.notifier);
 
     const network = await this.providers.http.getNetwork();
@@ -163,21 +164,25 @@ class ScanethBot {
     }
 
     for (const alert of result.alerts) {
-      this.state.recordAlert(alert);
-      log.info('active new launch alert', {
-        name: alert.metadata.name,
-        symbol: alert.metadata.symbol,
-        ageHours: alert.dexScreener ? (alert.dexScreener.ageMs / 3_600_000).toFixed(2) : null,
-        h1Txns: alert.dexScreener?.h1Txns,
-        h1Sells: alert.dexScreener?.h1Sells,
-        block: alert.blockNumber,
-      });
-      if (this.notifier.isEnabled) {
-        await this.notifier.alertLaunch(alert);
-      }
-      if (this.config.athTrackerEnabled || this.config.dailyReportEnabled) {
-        this.tracker.trackAlert(alert);
-      }
+      await this.emitAlert(alert);
+    }
+  }
+
+  private async emitAlert(alert: import('./scaneth/types').TokenLaunch): Promise<void> {
+    this.state.recordAlert(alert);
+    log.info('active new launch alert', {
+      name: alert.metadata.name,
+      symbol: alert.metadata.symbol,
+      ageHours: alert.dexScreener ? (alert.dexScreener.ageMs / 3_600_000).toFixed(2) : null,
+      h1Txns: alert.dexScreener?.h1Txns,
+      h1Sells: alert.dexScreener?.h1Sells,
+      block: alert.blockNumber,
+    });
+    if (this.notifier.isEnabled) {
+      await this.notifier.alertLaunch(alert);
+    }
+    if (this.config.athTrackerEnabled || this.config.dailyReportEnabled) {
+      this.tracker.trackAlert(alert);
     }
   }
 
@@ -187,6 +192,7 @@ class ScanethBot {
     log.info('shutting down', this.state.snapshot());
 
     if (this.pollTimer) clearTimeout(this.pollTimer);
+    this.scanner?.stop();
     this.tracker.stop();
     this.copytrader?.stop();
     this.walletScout?.stop();
