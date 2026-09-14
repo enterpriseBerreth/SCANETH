@@ -639,8 +639,7 @@ export class CopyTrader {
     const walletBalances = this.getWalletBalanceMap(trade.wallet);
     const prevBalance = walletBalances.get(key) ?? 0n;
     walletBalances.set(key, prevBalance + trade.tokenAmount);
-    const theirQty = Number(trade.tokenAmount) / Math.pow(10, trade.tokenDecimals);
-    this.updateWalletPortfolioBuy(trade.wallet, trade.tokenAddress, trade.tokenAmount, theirQty * trade.tokenPriceUsd, trade.tokenDecimals);
+    this.updateWalletPortfolioBuy(trade.wallet, trade.tokenAddress, trade.tokenAmount, trade.tokenDecimals, trade.tokenPriceUsd);
 
     const buyAmountUsd = this.config.copytraderBuyAmountUsd;
 
@@ -650,22 +649,26 @@ export class CopyTrader {
       return;
     }
 
+    // Update paper position. Every position lives on ONE decimal scale:
+    // re-derive the token quantity in the position's stored scale instead of
+    // the trade's freshly-resolved decimals, which can differ per transaction
+    // and would otherwise corrupt the PNL math by 10^x.
+    let pos = this.positions.get(key);
+    const positionDecimals = pos ? pos.decimals : trade.tokenDecimals;
     const tokenQty = buyAmountUsd / trade.tokenPriceUsd;
-    const tokenAmountBigInt = BigInt(Math.floor(tokenQty * Math.pow(10, trade.tokenDecimals)));
+    const tokenAmountBigInt = BigInt(Math.floor(tokenQty * Math.pow(10, positionDecimals)));
 
     if (tokenAmountBigInt <= 0n) {
       log.debug('paper buy too small', { token: trade.tokenAddress, price: trade.tokenPriceUsd });
       return;
     }
 
-    // Update paper position.
-    let pos = this.positions.get(key);
     if (!pos) {
       pos = {
         tokenAddress: trade.tokenAddress,
         name: trade.tokenName,
         symbol: trade.tokenSymbol,
-        decimals: trade.tokenDecimals,
+        decimals: positionDecimals,
         balance: 0n,
         costBasisUsd: 0,
         avgEntryPriceUsd: 0,
@@ -679,7 +682,7 @@ export class CopyTrader {
 
     const newCost = pos.costBasisUsd + buyAmountUsd;
     const newBalance = pos.balance + tokenAmountBigInt;
-    pos.avgEntryPriceUsd = newCost / (Number(newBalance) / Math.pow(10, trade.tokenDecimals));
+    pos.avgEntryPriceUsd = newCost / (Number(newBalance) / Math.pow(10, positionDecimals));
     pos.costBasisUsd = newCost;
     pos.balance = newBalance;
     pos.currentPriceUsd = trade.tokenPriceUsd;
@@ -730,8 +733,29 @@ export class CopyTrader {
       return;
     }
 
-    const proceedsUsd = (Number(ourSellAmount) / Math.pow(10, trade.tokenDecimals)) * trade.tokenPriceUsd;
-    const costBasisSold = (Number(ourSellAmount) / Math.pow(10, trade.tokenDecimals)) * pos.avgEntryPriceUsd;
+    // Quantities MUST use the position's stored decimals — the trade's
+    // freshly-resolved decimals can differ per transaction and would scale
+    // the PNL by 10^x.
+    const qtySold = Number(ourSellAmount) / Math.pow(10, pos.decimals);
+
+    // Guard against a bogus sell-time price: if it deviates from the live
+    // mark price by >~30x, the sell-side decimals/price resolution failed —
+    // fall back to the mark price (refreshed from DexScreener every 60s).
+    let sellPriceUsd = trade.tokenPriceUsd;
+    if (pos.currentPriceUsd > 0 && Number.isFinite(sellPriceUsd) && sellPriceUsd > 0) {
+      const offBy = Math.abs(Math.log10(sellPriceUsd / pos.currentPriceUsd));
+      if (Number.isFinite(offBy) && offBy > 1.5) {
+        log.warn('sell price deviates from mark — using mark price', {
+          token: trade.tokenAddress,
+          tradePrice: sellPriceUsd,
+          markPrice: pos.currentPriceUsd,
+        });
+        sellPriceUsd = pos.currentPriceUsd;
+      }
+    }
+
+    const proceedsUsd = qtySold * sellPriceUsd;
+    const costBasisSold = qtySold * pos.avgEntryPriceUsd;
     const pnlUsd = proceedsUsd - costBasisSold;
 
     pos.balance -= ourSellAmount;
@@ -745,7 +769,7 @@ export class CopyTrader {
     this.cashUsd += proceedsUsd;
 
     // Update wallet portfolio.
-    this.updateWalletPortfolioSell(trade.wallet, key, trade.tokenAmount, pnlUsd);
+    this.updateWalletPortfolioSell(trade.wallet, key, trade.tokenAmount, trade.tokenDecimals);
 
     // Track daily realized PNL.
     const day = currentMstDay();
@@ -783,8 +807,8 @@ export class CopyTrader {
     wallet: string,
     tokenAddress: string,
     tokenAmount: bigint,
-    buyAmountUsd: number,
     decimals: number,
+    tokenPriceUsd: number,
   ): void {
     const walletKey = wallet.toLowerCase();
     const tokenKey = tokenAddress.toLowerCase();
@@ -799,16 +823,34 @@ export class CopyTrader {
       pos = { balance: 0n, costBasisUsd: 0, avgEntryPriceUsd: 0, decimals };
       portfolio.set(tokenKey, pos);
     }
-    pos.decimals = decimals;
 
-    const newCost = pos.costBasisUsd + buyAmountUsd;
-    const newBalance = pos.balance + tokenAmount;
-    pos.avgEntryPriceUsd = newCost / (Number(newBalance) / Math.pow(10, decimals));
+    // Normalize the incoming raw amount into the stored decimal scale so
+    // repeated buys never mix units within one wallet position.
+    let amount = tokenAmount;
+    if (pos.decimals !== decimals) {
+      amount = BigInt(Math.max(1, Math.floor(Number(tokenAmount) * Math.pow(10, pos.decimals - decimals))));
+      log.warn('wallet portfolio decimals mismatch — normalized to stored scale', {
+        wallet: walletKey,
+        token: tokenKey,
+        stored: pos.decimals,
+        trade: decimals,
+      });
+    }
+
+    const buyUsd = (Number(amount) / Math.pow(10, pos.decimals)) * tokenPriceUsd;
+    const newCost = pos.costBasisUsd + buyUsd;
+    const newBalance = pos.balance + amount;
+    pos.avgEntryPriceUsd = newCost / (Number(newBalance) / Math.pow(10, pos.decimals));
     pos.costBasisUsd = newCost;
     pos.balance = newBalance;
   }
 
-  private updateWalletPortfolioSell(wallet: string, tokenKey: string, sellAmount: bigint, pnlUsd: number): void {
+  private updateWalletPortfolioSell(
+    wallet: string,
+    tokenKey: string,
+    sellAmount: bigint,
+    sellDecimals: number,
+  ): void {
     const walletKey = wallet.toLowerCase();
     const portfolio = this.walletPortfolios.get(walletKey);
     if (!portfolio) return;
@@ -816,8 +858,14 @@ export class CopyTrader {
     const pos = portfolio.get(tokenKey);
     if (!pos) return;
 
-    const costBasisSold = (Number(sellAmount) / Number(pos.balance)) * pos.costBasisUsd;
-    pos.balance -= sellAmount;
+    // Normalize the sell amount into the stored scale before applying it.
+    let amount = sellAmount;
+    if (pos.decimals !== sellDecimals) {
+      amount = BigInt(Math.max(0, Math.floor(Number(sellAmount) * Math.pow(10, pos.decimals - sellDecimals))));
+    }
+
+    const costBasisSold = (Number(amount) / Number(pos.balance)) * pos.costBasisUsd;
+    pos.balance -= amount;
     pos.costBasisUsd = Math.max(0, pos.costBasisUsd - costBasisSold);
 
     if (pos.balance <= 0n) {
