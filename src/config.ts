@@ -82,8 +82,6 @@ export interface ScanethConfig {
   copytraderMaxWallets: number;
   /** Hours between scout cycles. */
   copytraderScoutIntervalHours: number;
-  /** Auto-sell paper positions when they drop this % below entry. 0 disables. */
-  copytraderStopLossPct: number;
   /** True when the bot should actually process blocks; false for dry-run. */
   enabled: boolean;
 }
@@ -117,7 +115,6 @@ export function loadConfig(): ScanethConfig {
     copytraderAutoScoutEnabled: bool('COPYTRADER_AUTO_SCOUT_ENABLED', true),
     copytraderMaxWallets: num('COPYTRADER_MAX_WALLETS', 12),
     copytraderScoutIntervalHours: num('COPYTRADER_SCOUT_INTERVAL_HOURS', 12),
-    copytraderStopLossPct: num('COPYTRADER_STOP_LOSS_PCT', 50),
     startBlock: optionalStr('START_BLOCK') ? num('START_BLOCK', 0) : undefined,
     backtest: optionalStr('BACKTEST_FROM') && optionalStr('BACKTEST_TO')
       ? {
@@ -157,9 +154,6 @@ function validate(c: ScanethConfig): void {
   }
   if (c.copytraderStartingBudgetUsd <= 0) {
     problems.push('COPYTRADER_STARTING_BUDGET_USD must be > 0');
-  }
-  if (c.copytraderStopLossPct < 0 || c.copytraderStopLossPct > 100) {
-    problems.push('COPYTRADER_STOP_LOSS_PCT must be 0-100 (0 disables)');
   }
   if (c.backtest && c.backtest.to < c.backtest.from) {
     problems.push('BACKTEST_TO must be greater than or equal to BACKTEST_FROM');

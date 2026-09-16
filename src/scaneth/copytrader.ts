@@ -340,9 +340,6 @@ export class CopyTrader {
     // Mark open paper positions to market so unrealized PNL reflects reality.
     await this.refreshPositionPrices();
 
-    // Auto-sell positions that have dropped past the stop-loss threshold.
-    await this.enforceStopLoss();
-
     this.priceTimer = setTimeout(() => void this.refreshEthPrice(), 60_000);
   }
 
@@ -354,78 +351,6 @@ export class CopyTrader {
       openValue += (Number(pos.balance) / Math.pow(10, pos.decimals)) * price;
     }
     return this.cashUsd + openValue;
-  }
-
-  /**
-   * Auto-sell any open position trading below entry by the stop-loss percent.
-   * Runs after every mark-to-market cycle (every 60s). Disabled at 0.
-   */
-  private async enforceStopLoss(): Promise<void> {
-    const stopPct = this.config.copytraderStopLossPct;
-    if (stopPct <= 0) return;
-
-    for (const [key, pos] of [...this.positions]) {
-      if (pos.balance <= 0n) continue;
-      const price = pos.currentPriceUsd;
-      if (!(price > 0) || !(pos.avgEntryPriceUsd > 0)) continue;
-      const dropPct = ((price - pos.avgEntryPriceUsd) / pos.avgEntryPriceUsd) * 100;
-      if (dropPct > -stopPct) continue;
-
-      // Exit the entire position at the current market price.
-      const qty = Number(pos.balance) / Math.pow(10, pos.decimals);
-      const proceedsUsd = qty * price;
-      const pnlUsd = proceedsUsd - pos.costBasisUsd;
-      const capitalBefore = this.paperEquity();
-
-      pos.balance = 0n;
-      pos.realizedPnlUsd += pnlUsd;
-      this.cumulativeRealizedUsd += pnlUsd;
-      pos.costBasisUsd = 0;
-      pos.updatedAt = Date.now();
-      this.cashUsd += proceedsUsd;
-      this.positions.delete(key);
-
-      log.warn('stop-loss triggered', {
-        token: pos.symbol,
-        entry: pos.avgEntryPriceUsd,
-        exit: price,
-        dropPct,
-        proceedsUsd,
-        pnlUsd,
-      });
-
-      await this.sendStopLossAlert(pos, proceedsUsd, pnlUsd, capitalBefore);
-    }
-  }
-
-  /** Alert for a stop-loss exit of a paper position (minimal format). */
-  private async sendStopLossAlert(
-    pos: PaperPosition,
-    proceedsUsd: number,
-    pnlUsd: number,
-    capitalBefore: number,
-  ): Promise<void> {
-    const costBasisSold = Math.max(1e-9, proceedsUsd - pnlUsd);
-    const pnlPct = (pnlUsd / costBasisSold) * 100;
-    const pnlSign = pnlUsd >= 0 ? '+' : '';
-    const endingCapital = this.paperEquity();
-
-    const lines = [
-      `<b>SCANETH — Paper copytrade SELL (stop-loss)</b>`,
-      '',
-      `Token: <code>${pos.tokenAddress}</code>`,
-      '',
-      `PNL: <b>${pnlSign}$${pnlUsd.toFixed(2)} (${pnlPct.toFixed(2)}%)</b>`,
-      `Capital before trade: $${capitalBefore.toFixed(2)}`,
-      `Capital after trade: <b>$${endingCapital.toFixed(2)}</b>`,
-      '',
-      `⛔ Auto-exited at −${this.config.copytraderStopLossPct}% stop-loss`,
-    ];
-
-    const ok = await this.notifier.sendRaw(lines.join('\n'));
-    if (!ok) {
-      log.warn('stop-loss alert failed', { token: pos.tokenAddress });
-    }
   }
 
   /** Refresh current prices of open paper positions via DexScreener. */

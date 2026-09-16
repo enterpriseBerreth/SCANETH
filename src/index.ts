@@ -19,6 +19,7 @@ import { AthTracker } from './scaneth/tracker';
 import { CopyTrader } from './scaneth/copytrader';
 import { WalletScout } from './scaneth/wallet-scout';
 import type { TokenLaunch } from './scaneth/types';
+import { WebSocketProvider } from 'ethers';
 import type { Server } from 'node:http';
 
 const log = createLogger('scaneth');
@@ -34,6 +35,8 @@ class ScanethBot {
   private httpServer?: Server;
   private stopping = false;
   private pollTimer?: NodeJS.Timeout;
+  /** Blocks already processed (by either WS stream or poll loop) — dedup guard. */
+  private readonly processedBlocks = new Set<number>();
 
   constructor(private readonly config: ScanethConfig) {
     this.notifier = new ScanethNotifier(config);
@@ -94,9 +97,11 @@ class ScanethBot {
         if (this.stopping) return;
         void this.processBlock(blockNumber);
       });
-    } else {
-      this.schedulePoll(startBlock);
     }
+    // Poll loop always runs as a safety net: it catches blocks missed during
+    // WebSocket drops (ethers auto-reconnects, but events can be lost) and
+    // corrects any lag. processBlock dedups, so overlap is harmless.
+    this.schedulePoll(startBlock);
   }
 
   private banner(): void {
@@ -149,6 +154,17 @@ class ScanethBot {
 
   private async processBlock(blockNumber: number): Promise<void> {
     if (!this.scanner) return;
+    if (this.processedBlocks.has(blockNumber)) return;
+    this.processedBlocks.add(blockNumber);
+    // Keep the dedup set bounded: a 12s block cadence means ~7,200 entries/day.
+    if (this.processedBlocks.size > 2_000) {
+      const excess = this.processedBlocks.size - 1_000;
+      let removed = 0;
+      for (const b of this.processedBlocks) {
+        this.processedBlocks.delete(b);
+        if (++removed >= excess) break;
+      }
+    }
     const result = await this.scanner.processBlock(blockNumber);
     await this.handleResult(result);
     if (this.copytrader) {
