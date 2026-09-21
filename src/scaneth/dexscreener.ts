@@ -97,21 +97,23 @@ export async function fetchTokenPairs(
 }
 
 /**
- * Pick the best pair for a token. Prefer Ethereum mainnet pairs with the
- * deepest liquidity; fall back to any pair if no mainnet pair exists.
+ * Pick the best pair for a token. DexScreener's `priceUsd` is ALWAYS the price
+ * of the pair's base token, so we only accept pairs where OUR token is the
+ * base — otherwise we would mark positions at the quote token's price (e.g.
+ * a stablecoin's $1.00) and inflate them by 10^x. Prefer Ethereum mainnet
+ * pairs with the deepest liquidity; fall back to any chain if none exists.
  */
 export function pickBestPair(pairs: DexScreenerPair[], tokenAddress: string): DexScreenerPair | null {
   if (pairs.length === 0) return null;
 
   const tokenLower = tokenAddress.toLowerCase();
-  const ethPairs = pairs.filter(
+  const basePairs = pairs.filter(
     (p) =>
-      p.chainId === 'ethereum' ||
-      p.baseToken.address.toLowerCase() === tokenLower ||
-      p.quoteToken.address.toLowerCase() === tokenLower,
+      p.baseToken.address.toLowerCase() === tokenLower &&
+      (p.chainId === 'ethereum' || p.chainId === 'eth'),
   );
 
-  const candidates = ethPairs.length > 0 ? ethPairs : pairs;
+  const candidates = basePairs.length > 0 ? basePairs : pairs.filter((p) => p.baseToken.address.toLowerCase() === tokenLower);
 
   // Prefer the pair with the highest 1-hour transaction count, then liquidity.
   return candidates.sort((a, b) => {
