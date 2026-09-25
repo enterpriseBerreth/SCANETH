@@ -16,17 +16,11 @@ const CHAINLINK_ETH_USD = '0x5f4eC3Df9cbd43714FE2740f5E3616155c5b8419';
 
 const WALLETS = [
   '0x2d3d805517ae175153a3166b915b6ae9d32f509a',
-  '0xfb8834ddbe592b152be3fb15a6324af95192a00c',
   '0x82e159d63e585067e9fa3a4bba7d992fbc667751',
-  '0xa667a51bdcb32dabc8a9396a4523b5fef314ebe7',
-  '0x9dbfded199ee3a6b291c223e65f97d387156aada',
-  '0xae3c9dfd4dd4700d2382e985fb348b71b1341b5d',
-  '0xc05ef5e1fd014267f66fa24b260f361af7d79122',
   '0x9748566962e3f6caac751d860614889794c2f098',
   '0xb51ff2f65b935142aab32abefa1c0e29a4161d31',
-  '0xdfb6c7adb4d4e383e2d06a9f745513acb8e7358e',
-  '0xe353c12bb28dd8e3d98f63ffe8118154d26d46a7',
-  '0x6318eb6235afdc7b4eea60afcce4961873f1c0f7',
+  '0xc05ef5e1fd014267f66fa24b260f361af7d79122',
+  '0xae3c9dfd4dd4700d2382e985fb348b71b1341b5d',
 ];
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));

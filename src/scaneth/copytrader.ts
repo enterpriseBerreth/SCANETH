@@ -30,6 +30,17 @@ const TRANSFER_TOPIC = '0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a
 /** WETH Withdrawal(address,uint256) topic0 — emitted when WETH is unwrapped to ETH. */
 const WETH_WITHDRAWAL_TOPIC = '0x7fcf532c15f0a6db0bd6d0e038bea71d30d808c7d98cb3bf7268a95bf5081b65';
 
+/**
+ * Auto-take-profit rule: positions bought ONLY by these wallets are exited at
+ * the current mark once they are profitable and have been held >24h — they
+ * no longer wait for the source wallet to exit.
+ */
+const AUTO_TP_WALLETS = new Set([
+  '0xb51ff2f65b935142aab32abefa1c0e29a4161d31',
+  '0x2d3d805517ae175153a3166b915b6ae9d32f509a',
+]);
+const AUTO_TP_MIN_AGE_MS = 24 * 3_600_000;
+
 export interface PaperPosition {
   tokenAddress: string;
   name: string;
@@ -49,6 +60,8 @@ export interface PaperPosition {
   openedAt: number;
   /** Last activity timestamp. */
   updatedAt: number;
+  /** Watched wallets that bought into this position (lowercase). */
+  contributors: Set<string>;
 }
 
 interface WalletPosition {
@@ -392,7 +405,81 @@ export class CopyTrader {
     // Apply deferred buys whose tokens have listed a market pair by now.
     await this.retryPendingBuys();
 
+    // Exit stale profitable positions from the auto-take-profit wallets.
+    await this.enforceAutoTakeProfit();
+
     this.priceTimer = setTimeout(() => void this.refreshEthPrice(), 60_000);
+  }
+
+  /**
+   * Positions bought ONLY by the AUTO_TP_WALLETS wallets are exited at the
+   * current mark once profitable and held >24h, instead of waiting for a
+   * source-wallet exit that may never come. Runs after every mark-to-market
+   * cycle. Positions shared with any other watched wallet are left alone.
+   */
+  private async enforceAutoTakeProfit(): Promise<void> {
+    for (const [key, pos] of [...this.positions]) {
+      if (pos.balance <= 0n || pos.contributors.size === 0) continue;
+      if (![...pos.contributors].every((w) => AUTO_TP_WALLETS.has(w))) continue;
+      if (Date.now() - pos.openedAt < AUTO_TP_MIN_AGE_MS) continue;
+
+      const price = pos.currentPriceUsd;
+      if (!(price > 0) || !(pos.avgEntryPriceUsd > 0)) continue;
+      if (price <= pos.avgEntryPriceUsd) continue; // only profitable exits
+
+      const qty = Number(pos.balance) / Math.pow(10, pos.decimals);
+      const proceedsUsd = qty * price;
+      const pnlUsd = proceedsUsd - pos.costBasisUsd;
+      const capitalBefore = this.paperEquity();
+
+      pos.balance = 0n;
+      pos.realizedPnlUsd += pnlUsd;
+      this.cumulativeRealizedUsd += pnlUsd;
+      pos.costBasisUsd = 0;
+      pos.updatedAt = Date.now();
+      this.cashUsd += proceedsUsd;
+      this.positions.delete(key);
+
+      log.info('auto-take-profit exit', {
+        token: pos.symbol,
+        entry: pos.avgEntryPriceUsd,
+        exit: price,
+        proceedsUsd,
+        pnlUsd,
+        heldHours: ((Date.now() - pos.openedAt) / 3_600_000).toFixed(1),
+      });
+
+      await this.sendAutoTpAlert(pos, proceedsUsd, pnlUsd, capitalBefore);
+    }
+  }
+
+  /** Alert for an auto-take-profit exit (same minimal format as wallet sells). */
+  private async sendAutoTpAlert(
+    pos: PaperPosition,
+    proceedsUsd: number,
+    pnlUsd: number,
+    capitalBefore: number,
+  ): Promise<void> {
+    const pnlPct = (pnlUsd / Math.max(1e-9, proceedsUsd - pnlUsd)) * 100;
+    const pnlSign = pnlUsd >= 0 ? '+' : '';
+    const endingCapital = this.paperEquity();
+
+    const lines = [
+      `<b>SCANETH — Paper copytrade SELL (auto-take-profit)</b>`,
+      '',
+      `Token: <code>${pos.tokenAddress}</code>`,
+      '',
+      `PNL: <b>${pnlSign}$${pnlUsd.toFixed(2)} (${pnlSign}${pnlPct.toFixed(2)}%)</b>`,
+      `Capital before trade: $${capitalBefore.toFixed(2)}`,
+      `Capital after trade: <b>$${endingCapital.toFixed(2)}</b>`,
+      '',
+      `📌 Exited: profitable and held >24h (wallet rule)`,
+    ];
+
+    const ok = await this.notifier.sendRaw(lines.join('\n'));
+    if (!ok) {
+      log.warn('auto-take-profit alert failed', { token: pos.tokenAddress });
+    }
   }
 
   private schedulePendingBuy(
@@ -743,8 +830,11 @@ export class CopyTrader {
         currentPriceUsd: trade.tokenPriceUsd,
         openedAt: trade.timestamp,
         updatedAt: trade.timestamp,
+        contributors: new Set([trade.wallet.toLowerCase()]),
       };
       this.positions.set(key, pos);
+    } else {
+      pos.contributors.add(trade.wallet.toLowerCase());
     }
 
     const newCost = pos.costBasisUsd + buyAmountUsd;
