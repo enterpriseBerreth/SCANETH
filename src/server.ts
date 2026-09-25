@@ -10,7 +10,7 @@ import { createLogger, errMeta } from './logger';
 import type { BotState } from './state';
 import type { ScanethConfig } from './config';
 import type { TokenLaunch } from './scaneth/types';
-import type { CopyTraderStats } from './scaneth/copytrader';
+import type { CopyTrader, CopyTraderStats } from './scaneth/copytrader';
 import type { ScoutStats } from './scaneth/wallet-scout';
 
 const log = createLogger('server');
@@ -21,6 +21,7 @@ export interface ServerDeps {
   recentAlerts: () => TokenLaunch[];
   copytraderStats?: () => CopyTraderStats | undefined;
   scoutStats?: () => ScoutStats | undefined;
+  positions?: () => ReturnType<NonNullable<CopyTrader['getOpenPositions']>>;
 }
 
 function json(value: unknown): string {
@@ -75,6 +76,12 @@ export function startServer(deps: ServerDeps): Server {
       return;
     }
 
+    if (url === '/positions') {
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(json({ positions: deps.positions?.() ?? [] }));
+      return;
+    }
+
     if (url === '/alerts') {
       res.writeHead(200, { 'content-type': 'application/json' });
       res.end(json(deps.recentAlerts().slice(0, 20)));
@@ -82,7 +89,7 @@ export function startServer(deps: ServerDeps): Server {
     }
 
     res.writeHead(404, { 'content-type': 'application/json' });
-    res.end(json({ error: 'not found', routes: ['/health', '/stats', '/alerts'] }));
+    res.end(json({ error: 'not found', routes: ['/health', '/stats', '/positions', '/alerts'] }));
   });
 
   server.on('error', (err) => log.error('http server error', errMeta(err)));
@@ -90,7 +97,7 @@ export function startServer(deps: ServerDeps): Server {
   server.listen(deps.config.port, () => {
     log.info('http server listening', {
       port: deps.config.port,
-      routes: ['/health', '/stats', '/alerts'],
+      routes: ['/health', '/stats', '/positions', '/alerts'],
     });
   });
 

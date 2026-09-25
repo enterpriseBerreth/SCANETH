@@ -202,6 +202,8 @@ async function main(): Promise<void> {
   let sellsCopied = 0;
   let skippedNoCash = 0;
   let realizedPnl = 0;
+  let profitableSells = 0;
+  let losingSells = 0;
 
   for (const t of trades) {
     const heldKey = `${t.wallet}:${t.token}`;
@@ -235,7 +237,9 @@ async function main(): Promise<void> {
       const qtySold = pos.balance * sellPct;
       const proceeds = qtySold * pricePerUnit;
       const costSold = qtySold * pos.avgEntry;
-      realizedPnl += proceeds - costSold;
+      const tradePnl = proceeds - costSold;
+      realizedPnl += tradePnl;
+      if (tradePnl >= 0) profitableSells++; else losingSells++;
       cash += proceeds;
       pos.balance -= qtySold;
       pos.costBasis = Math.max(0, pos.costBasis - costSold);
@@ -278,6 +282,7 @@ async function main(): Promise<void> {
   const pnl = equity - START_CASH;
 
   console.log(`Trades copied: ${buysCopied} buys, ${sellsCopied} sells (skipped ${skippedNoCash} buys — out of cash)`);
+  console.log(`Closed sells: ${profitableSells} profitable, ${losingSells} at a loss`);
   console.log(`Realized PNL (closed exits): ${realizedPnl >= 0 ? '+' : ''}$${realizedPnl.toFixed(2)}`);
   console.log(`Open positions: ${positions.size}, marked value: $${openValue.toFixed(2)}`);
   if (openDetail.length) console.log(openDetail.join('\n'));

@@ -1,11 +1,11 @@
 /**
  * SCANETH entry point.
  *
- * Wires the Ethereum block scanner, DEXScreener enrichment, Telegram notifier
- * and HTTP server together. The bot streams every new Ethereum block, detects
- * new DEX pairs, and sends a Telegram alert for every newly-paired token with
- * complete metadata. Each alert includes the token name, exact address, scam
- * rating, and a pros/cons summary.
+ * Pure copywallet bot: streams every new Ethereum block, mirrors the buys and
+ * sells of watched wallets into a paper-trading account ($20 per buy,
+ * proportional exits), and Telegrams one alert per closed trade plus the
+ * daily midnight MST wallet ranking. An auto-scout engine periodically swaps
+ * losing wallets for newly discovered profitable ones.
  */
 
 import { loadConfig, type ScanethConfig } from './config';
@@ -15,10 +15,8 @@ import { startServer } from './server';
 import { ScanethNotifier } from './scaneth/notifier';
 import { BlockScanner } from './scaneth/scanner';
 import { createProviders, destroyProviders, type ProviderPair } from './scaneth/provider';
-import { AthTracker } from './scaneth/tracker';
 import { CopyTrader } from './scaneth/copytrader';
 import { WalletScout } from './scaneth/wallet-scout';
-import type { TokenLaunch } from './scaneth/types';
 import { WebSocketProvider } from 'ethers';
 import type { Server } from 'node:http';
 
@@ -27,7 +25,6 @@ const log = createLogger('scaneth');
 class ScanethBot {
   private readonly state = new BotState();
   private readonly notifier: ScanethNotifier;
-  private readonly tracker: AthTracker;
   private providers?: ProviderPair;
   private scanner?: BlockScanner;
   private copytrader?: CopyTrader;
@@ -40,7 +37,6 @@ class ScanethBot {
 
   constructor(private readonly config: ScanethConfig) {
     this.notifier = new ScanethNotifier(config);
-    this.tracker = new AthTracker(config, this.notifier);
   }
 
   async start(): Promise<void> {
@@ -52,6 +48,7 @@ class ScanethBot {
       recentAlerts: () => this.state.recentAlerts,
       copytraderStats: () => this.copytrader?.getStats(),
       scoutStats: () => this.walletScout?.getStats(),
+      positions: () => this.copytrader?.getOpenPositions() ?? [],
     });
 
     this.providers = createProviders(this.config.rpcUrl, this.config.wsUrl);
@@ -60,20 +57,10 @@ class ScanethBot {
       maxTaxBps: this.config.maxTaxBps,
       maxTopHolderPct: this.config.maxTopHolderPct,
     });
-    this.scanner.onLateAlert = (launch) => this.emitAlert(launch);
     this.copytrader = new CopyTrader(this.config, this.providers.http, this.notifier);
 
     const network = await this.providers.http.getNetwork();
     log.info('connected', { chainId: network.chainId, name: network.name });
-
-    if (this.config.telegramTestOnBoot) {
-      const ok = await this.notifier.test();
-      log.info(ok ? 'telegram test delivered' : 'telegram test failed');
-    }
-
-    if (this.config.athTrackerEnabled || this.config.dailyReportEnabled) {
-      this.tracker.start();
-    }
 
     if (this.config.copytraderEnabled) {
       this.copytrader.start();
@@ -112,7 +99,7 @@ class ScanethBot {
         maxTaxBps: this.config.maxTaxBps,
         maxTopHolderPct: this.config.maxTopHolderPct,
       },
-      athTracker: this.config.athTrackerEnabled ? 'enabled' : 'disabled',
+      athTracker: 'disabled (copywallet bot)',
       dailyReport: this.config.dailyReportEnabled ? 'enabled' : 'disabled',
       copytrader: this.config.copytraderEnabled ? 'enabled' : 'disabled',
       telegram: this.notifier.isEnabled ? 'enabled' : 'disabled',
@@ -178,28 +165,8 @@ class ScanethBot {
     for (const launch of result.launches) {
       this.state.recordLaunch(launch);
     }
-
-    for (const alert of result.alerts) {
-      await this.emitAlert(alert);
-    }
-  }
-
-  private async emitAlert(alert: import('./scaneth/types').TokenLaunch): Promise<void> {
-    this.state.recordAlert(alert);
-    log.info('active new launch alert', {
-      name: alert.metadata.name,
-      symbol: alert.metadata.symbol,
-      ageHours: alert.dexScreener ? (alert.dexScreener.ageMs / 3_600_000).toFixed(2) : null,
-      h1Txns: alert.dexScreener?.h1Txns,
-      h1Sells: alert.dexScreener?.h1Sells,
-      block: alert.blockNumber,
-    });
-    if (this.notifier.isEnabled) {
-      await this.notifier.alertLaunch(alert);
-    }
-    if (this.config.athTrackerEnabled || this.config.dailyReportEnabled) {
-      this.tracker.trackAlert(alert);
-    }
+    // Launch alerts removed — SCANETH is a pure copywallet bot now.
+    // Scanner metrics (launches/alerts counters) are still tracked above.
   }
 
   async shutdown(): Promise<void> {
@@ -209,7 +176,6 @@ class ScanethBot {
 
     if (this.pollTimer) clearTimeout(this.pollTimer);
     this.scanner?.stop();
-    this.tracker.stop();
     this.copytrader?.stop();
     this.walletScout?.stop();
 

@@ -120,6 +120,23 @@ export class CopyTrader {
   private priceTimer?: NodeJS.Timeout;
   private reportTimer?: NodeJS.Timeout;
   private running = false;
+  /**
+   * Buys whose token had no DexScreener pair yet at detection time. Sizing
+   * them immediately would rely on a blind 18-decimal implied price — the
+   * last corruption path behind 10^x PNL. They are retried every minute and
+   * applied with market-anchored decimals once a pair lists.
+   */
+  private readonly pendingBuys = new Map<string, {
+    wallet: string;
+    tokenAddress: string;
+    tokenAmount: bigint;
+    ethAmount: bigint;
+    ts: number;
+    txHash: string;
+    blockNumber: number;
+    attempts: number;
+    nextAt: number;
+  }>();
 
   constructor(
     private readonly config: ScanethConfig,
@@ -130,6 +147,38 @@ export class CopyTrader {
       this.watchedWallets.add(w.toLowerCase());
     }
     this.cashUsd = config.copytraderStartingBudgetUsd;
+  }
+
+  /** Open paper positions with full marking detail (for /positions). */
+  getOpenPositions(): Array<{
+    token: string;
+    symbol: string;
+    name: string;
+    units: number;
+    costBasisUsd: number;
+    avgEntryUsd: number;
+    currentPriceUsd: number;
+    valueUsd: number;
+    pnlUsd: number;
+    openedAt: number;
+  }> {
+    return [...this.positions.values()].map((pos) => {
+      const units = Number(pos.balance) / Math.pow(10, pos.decimals);
+      const price = pos.currentPriceUsd > 0 ? pos.currentPriceUsd : pos.avgEntryPriceUsd;
+      const value = units * price;
+      return {
+        token: pos.tokenAddress,
+        symbol: pos.symbol,
+        name: pos.name,
+        units,
+        costBasisUsd: Number(pos.costBasisUsd.toFixed(2)),
+        avgEntryUsd: pos.avgEntryPriceUsd,
+        currentPriceUsd: pos.currentPriceUsd,
+        valueUsd: Number(value.toFixed(2)),
+        pnlUsd: Number((value - pos.costBasisUsd).toFixed(2)),
+        openedAt: pos.openedAt,
+      };
+    });
   }
 
   getStats(): CopyTraderStats {
@@ -340,7 +389,95 @@ export class CopyTrader {
     // Mark open paper positions to market so unrealized PNL reflects reality.
     await this.refreshPositionPrices();
 
+    // Apply deferred buys whose tokens have listed a market pair by now.
+    await this.retryPendingBuys();
+
     this.priceTimer = setTimeout(() => void this.refreshEthPrice(), 60_000);
+  }
+
+  private schedulePendingBuy(
+    wallet: string,
+    tokenAddress: string,
+    tokenAmount: bigint,
+    ethAmount: bigint,
+    tx: TransactionResponse,
+  ): void {
+    if (this.pendingBuys.has(tokenAddress)) return;
+    this.pendingBuys.set(tokenAddress, {
+      wallet,
+      tokenAddress,
+      tokenAmount,
+      ethAmount,
+      ts: Date.now(),
+      txHash: tx.hash,
+      blockNumber: tx.blockNumber ?? 0,
+      attempts: 0,
+      nextAt: 0,
+    });
+    log.info('paper buy deferred — no market pair yet, will retry', { token: tokenAddress, wallet, txHash: tx.hash });
+  }
+
+  /**
+   * Retry deferred buys once a DexScreener pair exists. Decimals are anchored
+   * to the live market price (search 0-18 for the implied price closest to
+   * the market price), then the buy applies at the trade's own implied price.
+   */
+  private async retryPendingBuys(): Promise<void> {
+    if (this.pendingBuys.size === 0 || !this.running) return;
+    const now = Date.now();
+
+    for (const [tokenAddress, item] of [...this.pendingBuys]) {
+      if (item.nextAt > now) continue;
+      this.pendingBuys.delete(tokenAddress);
+
+      const dexPrice = await this.getCurrentTokenPrice(tokenAddress);
+      if (!(dexPrice > 0)) {
+        item.attempts++;
+        if (item.attempts >= 30) {
+          log.info('deferred paper buy dropped — no market pair after 30 min', { token: tokenAddress });
+          continue;
+        }
+        item.nextAt = now + 60_000;
+        this.pendingBuys.set(tokenAddress, item);
+        continue;
+      }
+
+      const ethPriceUsd = this.ethUsdPrice || 2500;
+      const impliedPrice = (d: number): number => {
+        const qty = Number(item.tokenAmount) / Math.pow(10, d);
+        if (!(qty > 0)) return NaN;
+        return (Number(item.ethAmount) * ethPriceUsd) / qty;
+      };
+      let best = 18;
+      let bestOff = Infinity;
+      for (let d = 0; d <= 18; d++) {
+        const p = impliedPrice(d);
+        if (!Number.isFinite(p) || p <= 0) continue;
+        const off = Math.abs(Math.log10(p / dexPrice));
+        if (off < bestOff) {
+          bestOff = off;
+          best = d;
+        }
+      }
+      const price = impliedPrice(best);
+      if (!Number.isFinite(price) || price <= 0) continue;
+
+      log.info('deferred paper buy applied — market pair now live', {
+        token: tokenAddress,
+        wallet: item.wallet,
+        attempt: item.attempts + 1,
+        decimals: best,
+        price,
+      });
+
+      const trade = await this.buildTrade(
+        item.wallet, 'buy', tokenAddress, best, item.tokenAmount,
+        item.ethAmount, ethPriceUsd, price,
+        { hash: item.txHash, blockNumber: item.blockNumber } as TransactionResponse,
+      );
+      trade.timestamp = item.ts;
+      await this.executePaperTrade(trade);
+    }
   }
 
   /** Paper equity: remaining cash + market value of open positions. */
@@ -441,7 +578,12 @@ export class CopyTrader {
       const [tokenAddress, tokenAmount] = bought;
       const ethAmount = tx.value + wethOut;
       if (tokenAmount <= 0n) return null;
-      const { decimals, tokenPriceUsd } = await this.resolveDecimalsAndPrice(tokenAddress, tokenAmount, ethAmount, ethPriceUsd);
+      const { decimals, tokenPriceUsd, anchored } = await this.resolveDecimalsAndPrice(tokenAddress, tokenAmount, ethAmount, ethPriceUsd);
+      if (!anchored) {
+        // No market pair yet — sizing now would rely on a blind implied price.
+        this.schedulePendingBuy(wallet, tokenAddress, tokenAmount, ethAmount, tx);
+        return null;
+      }
       if (!Number.isFinite(tokenPriceUsd) || tokenPriceUsd <= 0) return null;
       return this.buildTrade(wallet, 'buy', tokenAddress, decimals, tokenAmount, ethAmount, ethPriceUsd, tokenPriceUsd, tx);
     }
@@ -830,16 +972,18 @@ export class CopyTrader {
    *
    * Some tokens revert on decimals(); the 18-decimal fallback then produces an
    * absurd implied price (e.g. $1e18 per token for a 0-decimal token), which
-   * corrupts position sizing and trips the stop-loss instantly. We cross-check
-   * the implied price against DexScreener: if it is off by >~30x, we pick the
-   * decimals value (0-18) whose implied price best matches the market price.
+   * corrupts position sizing. We cross-check the implied price against
+   * DexScreener: if it is off by >~30x, we pick the decimals value (0-18)
+   * whose implied price best matches the market price. `anchored` is false
+   * when no market pair exists yet — callers must NOT size the trade on the
+   * blind implied price in that case.
    */
   private async resolveDecimalsAndPrice(
     tokenAddress: string,
     tokenAmountRaw: bigint,
     ethAmount: bigint,
     ethPriceUsd: number,
-  ): Promise<{ decimals: number; tokenPriceUsd: number }> {
+  ): Promise<{ decimals: number; tokenPriceUsd: number; anchored: boolean }> {
     let decimals = await this.getDecimals(tokenAddress);
     const dexPrice = await this.getCurrentTokenPrice(tokenAddress);
 
@@ -879,7 +1023,7 @@ export class CopyTrader {
     if (!Number.isFinite(price) || price <= 0) {
       price = dexPrice > 0 ? dexPrice : 0;
     }
-    return { decimals, tokenPriceUsd: price };
+    return { decimals, tokenPriceUsd: price, anchored: dexPrice > 0 };
   }
 
   /**
