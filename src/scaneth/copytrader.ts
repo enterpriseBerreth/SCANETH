@@ -795,7 +795,15 @@ export class CopyTrader {
     walletBalances.set(key, prevBalance + trade.tokenAmount);
     this.updateWalletPortfolioBuy(trade.wallet, trade.tokenAddress, trade.tokenAmount, trade.tokenDecimals, trade.tokenPriceUsd);
 
-    const buyAmountUsd = this.config.copytraderBuyAmountUsd;
+    /**
+     * Per-wallet buy sizing: this wallet is the strongest performer, so its
+     * buys are copied at a premium clip. All other wallets use the default.
+     */
+    const PREMIUM_WALLET = '0xb51ff2f65b935142aab32abefa1c0e29a4161d31';
+    const PREMIUM_BUY_USD = 100;
+    const buyAmountUsd = trade.wallet.toLowerCase() === PREMIUM_WALLET
+      ? PREMIUM_BUY_USD
+      : this.config.copytraderBuyAmountUsd;
 
     // Respect the paper cash budget.
     if (this.cashUsd < buyAmountUsd) {
