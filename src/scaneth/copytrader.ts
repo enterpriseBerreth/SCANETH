@@ -140,6 +140,12 @@ export class CopyTrader {
   private reportTimer?: NodeJS.Timeout;
   private running = false;
   /**
+   * Wallets copied at the premium $100 clip. Seeded with the proven
+   * performers; the scout promotes proven newcomers and demotes degrading
+   * wallets at each daily cycle.
+   */
+  private readonly premiumWallets = new Set(PREMIUM_WALLETS);
+  /**
    * Buys whose token had no DexScreener pair yet at detection time. Sizing
    * them immediately would rely on a blind 18-decimal implied price — the
    * last corruption path behind 10^x PNL. They are retried every minute and
@@ -757,8 +763,35 @@ export class CopyTrader {
     const key = wallet.toLowerCase();
     if (!this.watchedWallets.has(key)) return false;
     this.watchedWallets.delete(key);
+    this.premiumWallets.delete(key);
     log.info('scout removed wallet', { wallet: key });
     return true;
+  }
+
+  /** Premium ($100-clip) wallets — scout promotes/demotes based on proof. */
+  isPremiumWallet(wallet: string): boolean {
+    return this.premiumWallets.has(wallet.toLowerCase());
+  }
+
+  /** Promote a proven wallet to $100 clips. Returns false if already premium. */
+  promoteWallet(wallet: string): boolean {
+    const key = wallet.toLowerCase();
+    if (!this.watchedWallets.has(key) || this.premiumWallets.has(key)) return false;
+    this.premiumWallets.add(key);
+    log.info('wallet promoted to premium clips', { wallet: key });
+    return true;
+  }
+
+  /** Demote a degrading wallet back to $20 clips. Returns false if not premium. */
+  demoteWallet(wallet: string): boolean {
+    const key = wallet.toLowerCase();
+    if (!this.premiumWallets.delete(key)) return false;
+    log.info('wallet demoted to default clips', { wallet: key });
+    return true;
+  }
+
+  getPremiumWallets(): string[] {
+    return [...this.premiumWallets];
   }
 
   /** Per-wallet performance across all observed trades (for scout ranking). */
@@ -805,7 +838,7 @@ export class CopyTrader {
      * Per-wallet buy sizing: premium wallets (see PREMIUM_WALLETS) are copied
      * at a premium clip. All other wallets use the default.
      */
-    const buyAmountUsd = PREMIUM_WALLETS.has(trade.wallet.toLowerCase())
+    const buyAmountUsd = this.premiumWallets.has(trade.wallet.toLowerCase())
       ? PREMIUM_BUY_USD
       : this.config.copytraderBuyAmountUsd;
 

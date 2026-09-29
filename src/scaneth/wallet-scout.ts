@@ -82,7 +82,7 @@ export class WalletScout {
     };
   }
 
-  /** One scout cycle: discover → evaluate → replace worst performers. */
+  /** One scout cycle: discover → evaluate → grow roster → tune clip tiers. */
   async runCycle(): Promise<void> {
     if (this.runningCycle) return;
     this.runningCycle = true;
@@ -90,20 +90,51 @@ export class WalletScout {
       log.info('scout cycle starting');
       const candidates = await this.discoverAndEvaluate();
       const changes = this.manageRoster(candidates);
+      const tiers = await this.tuneTiers();
       this.lastRunAt = Date.now();
       this.lastRunAdded = changes.added;
       this.lastRunRemoved = changes.removed;
-      if (changes.added.length > 0 || changes.removed.length > 0) {
+      if (changes.added.length > 0 || changes.removed.length > 0 || tiers.promoted.length > 0 || tiers.demoted.length > 0) {
         this.totalAdded += changes.added.length;
         this.totalRemoved += changes.removed.length;
-        await this.notifyChanges(changes);
+        await this.notifyChanges(changes, tiers);
       }
-      log.info('scout cycle done', { candidates: candidates.length, ...changes });
+      log.info('scout cycle done', { candidates: candidates.length, ...changes, ...tiers });
     } catch (err) {
       log.error('scout cycle failed', errMeta(err));
     } finally {
       this.runningCycle = false;
     }
+  }
+
+  /**
+   * Daily clip-tier tuning. New wallets are copied at the default $20 clip
+   * until they prove themselves on-chain: at least 3 completed round trips
+   * with positive aggregate PNL earns promotion to $100 clips. A premium
+   * wallet whose recent round trips turn negative is demoted back to $20.
+   */
+  private async tuneTiers(): Promise<{ promoted: string[]; demoted: string[] }> {
+    const promoted: string[] = [];
+    const demoted: string[] = [];
+
+    for (const wallet of this.copytrader.getWalletPerformance().keys()) {
+      const score = await this.evaluateCandidate(wallet);
+      if (!score || score.roundTrips < 3) continue;
+
+      if (!this.copytrader.isPremiumWallet(wallet) && score.pnlPct > 0) {
+        if (this.copytrader.promoteWallet(wallet)) {
+          promoted.push(wallet);
+          log.info('scout promoted wallet', { wallet, pnlPct: score.pnlPct, roundTrips: score.roundTrips });
+        }
+      } else if (this.copytrader.isPremiumWallet(wallet) && score.pnlPct < 0) {
+        if (this.copytrader.demoteWallet(wallet)) {
+          demoted.push(wallet);
+          log.info('scout demoted wallet', { wallet, pnlPct: score.pnlPct, roundTrips: score.roundTrips });
+        }
+      }
+    }
+
+    return { promoted, demoted };
   }
 
   /** Find hot ETH tokens, extract active traders, evaluate their profitability. */
@@ -117,7 +148,7 @@ export class WalletScout {
     const latest = await this.provider.getBlockNumber();
     const fromBlock = Math.max(0, latest - 3_000);
 
-    for (const token of tokens.slice(0, 8)) {
+    for (const token of tokens.slice(0, 16)) {
       try {
         const logs = await this.provider.getLogs({
           address: token,
@@ -146,7 +177,7 @@ export class WalletScout {
     const ranked = [...traderCounts.entries()].sort((a, b) => b[1] - a[1]).map(([w]) => w);
     const evaluated: CandidateScore[] = [];
     for (const wallet of ranked) {
-      if (evaluated.length >= 10) break;
+      if (evaluated.length >= 20) break;
       const code = await this.provider.getCode(wallet);
       if (code !== '0x') continue;
 
@@ -175,7 +206,7 @@ export class WalletScout {
         if (addr === WETH || seen.has(addr)) continue;
         seen.add(addr);
         out.push(addr);
-        if (out.length >= 8) break;
+        if (out.length >= 16) break;
       }
       return out;
     } catch (err) {
@@ -329,16 +360,29 @@ export class WalletScout {
     return worst;
   }
 
-  private async notifyChanges(changes: { added: string[]; removed: string[] }): Promise<void> {
+  private async notifyChanges(
+    changes: { added: string[]; removed: string[] },
+    tiers: { promoted: string[]; demoted: string[] } = { promoted: [], demoted: [] },
+  ): Promise<void> {
     const lines: string[] = ['<b>SCANETH — Scout roster update</b>', ''];
+    if (changes.added.length > 0) {
+      lines.push('<b>Added (profitable on hot ETH tokens — copied at $20 until proven):</b>');
+      for (const w of changes.added) lines.push(`<code>${w}</code>`);
+      lines.push('');
+    }
     if (changes.removed.length > 0) {
       lines.push('<b>Removed (underperforming):</b>');
       for (const w of changes.removed) lines.push(`<code>${w}</code>`);
       lines.push('');
     }
-    if (changes.added.length > 0) {
-      lines.push('<b>Added (profitable on hot ETH tokens):</b>');
-      for (const w of changes.added) lines.push(`<code>${w}</code>`);
+    if (tiers.promoted.length > 0) {
+      lines.push('<b>⬆️ Promoted to $100 clips (proven profitable):</b>');
+      for (const w of tiers.promoted) lines.push(`<code>${w}</code>`);
+      lines.push('');
+    }
+    if (tiers.demoted.length > 0) {
+      lines.push('<b>⬇️ Demoted to $20 clips (recent round trips negative):</b>');
+      for (const w of tiers.demoted) lines.push(`<code>${w}</code>`);
     }
     const ok = await this.notifier.sendRaw(lines.join('\n'));
     if (!ok) log.warn('scout roster alert failed');
