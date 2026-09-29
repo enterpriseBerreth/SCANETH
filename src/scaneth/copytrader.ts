@@ -37,9 +37,15 @@ const WETH_WITHDRAWAL_TOPIC = '0x7fcf532c15f0a6db0bd6d0e038bea71d30d808c7d98cb3b
  */
 const AUTO_TP_WALLETS = new Set([
   '0xb51ff2f65b935142aab32abefa1c0e29a4161d31',
-  '0x2d3d805517ae175153a3166b915b6ae9d32f509a',
 ]);
 const AUTO_TP_MIN_AGE_MS = 24 * 3_600_000;
+
+/** Wallets whose buys are copied at a premium clip (strongest performers). */
+const PREMIUM_WALLETS = new Set([
+  '0xb51ff2f65b935142aab32abefa1c0e29a4161d31',
+  '0xc05ef5e1fd014267f66fa24b260f361af7d79122',
+]);
+const PREMIUM_BUY_USD = 100;
 
 export interface PaperPosition {
   tokenAddress: string;
@@ -796,12 +802,10 @@ export class CopyTrader {
     this.updateWalletPortfolioBuy(trade.wallet, trade.tokenAddress, trade.tokenAmount, trade.tokenDecimals, trade.tokenPriceUsd);
 
     /**
-     * Per-wallet buy sizing: this wallet is the strongest performer, so its
-     * buys are copied at a premium clip. All other wallets use the default.
+     * Per-wallet buy sizing: premium wallets (see PREMIUM_WALLETS) are copied
+     * at a premium clip. All other wallets use the default.
      */
-    const PREMIUM_WALLET = '0xb51ff2f65b935142aab32abefa1c0e29a4161d31';
-    const PREMIUM_BUY_USD = 100;
-    const buyAmountUsd = trade.wallet.toLowerCase() === PREMIUM_WALLET
+    const buyAmountUsd = PREMIUM_WALLETS.has(trade.wallet.toLowerCase())
       ? PREMIUM_BUY_USD
       : this.config.copytraderBuyAmountUsd;
 
