@@ -84,6 +84,10 @@ export interface ScanethConfig {
   copytraderScoutIntervalHours: number;
   /** Auto-sell paper positions when they drop this % below entry. 0 disables. */
   copytraderStopLossPct: number;
+  /** File path for persisted paper-account state. Empty string disables persistence. */
+  copytraderStatePath: string;
+  /** Shared secret for admin endpoints (/dump, /restore, /exit, /reset). */
+  copytraderAdminKey?: string;
   /** True when the bot should actually process blocks; false for dry-run. */
   enabled: boolean;
 }
@@ -118,6 +122,8 @@ export function loadConfig(): ScanethConfig {
     copytraderMaxWallets: num('COPYTRADER_MAX_WALLETS', 12),
     copytraderScoutIntervalHours: num('COPYTRADER_SCOUT_INTERVAL_HOURS', 12),
     copytraderStopLossPct: num('COPYTRADER_STOP_LOSS_PCT', 40),
+    copytraderStatePath: optionalStr('COPYTRADER_STATE_PATH') ?? 'data/paper-state.json',
+    copytraderAdminKey: optionalStr('COPYTRADER_ADMIN_KEY'),
     startBlock: optionalStr('START_BLOCK') ? num('START_BLOCK', 0) : undefined,
     backtest: optionalStr('BACKTEST_FROM') && optionalStr('BACKTEST_TO')
       ? {

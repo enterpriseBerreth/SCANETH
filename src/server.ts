@@ -19,6 +19,7 @@ export interface ServerDeps {
   config: ScanethConfig;
   state: BotState;
   recentAlerts: () => TokenLaunch[];
+  copytrader?: CopyTrader;
   copytraderStats?: () => CopyTraderStats | undefined;
   scoutStats?: () => ScoutStats | undefined;
   positions?: () => ReturnType<NonNullable<CopyTrader['getOpenPositions']>>;
@@ -34,8 +35,28 @@ function json(value: unknown): string {
 
 export function startServer(deps: ServerDeps): Server {
   const server = createServer((req, res) => {
-    const url = req.url ?? '/';
+    const parsed = new URL(req.url ?? '/', 'http://localhost');
+    const url = parsed.pathname;
+    void handle(req, res, parsed, url);
+  });
 
+  server.on('error', (err) => log.error('http server error', errMeta(err)));
+
+  server.listen(deps.config.port, () => {
+    log.info('http server listening', {
+      port: deps.config.port,
+      routes: ['/health', '/stats', '/positions', '/alerts', '/dump', '/restore', '/exit', '/reset'],
+    });
+  });
+
+  return server;
+
+  async function handle(
+    req: import('node:http').IncomingMessage,
+    res: import('node:http').ServerResponse,
+    parsed: URL,
+    url: string,
+  ): Promise<void> {
     if (url === '/health' || url === '/') {
       res.writeHead(200, { 'content-type': 'application/json' });
       res.end(
@@ -88,18 +109,97 @@ export function startServer(deps: ServerDeps): Server {
       return;
     }
 
+    // --- Admin endpoints (require COPYTRADER_ADMIN_KEY) ---
+
+    if (['/dump', '/restore', '/exit', '/reset'].includes(url)) {
+      const key = parsed.searchParams.get('key') ?? '';
+      if (!deps.config.copytraderAdminKey || key !== deps.config.copytraderAdminKey) {
+        res.writeHead(403, { 'content-type': 'application/json' });
+        res.end(json({ error: 'forbidden' }));
+        return;
+      }
+      const trader = deps.copytrader;
+      if (!trader) {
+        res.writeHead(503, { 'content-type': 'application/json' });
+        res.end(json({ error: 'copytrader not enabled' }));
+        return;
+      }
+
+      if (url === '/dump') {
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.end(json(trader.serializeState()));
+        return;
+      }
+
+      if (url === '/restore') {
+        if (req.method !== 'POST') {
+          res.writeHead(405, { 'content-type': 'application/json' });
+          res.end(json({ error: 'POST required' }));
+          return;
+        }
+        try {
+          const body = await readBody(req);
+          const state = JSON.parse(body);
+          await trader.restoreState(state);
+          log.warn('paper state restored via admin endpoint', {
+            positions: trader.getOpenPositions().length,
+          });
+          res.writeHead(200, { 'content-type': 'application/json' });
+          res.end(json({ ok: true, positions: trader.getOpenPositions().length }));
+        } catch (err) {
+          res.writeHead(400, { 'content-type': 'application/json' });
+          res.end(json({ error: err instanceof Error ? err.message : 'invalid payload' }));
+        }
+        return;
+      }
+
+      if (url === '/exit') {
+        if (req.method !== 'POST') {
+          res.writeHead(405, { 'content-type': 'application/json' });
+          res.end(json({ error: 'POST required' }));
+          return;
+        }
+        const token = parsed.searchParams.get('token') ?? '';
+        if (!token.startsWith('0x') || token.length !== 42) {
+          res.writeHead(400, { 'content-type': 'application/json' });
+          res.end(json({ error: 'token query param must be a 42-char address' }));
+          return;
+        }
+        const exited = await trader.exitToken(token, 'manual-api');
+        res.writeHead(exited ? 200 : 404, { 'content-type': 'application/json' });
+        res.end(json({ ok: exited, exited }));
+        return;
+      }
+
+      // /reset
+      if (req.method !== 'POST') {
+        res.writeHead(405, { 'content-type': 'application/json' });
+        res.end(json({ error: 'POST required' }));
+        return;
+      }
+      await trader.resetPaperAccount();
+      log.warn('paper account reset via admin endpoint');
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(json({ ok: true, reset: true }));
+      return;
+    }
+
     res.writeHead(404, { 'content-type': 'application/json' });
     res.end(json({ error: 'not found', routes: ['/health', '/stats', '/positions', '/alerts'] }));
-  });
+  }
+}
 
-  server.on('error', (err) => log.error('http server error', errMeta(err)));
-
-  server.listen(deps.config.port, () => {
-    log.info('http server listening', {
-      port: deps.config.port,
-      routes: ['/health', '/stats', '/positions', '/alerts'],
+function readBody(req: import('node:http').IncomingMessage): Promise<string> {
+  return new Promise((resolve, reject) => {
+    let data = '';
+    req.on('data', (chunk: Buffer) => {
+      data += chunk.toString('utf8');
+      if (data.length > 1_000_000) {
+        reject(new Error('payload too large'));
+        req.destroy();
+      }
     });
+    req.on('end', () => resolve(data));
+    req.on('error', reject);
   });
-
-  return server;
 }

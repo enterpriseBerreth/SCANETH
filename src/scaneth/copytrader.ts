@@ -12,6 +12,8 @@
  * No real transactions are sent. This is a simulation layer only.
  */
 
+import { mkdir, readFile, writeFile } from 'node:fs/promises';
+import { dirname } from 'node:path';
 import { Contract, type Provider, type TransactionReceipt, type TransactionResponse } from 'ethers';
 import { createLogger, errMeta } from '../logger';
 import type { ScanethConfig } from '../config';
@@ -46,6 +48,33 @@ const PREMIUM_WALLETS = new Set([
   '0xc05ef5e1fd014267f66fa24b260f361af7d79122',
 ]);
 const PREMIUM_BUY_USD = 100;
+
+/** Serialized paper position (bigint balance as string). */
+export interface PersistedPosition {
+  tokenAddress: string;
+  name: string;
+  symbol: string;
+  decimals: number;
+  balance: string;
+  costBasisUsd: number;
+  avgEntryPriceUsd: number;
+  realizedPnlUsd: number;
+  currentPriceUsd: number;
+  openedAt: number;
+  updatedAt: number;
+  contributors: string[];
+}
+
+/** Full serializable paper-account state. */
+export interface PersistedState {
+  version: 1;
+  savedAt: number;
+  cashUsd: number;
+  cumulativeRealizedUsd: number;
+  tradeCount: number;
+  premiumWallets: string[];
+  positions: PersistedPosition[];
+}
 
 export interface PaperPosition {
   tokenAddress: string;
@@ -251,14 +280,256 @@ export class CopyTrader {
       watchedWallets: this.watchedWallets.size,
       buyAmountUsd: this.config.copytraderBuyAmountUsd,
     });
+    void this.restoreOrInit();
     void this.refreshEthPrice();
     this.scheduleDailyWalletReport();
+  }
+
+  /**
+   * Restore persisted paper state from disk at boot. When no state file
+   * exists yet, persist the fresh account immediately so every later restart
+   * (deploy, crash) resumes exactly where the bot left off.
+   */
+  private async restoreOrInit(): Promise<void> {
+    const path = this.config.copytraderStatePath;
+    if (!path) return;
+    try {
+      const raw = await readFile(path, 'utf8');
+      const state = JSON.parse(raw) as PersistedState;
+      await this.restoreState(state);
+      log.info('paper state restored from disk', {
+        path,
+        positions: this.positions.size,
+        cashUsd: Number(this.cashUsd.toFixed(2)),
+      });
+    } catch (err) {
+      const code = (err as NodeJS.ErrnoException)?.code;
+      if (code !== 'ENOENT') {
+        log.warn('paper state load failed — starting fresh', { path, ...errMeta(err) });
+      }
+      await this.persistState();
+    }
   }
 
   stop(): void {
     this.running = false;
     if (this.priceTimer) clearTimeout(this.priceTimer);
     if (this.reportTimer) clearTimeout(this.reportTimer);
+  }
+
+  /** Serialize the full paper account for persistence or /dump. */
+  serializeState(): PersistedState {
+    return {
+      version: 1,
+      savedAt: Date.now(),
+      cashUsd: this.cashUsd,
+      cumulativeRealizedUsd: this.cumulativeRealizedUsd,
+      tradeCount: this.tradeCount,
+      premiumWallets: [...this.premiumWallets],
+      positions: [...this.positions.values()].map((pos) => ({
+        tokenAddress: pos.tokenAddress,
+        name: pos.name,
+        symbol: pos.symbol,
+        decimals: pos.decimals,
+        balance: pos.balance.toString(),
+        costBasisUsd: pos.costBasisUsd,
+        avgEntryPriceUsd: pos.avgEntryPriceUsd,
+        realizedPnlUsd: pos.realizedPnlUsd,
+        currentPriceUsd: pos.currentPriceUsd,
+        openedAt: pos.openedAt,
+        updatedAt: pos.updatedAt,
+        contributors: [...pos.contributors],
+      })),
+    };
+  }
+
+  /** Write the paper account to disk (best-effort). */
+  async persistState(): Promise<void> {
+    const path = this.config.copytraderStatePath;
+    if (!path) return;
+    try {
+      await mkdir(dirname(path), { recursive: true });
+      await writeFile(path, JSON.stringify(this.serializeState(), null, 2));
+    } catch (err) {
+      log.warn('paper state persist failed', { path, ...errMeta(err) });
+    }
+  }
+
+  /** Apply a serialized paper account (from disk or a POST /restore payload). */
+  async restoreState(state: PersistedState): Promise<void> {
+    if (!state || state.version !== 1) {
+      throw new Error('unsupported paper state payload (expected version 1)');
+    }
+    if (!Number.isFinite(state.cashUsd) || state.cashUsd < 0) {
+      throw new Error('invalid cashUsd in paper state payload');
+    }
+    this.cashUsd = state.cashUsd;
+    this.cumulativeRealizedUsd = Number.isFinite(state.cumulativeRealizedUsd) ? state.cumulativeRealizedUsd : 0;
+    this.tradeCount = Number.isFinite(state.tradeCount) ? state.tradeCount : 0;
+    if (Array.isArray(state.premiumWallets) && state.premiumWallets.length > 0) {
+      this.premiumWallets.clear();
+      for (const w of state.premiumWallets) this.premiumWallets.add(w.toLowerCase());
+    }
+    this.positions.clear();
+    for (const p of state.positions ?? []) {
+      const token = p.tokenAddress?.toLowerCase();
+      if (!token || !token.startsWith('0x')) continue;
+      let balance = 0n;
+      try {
+        balance = BigInt(p.balance);
+      } catch {
+        balance = 0n;
+      }
+      if (balance <= 0n) continue;
+      let decimals = Number(p.decimals);
+      if (!Number.isInteger(decimals) || decimals < 0 || decimals > 36) {
+        decimals = await this.getDecimals(token);
+      }
+      const qty = Number(balance) / Math.pow(10, decimals);
+      const avgEntry = qty > 0 && p.costBasisUsd > 0 ? p.costBasisUsd / qty : p.avgEntryPriceUsd;
+      const pos: PaperPosition = {
+        tokenAddress: token,
+        name: p.name ?? 'Unknown',
+        symbol: p.symbol ?? '???',
+        decimals,
+        balance,
+        costBasisUsd: p.costBasisUsd,
+        avgEntryPriceUsd: avgEntry > 0 ? avgEntry : p.avgEntryPriceUsd,
+        realizedPnlUsd: Number.isFinite(p.realizedPnlUsd) ? p.realizedPnlUsd : 0,
+        currentPriceUsd: Number.isFinite(p.currentPriceUsd) ? p.currentPriceUsd : 0,
+        openedAt: p.openedAt ?? Date.now(),
+        updatedAt: p.updatedAt ?? Date.now(),
+        contributors: new Set((p.contributors ?? []).map((w) => w.toLowerCase())),
+      };
+      this.positions.set(token, pos);
+      await this.seedWalletTrackingFromChain(token, pos);
+    }
+    await this.persistState();
+  }
+
+  /**
+   * Seed proportional-sell tracking from the chain: for each contributor of a
+   * restored position, use their real on-chain token balance as the wallet
+   * position a future sell percentage is computed against.
+   */
+  private async seedWalletTrackingFromChain(token: string, pos: PaperPosition): Promise<void> {
+    for (const wallet of pos.contributors) {
+      try {
+        const contract = new Contract(token, ['function balanceOf(address) view returns (uint256)'], this.provider);
+        const bal = (await contract['balanceOf']!(wallet)) as bigint;
+        if (bal <= 0n) continue;
+        this.getWalletBalanceMap(wallet).set(token, bal);
+        const walletKey = wallet.toLowerCase();
+        let portfolio = this.walletPortfolios.get(walletKey);
+        if (!portfolio) {
+          portfolio = new Map<string, WalletPosition>();
+          this.walletPortfolios.set(walletKey, portfolio);
+        }
+        const qty = Number(bal) / Math.pow(10, pos.decimals);
+        portfolio.set(token, {
+          balance: bal,
+          costBasisUsd: qty * pos.avgEntryPriceUsd,
+          avgEntryPriceUsd: pos.avgEntryPriceUsd,
+          decimals: pos.decimals,
+        });
+      } catch (err) {
+        log.debug('wallet tracking seed failed', { token, wallet, ...errMeta(err) });
+      }
+    }
+  }
+
+  /**
+   * Force-exit an open paper position at the current market price (manual
+   * exit / admin action). Refreshes the mark first so the exit uses a fresh
+   * price rather than one up to 60s old.
+   */
+  async exitToken(tokenAddress: string, reason = 'manual'): Promise<boolean> {
+    const key = tokenAddress.toLowerCase();
+    const pos = this.positions.get(key);
+    if (!pos || pos.balance <= 0n) return false;
+
+    let price = await this.getCurrentTokenPrice(key);
+    if (!(price > 0)) price = pos.currentPriceUsd;
+    if (!(price > 0)) {
+      log.warn('manual exit skipped — no market price', { token: key });
+      return false;
+    }
+
+    const qty = Number(pos.balance) / Math.pow(10, pos.decimals);
+    const proceedsUsd = qty * price;
+    const pnlUsd = proceedsUsd - pos.costBasisUsd;
+    const capitalBefore = this.paperEquity();
+
+    pos.balance = 0n;
+    pos.realizedPnlUsd += pnlUsd;
+    this.cumulativeRealizedUsd += pnlUsd;
+    pos.costBasisUsd = 0;
+    pos.updatedAt = Date.now();
+    this.cashUsd += proceedsUsd;
+    this.positions.delete(key);
+
+    log.warn('manual exit executed', {
+      token: pos.symbol,
+      entry: pos.avgEntryPriceUsd,
+      exit: price,
+      proceedsUsd,
+      pnlUsd,
+      reason,
+    });
+
+    await this.sendManualExitAlert(pos, proceedsUsd, pnlUsd, capitalBefore);
+    await this.persistState();
+    return true;
+  }
+
+  /** Alert for a manual/admin exit (minimal format). */
+  private async sendManualExitAlert(
+    pos: PaperPosition,
+    proceedsUsd: number,
+    pnlUsd: number,
+    capitalBefore: number,
+  ): Promise<void> {
+    const pnlPct = (pnlUsd / Math.max(1e-9, proceedsUsd - pnlUsd)) * 100;
+    const pnlSign = pnlUsd >= 0 ? '+' : '';
+    const endingCapital = this.paperEquity();
+    const wallets =
+      pos.contributors.size > 0
+        ? [...pos.contributors].map((w) => `<code>${w}</code>`).join(', ')
+        : '(manual exit)';
+
+    const lines = [
+      `<b>SCANETH — Paper copytrade SELL (manual exit)</b>`,
+      '',
+      `Token: <code>${pos.tokenAddress}</code>`,
+      `Copied wallet: ${wallets}`,
+      '',
+      `PNL: <b>${pnlSign}$${pnlUsd.toFixed(2)} (${pnlSign}${pnlPct.toFixed(2)}%)</b>`,
+      `Capital before trade: $${capitalBefore.toFixed(2)}`,
+      `Capital after trade: <b>$${endingCapital.toFixed(2)}</b>`,
+      '',
+      `✋ Exited manually at market`,
+    ];
+
+    const ok = await this.notifier.sendRaw(lines.join('\n'));
+    if (!ok) {
+      log.warn('manual exit alert failed', { token: pos.tokenAddress });
+    }
+  }
+
+  /** Wipe the paper account back to the starting budget (admin action). */
+  async resetPaperAccount(): Promise<void> {
+    this.positions.clear();
+    this.walletBalances.clear();
+    this.walletPortfolios.clear();
+    this.walletDailyStats.clear();
+    this.walletTradeCounts.clear();
+    this.cashUsd = this.config.copytraderStartingBudgetUsd;
+    this.cumulativeRealizedUsd = 0;
+    this.tradeCount = 0;
+    this.premiumWallets.clear();
+    for (const w of PREMIUM_WALLETS) this.premiumWallets.add(w);
+    await this.persistState();
+    log.warn('paper account reset to starting budget');
   }
 
   /** Inspect all transactions in a block for watched-wallet activity. */
@@ -422,6 +693,9 @@ export class CopyTrader {
 
     // Auto-exit positions that have dropped past the stop-loss threshold.
     await this.enforceStopLoss();
+
+    // Persist marks/trades so restarts (deploy or crash) resume exactly here.
+    await this.persistState();
 
     this.priceTimer = setTimeout(() => void this.refreshEthPrice(), 60_000);
   }

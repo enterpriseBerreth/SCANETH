@@ -42,15 +42,6 @@ class ScanethBot {
   async start(): Promise<void> {
     this.banner();
 
-    this.httpServer = startServer({
-      config: this.config,
-      state: this.state,
-      recentAlerts: () => this.state.recentAlerts,
-      copytraderStats: () => this.copytrader?.getStats(),
-      scoutStats: () => this.walletScout?.getStats(),
-      positions: () => this.copytrader?.getOpenPositions() ?? [],
-    });
-
     this.providers = createProviders(this.config.rpcUrl, this.config.wsUrl);
     this.scanner = new BlockScanner(this.providers.http, {
       probeEth: this.config.probeEth,
@@ -58,6 +49,16 @@ class ScanethBot {
       maxTopHolderPct: this.config.maxTopHolderPct,
     });
     this.copytrader = new CopyTrader(this.config, this.providers.http, this.notifier);
+
+    this.httpServer = startServer({
+      config: this.config,
+      state: this.state,
+      recentAlerts: () => this.state.recentAlerts,
+      copytrader: this.copytrader,
+      copytraderStats: () => this.copytrader?.getStats(),
+      scoutStats: () => this.walletScout?.getStats(),
+      positions: () => this.copytrader?.getOpenPositions() ?? [],
+    });
 
     const network = await this.providers.http.getNetwork();
     log.info('connected', { chainId: network.chainId, name: network.name });
