@@ -84,6 +84,11 @@ export interface ScanethConfig {
   copytraderScoutIntervalHours: number;
   /** Auto-sell paper positions when they drop this % below entry. 0 disables. */
   copytraderStopLossPct: number;
+  /**
+   * Simulated slippage on paper fills (%): entries pay above market, exits
+   * receive below market. Makes paper PNL realistic for live capital.
+   */
+  copytraderSlippagePct: number;
   /** File path for persisted paper-account state. Empty string disables persistence. */
   copytraderStatePath: string;
   /** Shared secret for admin endpoints (/dump, /restore, /exit, /reset). */
@@ -122,6 +127,7 @@ export function loadConfig(): ScanethConfig {
     copytraderMaxWallets: num('COPYTRADER_MAX_WALLETS', 12),
     copytraderScoutIntervalHours: num('COPYTRADER_SCOUT_INTERVAL_HOURS', 12),
     copytraderStopLossPct: num('COPYTRADER_STOP_LOSS_PCT', 40),
+    copytraderSlippagePct: num('COPYTRADER_SLIPPAGE_PCT', 2),
     copytraderStatePath: optionalStr('COPYTRADER_STATE_PATH') ?? 'data/paper-state.json',
     copytraderAdminKey: optionalStr('COPYTRADER_ADMIN_KEY'),
     startBlock: optionalStr('START_BLOCK') ? num('START_BLOCK', 0) : undefined,
@@ -166,6 +172,9 @@ function validate(c: ScanethConfig): void {
   }
   if (c.copytraderStopLossPct < 0 || c.copytraderStopLossPct > 100) {
     problems.push('COPYTRADER_STOP_LOSS_PCT must be 0-100 (0 disables)');
+  }
+  if (c.copytraderSlippagePct < 0 || c.copytraderSlippagePct > 50) {
+    problems.push('COPYTRADER_SLIPPAGE_PCT must be 0-50');
   }
   if (c.backtest && c.backtest.to < c.backtest.from) {
     problems.push('BACKTEST_TO must be greater than or equal to BACKTEST_FROM');

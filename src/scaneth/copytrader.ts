@@ -456,7 +456,7 @@ export class CopyTrader {
     }
 
     const qty = Number(pos.balance) / Math.pow(10, pos.decimals);
-    const proceedsUsd = qty * price;
+    const proceedsUsd = qty * price * this.exitFillFactor();
     const pnlUsd = proceedsUsd - pos.costBasisUsd;
     const capitalBefore = this.paperEquity();
 
@@ -532,7 +532,15 @@ export class CopyTrader {
     log.warn('paper account reset to starting budget');
   }
 
-  /** Inspect all transactions in a block for watched-wallet activity. */
+  /**
+   * Inspect a block for watched-wallet activity.
+   *
+   * Trade discovery is log-driven: any transaction whose ERC-20 Transfers
+   * touch a watched wallet is inspected, regardless of who SENT it. This
+   * catches trades routed through executor/bot contracts (tx.from != wallet),
+   * which a tx.from-only scan misses entirely. Falls back to a tx.from scan
+   * if the transfer-log query fails.
+   */
   async processBlock(blockNumber: number): Promise<void> {
     if (this.watchedWallets.size === 0) return;
 
@@ -540,20 +548,52 @@ export class CopyTrader {
       const block = await this.provider.getBlock(blockNumber, true);
       if (!block) return;
 
+      // txHash -> watched wallets whose transfers appear in it.
+      const candidates = new Map<string, Set<string>>();
+      try {
+        const padded = [...this.watchedWallets].map((w) => '0x' + w.slice(2).padStart(64, '0'));
+        const [inLogs, outLogs] = await Promise.all([
+          this.provider.getLogs({ topics: [TRANSFER_TOPIC, null, padded], fromBlock: blockNumber, toBlock: blockNumber }),
+          this.provider.getLogs({ topics: [TRANSFER_TOPIC, padded, null], fromBlock: blockNumber, toBlock: blockNumber }),
+        ]);
+        for (const lg of [...inLogs, ...outLogs]) {
+          const from = lg.topics[1] ? '0x' + lg.topics[1].slice(26).toLowerCase() : '';
+          const to = lg.topics[2] ? '0x' + lg.topics[2].slice(26).toLowerCase() : '';
+          let set = candidates.get(lg.transactionHash);
+          if (!set) {
+            set = new Set<string>();
+            candidates.set(lg.transactionHash, set);
+          }
+          for (const w of this.watchedWallets) {
+            if (from === w || to === w) set.add(w);
+          }
+        }
+      } catch (err) {
+        log.debug('transfer-log scan failed — falling back to tx.from scan', { blockNumber, ...errMeta(err) });
+        for (const tx of block.prefetchedTransactions) {
+          const from = tx.from?.toLowerCase();
+          if (from && this.watchedWallets.has(from)) {
+            candidates.set(tx.hash, new Set([from]));
+          }
+        }
+      }
+
+      const txByHash = new Map(block.prefetchedTransactions.map((t) => [t.hash, t]));
       const trades: CopyTrade[] = [];
 
-      for (const tx of block.prefetchedTransactions) {
-        const from = tx.from?.toLowerCase();
-        if (!from || !this.watchedWallets.has(from)) continue;
-
+      for (const [txHash, wallets] of candidates) {
+        const tx = txByHash.get(txHash);
+        if (!tx) continue;
         try {
-          const receipt = await this.provider.getTransactionReceipt(tx.hash);
+          const receipt = await this.provider.getTransactionReceipt(txHash);
           if (!receipt || receipt.status !== 1) continue;
 
-          const trade = await this.parseTrade(tx, receipt, from);
-          if (trade) trades.push(trade);
+          for (const wallet of wallets) {
+            const trade = await this.parseTrade(tx, receipt, wallet);
+            if (trade) trades.push(trade);
+          }
         } catch (err) {
-          log.debug('copytrade inspection failed', { txHash: tx.hash, ...errMeta(err) });
+          log.debug('copytrade inspection failed', { txHash, ...errMeta(err) });
         }
       }
 
@@ -694,6 +734,10 @@ export class CopyTrader {
     // Auto-exit positions that have dropped past the stop-loss threshold.
     await this.enforceStopLoss();
 
+    // Mirror sells the pattern parser cannot see (native sell functions,
+    // executor contracts) by comparing on-chain balances to tracked ones.
+    await this.reconcileWalletPositions();
+
     // Persist marks/trades so restarts (deploy or crash) resume exactly here.
     await this.persistState();
 
@@ -719,7 +763,7 @@ export class CopyTrader {
       if (dropPct > -stopPct) continue;
 
       const qty = Number(pos.balance) / Math.pow(10, pos.decimals);
-      const proceedsUsd = qty * price;
+      const proceedsUsd = qty * price * this.exitFillFactor();
       const pnlUsd = proceedsUsd - pos.costBasisUsd;
       const capitalBefore = this.paperEquity();
 
@@ -790,7 +834,7 @@ export class CopyTrader {
       if (price <= pos.avgEntryPriceUsd) continue; // only profitable exits
 
       const qty = Number(pos.balance) / Math.pow(10, pos.decimals);
-      const proceedsUsd = qty * price;
+      const proceedsUsd = qty * price * this.exitFillFactor();
       const pnlUsd = proceedsUsd - pos.costBasisUsd;
       const capitalBefore = this.paperEquity();
 
@@ -891,6 +935,27 @@ export class CopyTrader {
         continue;
       }
 
+      // Executor-submitted buys may carry no wallet ETH information at all
+      // (native-ETH paid by an executor contract): size directly at the live
+      // market price using on-chain decimals instead of implied-price search.
+      if (item.ethAmount === 0n) {
+        const decimals = await this.getDecimals(tokenAddress);
+        log.info('deferred paper buy applied at market price (no eth info)', {
+          token: tokenAddress,
+          wallet: item.wallet,
+          decimals,
+          dexPrice,
+        });
+        const trade = await this.buildTrade(
+          item.wallet, 'buy', tokenAddress, decimals, item.tokenAmount,
+          0n, this.ethUsdPrice || 2500, dexPrice,
+          { hash: item.txHash, blockNumber: item.blockNumber } as TransactionResponse,
+        );
+        trade.timestamp = item.ts;
+        await this.executePaperTrade(trade);
+        continue;
+      }
+
       const ethPriceUsd = this.ethUsdPrice || 2500;
       const impliedPrice = (d: number): number => {
         const qty = Number(item.tokenAmount) / Math.pow(10, d);
@@ -929,6 +994,90 @@ export class CopyTrader {
     }
   }
 
+  /**
+   * Balance-reconciliation sweep — the safety net for trades our pattern
+   * parser cannot see (pump.fun-style native sell functions, executor
+   * contracts, non-WETH routing). Every cycle, each open position's
+   * contributor balances are read from the chain and compared to the bot's
+   * tracked balance:
+   *   - on-chain < tracked  -> the wallet exited (partly or fully) without a
+   *     detected sell: mirror a proportional paper sell at the current mark.
+   *   - on-chain > tracked  -> the wallet added tokens via an undetected buy:
+   *     resync tracking so future sell percentages stay proportional.
+   * This is also the more realistic model for live capital: trust on-chain
+   * balances over inferred trade patterns.
+   */
+  private async reconcileWalletPositions(): Promise<void> {
+    for (const wallet of this.watchedWallets) {
+      const balances = this.walletBalances.get(wallet);
+      if (!balances || balances.size === 0) continue;
+      for (const [token, tracked] of [...balances]) {
+        const pos = this.positions.get(token);
+        if (!pos || pos.balance <= 0n || tracked <= 0n) continue;
+        let onChain: bigint;
+        try {
+          const contract = new Contract(token, ['function balanceOf(address) view returns (uint256)'], this.provider);
+          onChain = (await contract['balanceOf']!(wallet)) as bigint;
+        } catch (err) {
+          log.debug('reconcile balanceOf failed', { wallet, token, ...errMeta(err) });
+          continue;
+        }
+
+        // Guard against decimal-scale drift between tracked and on-chain
+        // amounts: when they diverge by >30x the delta is meaningless —
+        // resync tracking instead of mirroring a bogus sell.
+        if (onChain > 0n && tracked > 0n) {
+          const ratio = Number(onChain > tracked ? onChain / tracked : tracked / onChain);
+          if (Number.isFinite(ratio) && ratio > 30) {
+            log.warn('reconcile scale mismatch — resyncing tracked balance', {
+              wallet, token, tracked: tracked.toString(), onChain: onChain.toString(),
+            });
+            balances.set(token, onChain);
+            continue;
+          }
+        }
+
+        if (onChain < tracked) {
+          const delta = tracked - onChain;
+          log.warn('reconciled missed sell — wallet on-chain balance below tracked', {
+            wallet,
+            token,
+            tracked: tracked.toString(),
+            onChain: onChain.toString(),
+            delta: delta.toString(),
+          });
+          const trade = await this.buildReconciledSell(wallet, token, delta);
+          await this.executePaperSell(trade);
+        } else if (onChain > tracked) {
+          balances.set(token, onChain);
+          log.debug('reconcile resync — wallet holds more than tracked', {
+            wallet, token, tracked: tracked.toString(), onChain: onChain.toString(),
+          });
+        }
+      }
+    }
+  }
+
+  /** Build a synthetic sell trade for a reconciled (missed) wallet exit. */
+  private async buildReconciledSell(wallet: string, tokenKey: string, delta: bigint): Promise<CopyTrade> {
+    const pos = this.positions.get(tokenKey)!;
+    return {
+      wallet,
+      type: 'sell',
+      tokenAddress: tokenKey,
+      tokenName: pos.name,
+      tokenSymbol: pos.symbol,
+      tokenAmount: delta,
+      tokenDecimals: pos.decimals,
+      ethAmount: 0n,
+      ethPriceUsd: this.ethUsdPrice || 2500,
+      tokenPriceUsd: pos.currentPriceUsd > 0 ? pos.currentPriceUsd : pos.avgEntryPriceUsd,
+      txHash: 'reconciled',
+      blockNumber: 0,
+      timestamp: Date.now(),
+    };
+  }
+
   /** Paper equity: remaining cash + market value of open positions. */
   private paperEquity(): number {
     let openValue = 0;
@@ -937,6 +1086,15 @@ export class CopyTrader {
       openValue += (Number(pos.balance) / Math.pow(10, pos.decimals)) * price;
     }
     return this.cashUsd + openValue;
+  }
+
+  /** Simulated fill degradation: entries pay above market, exits receive below. */
+  private entryFillFactor(): number {
+    return 1 + this.config.copytraderSlippagePct / 100;
+  }
+
+  private exitFillFactor(): number {
+    return Math.max(0, 1 - this.config.copytraderSlippagePct / 100);
   }
 
   /** Refresh current prices of open paper positions via DexScreener. */
@@ -1020,12 +1178,16 @@ export class CopyTrader {
     }
 
     const ethPriceUsd = this.ethUsdPrice || 2500;
+    // ETH attribution: tx.value belongs to the SENDER. When a watched wallet
+    // trades through an executor contract (tx.from != wallet), the wallet's
+    // ETH cost is only visible via WETH transfers out of it.
+    const isFromWallet = tx.from?.toLowerCase() === wallet;
 
     // Buy: wallet paid ETH or WETH and received a non-WETH token.
     const bought = [...tokenIn.entries()][0];
     if (bought && (tx.value > 0n || wethOut > 0n)) {
       const [tokenAddress, tokenAmount] = bought;
-      const ethAmount = tx.value + wethOut;
+      const ethAmount = (isFromWallet ? tx.value : 0n) + wethOut;
       if (tokenAmount <= 0n) return null;
       const { decimals, tokenPriceUsd, anchored } = await this.resolveDecimalsAndPrice(tokenAddress, tokenAmount, ethAmount, ethPriceUsd);
       if (!anchored) {
@@ -1204,7 +1366,8 @@ export class CopyTrader {
     // and would otherwise corrupt the PNL math by 10^x.
     let pos = this.positions.get(key);
     const positionDecimals = pos ? pos.decimals : trade.tokenDecimals;
-    const tokenQty = buyAmountUsd / trade.tokenPriceUsd;
+    // Realistic entry: pay slippage above the observed market price.
+    const tokenQty = buyAmountUsd / (trade.tokenPriceUsd * this.entryFillFactor());
     const tokenAmountBigInt = BigInt(Math.floor(tokenQty * Math.pow(10, positionDecimals)));
 
     if (tokenAmountBigInt <= 0n) {
@@ -1306,7 +1469,8 @@ export class CopyTrader {
       }
     }
 
-    const proceedsUsd = qtySold * sellPriceUsd;
+    // Realistic exit: receive slippage below the observed market price.
+    const proceedsUsd = qtySold * sellPriceUsd * this.exitFillFactor();
     const costBasisSold = qtySold * pos.avgEntryPriceUsd;
     const pnlUsd = proceedsUsd - costBasisSold;
 
