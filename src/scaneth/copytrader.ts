@@ -456,8 +456,14 @@ export class CopyTrader {
     }
 
     const qty = Number(pos.balance) / Math.pow(10, pos.decimals);
-    const proceedsUsd = qty * price * this.exitFillFactor();
-    const pnlUsd = proceedsUsd - pos.costBasisUsd;
+    // Manual override ignores the liquidity floor (human decision) but still
+    // pays slippage, AMM impact and gas.
+    const market = await this.getMarketSnapshot(key);
+    const midProceedsUsd = qty * price;
+    const impactFactor = this.exitImpactFactor(midProceedsUsd, market.liquidityUsd);
+    const proceedsUsd = midProceedsUsd * this.exitFillFactor() * impactFactor;
+    const gasPaid = this.takeGas();
+    const pnlUsd = proceedsUsd - pos.costBasisUsd - gasPaid;
     const capitalBefore = this.paperEquity();
 
     pos.balance = 0n;
@@ -523,6 +529,7 @@ export class CopyTrader {
     this.walletPortfolios.clear();
     this.walletDailyStats.clear();
     this.walletTradeCounts.clear();
+    this.pendingBuys.clear();
     this.cashUsd = this.config.copytraderStartingBudgetUsd;
     this.cumulativeRealizedUsd = 0;
     this.tradeCount = 0;
@@ -762,9 +769,21 @@ export class CopyTrader {
       const dropPct = ((price - pos.avgEntryPriceUsd) / pos.avgEntryPriceUsd) * 100;
       if (dropPct > -stopPct) continue;
 
+      // Realism: cannot exit into a pool thinner than the floor — retry next cycle.
+      const market = await this.getMarketSnapshot(key);
+      if (this.exitLiquidityBlocked(key, market)) {
+        log.warn('stop-loss blocked — liquidity below executable floor', {
+          token: key, liquidityUsd: market.liquidityUsd,
+        });
+        continue;
+      }
+
       const qty = Number(pos.balance) / Math.pow(10, pos.decimals);
-      const proceedsUsd = qty * price * this.exitFillFactor();
-      const pnlUsd = proceedsUsd - pos.costBasisUsd;
+      const midProceedsUsd = qty * price;
+      const impactFactor = this.exitImpactFactor(midProceedsUsd, market.liquidityUsd);
+      const proceedsUsd = midProceedsUsd * this.exitFillFactor() * impactFactor;
+      const gasPaid = this.takeGas();
+      const pnlUsd = proceedsUsd - pos.costBasisUsd - gasPaid;
       const capitalBefore = this.paperEquity();
 
       pos.balance = 0n;
@@ -781,6 +800,8 @@ export class CopyTrader {
         exit: price,
         dropPct,
         proceedsUsd,
+        gasPaid,
+        impactFactor: Number(impactFactor.toFixed(3)),
         pnlUsd,
       });
 
@@ -833,9 +854,21 @@ export class CopyTrader {
       if (!(price > 0) || !(pos.avgEntryPriceUsd > 0)) continue;
       if (price <= pos.avgEntryPriceUsd) continue; // only profitable exits
 
+      // Realism: cannot exit into a pool thinner than the floor — retry next cycle.
+      const market = await this.getMarketSnapshot(key);
+      if (this.exitLiquidityBlocked(key, market)) {
+        log.warn('auto-take-profit blocked — liquidity below executable floor', {
+          token: key, liquidityUsd: market.liquidityUsd,
+        });
+        continue;
+      }
+
       const qty = Number(pos.balance) / Math.pow(10, pos.decimals);
-      const proceedsUsd = qty * price * this.exitFillFactor();
-      const pnlUsd = proceedsUsd - pos.costBasisUsd;
+      const midProceedsUsd = qty * price;
+      const impactFactor = this.exitImpactFactor(midProceedsUsd, market.liquidityUsd);
+      const proceedsUsd = midProceedsUsd * this.exitFillFactor() * impactFactor;
+      const gasPaid = this.takeGas();
+      const pnlUsd = proceedsUsd - pos.costBasisUsd - gasPaid;
       const capitalBefore = this.paperEquity();
 
       pos.balance = 0n;
@@ -851,6 +884,8 @@ export class CopyTrader {
         entry: pos.avgEntryPriceUsd,
         exit: price,
         proceedsUsd,
+        gasPaid,
+        impactFactor: Number(impactFactor.toFixed(3)),
         pnlUsd,
         heldHours: ((Date.now() - pos.openedAt) / 3_600_000).toFixed(1),
       });
@@ -1354,11 +1389,28 @@ export class CopyTrader {
       ? PREMIUM_BUY_USD
       : this.config.copytraderBuyAmountUsd;
 
-    // Respect the paper cash budget.
-    if (this.cashUsd < buyAmountUsd) {
+    // Respect the paper cash budget (gas included — real trades pay both).
+    const gasEstimate = this.config.copytraderGasFeeUsd;
+    if (this.cashUsd < buyAmountUsd + gasEstimate) {
       log.debug('paper buy skipped — out of cash', { token: trade.tokenAddress, cashUsd: this.cashUsd });
       return;
     }
+
+    // Live-executability gate: real capital cannot buy into a pool thinner
+    // than the configured floor. Skip the copy entirely.
+    const market = await this.getMarketSnapshot(key);
+    if (this.exitLiquidityBlocked(key, market)) {
+      log.warn('paper buy skipped — liquidity below executable floor', {
+        token: trade.tokenAddress,
+        liquidityUsd: market.liquidityUsd,
+        floorUsd: this.config.copytraderMinLiquidityUsd,
+      });
+      return;
+    }
+
+    // Realistic entry: we fill one block after the wallet, at the price
+    // observable at detection time — not the wallet's own earlier fill.
+    const entryPriceUsd = market.priceUsd > 0 ? market.priceUsd : trade.tokenPriceUsd;
 
     // Update paper position. Every position lives on ONE decimal scale:
     // re-derive the token quantity in the position's stored scale instead of
@@ -1366,8 +1418,8 @@ export class CopyTrader {
     // and would otherwise corrupt the PNL math by 10^x.
     let pos = this.positions.get(key);
     const positionDecimals = pos ? pos.decimals : trade.tokenDecimals;
-    // Realistic entry: pay slippage above the observed market price.
-    const tokenQty = buyAmountUsd / (trade.tokenPriceUsd * this.entryFillFactor());
+    // Realistic entry: detection-time price plus slippage above market.
+    const tokenQty = buyAmountUsd / (entryPriceUsd * this.entryFillFactor());
     const tokenAmountBigInt = BigInt(Math.floor(tokenQty * Math.pow(10, positionDecimals)));
 
     if (tokenAmountBigInt <= 0n) {
@@ -1385,7 +1437,7 @@ export class CopyTrader {
         costBasisUsd: 0,
         avgEntryPriceUsd: 0,
         realizedPnlUsd: 0,
-        currentPriceUsd: trade.tokenPriceUsd,
+        currentPriceUsd: entryPriceUsd,
         openedAt: trade.timestamp,
         updatedAt: trade.timestamp,
         contributors: new Set([trade.wallet.toLowerCase()]),
@@ -1400,11 +1452,12 @@ export class CopyTrader {
     pos.avgEntryPriceUsd = newCost / (Number(newBalance) / Math.pow(10, positionDecimals));
     pos.costBasisUsd = newCost;
     pos.balance = newBalance;
-    pos.currentPriceUsd = trade.tokenPriceUsd;
+    pos.currentPriceUsd = entryPriceUsd;
     pos.updatedAt = trade.timestamp;
 
-    // Deduct from the paper cash budget.
+    // Deduct from the paper cash budget, plus simulated gas.
     this.cashUsd -= buyAmountUsd;
+    const gasPaid = this.takeGas();
 
     // Track daily cost basis for the wallet.
     const day = currentMstDay();
@@ -1415,6 +1468,10 @@ export class CopyTrader {
       wallet: trade.wallet,
       token: trade.tokenSymbol,
       amountUsd: buyAmountUsd,
+      gasPaid,
+      entryPriceUsd,
+      walletFillPriceUsd: trade.tokenPriceUsd,
+      liquidityUsd: market.liquidityUsd,
       tokenAmount: tokenAmountBigInt.toString(),
     });
 
@@ -1469,10 +1526,26 @@ export class CopyTrader {
       }
     }
 
-    // Realistic exit: receive slippage below the observed market price.
-    const proceedsUsd = qtySold * sellPriceUsd * this.exitFillFactor();
+    // Live-executability gate on the way OUT: a pool thinner than the floor
+    // cannot absorb the exit — real capital stays stuck. Retry next cycle.
+    const market = await this.getMarketSnapshot(key);
+    if (this.exitLiquidityBlocked(key, market)) {
+      log.warn('paper sell skipped — liquidity below executable floor', {
+        token: trade.tokenAddress,
+        liquidityUsd: market.liquidityUsd,
+        floorUsd: this.config.copytraderMinLiquidityUsd,
+      });
+      return;
+    }
+
+    // Realistic exit: slippage below market PLUS AMM price impact — the sell
+    // itself moves the price against us in proportion to pool depth.
+    const midProceedsUsd = qtySold * sellPriceUsd;
+    const impactFactor = this.exitImpactFactor(midProceedsUsd, market.liquidityUsd);
+    const proceedsUsd = midProceedsUsd * this.exitFillFactor() * impactFactor;
     const costBasisSold = qtySold * pos.avgEntryPriceUsd;
-    const pnlUsd = proceedsUsd - costBasisSold;
+    const gasPaid = this.takeGas();
+    const pnlUsd = proceedsUsd - costBasisSold - gasPaid;
 
     pos.balance -= ourSellAmount;
     pos.realizedPnlUsd += pnlUsd;
@@ -1481,7 +1554,7 @@ export class CopyTrader {
     pos.currentPriceUsd = trade.tokenPriceUsd;
     pos.updatedAt = trade.timestamp;
 
-    // Credit sale proceeds back to the paper cash budget.
+    // Credit sale proceeds back to the paper cash budget (gas already debited).
     this.cashUsd += proceedsUsd;
 
     // Update wallet portfolio.
@@ -1497,6 +1570,8 @@ export class CopyTrader {
       token: trade.tokenSymbol,
       sellPct,
       proceedsUsd,
+      gasPaid,
+      impactFactor: Number(impactFactor.toFixed(3)),
       pnlUsd,
     });
 
@@ -1606,14 +1681,52 @@ export class CopyTrader {
   }
 
   private async getCurrentTokenPrice(tokenAddress: string): Promise<number> {
+    const snap = await this.getMarketSnapshot(tokenAddress);
+    return snap.priceUsd;
+  }
+
+  /** Current DexScreener market snapshot for a token: price + best-pair liquidity. */
+  private async getMarketSnapshot(tokenAddress: string): Promise<{ priceUsd: number; liquidityUsd: number }> {
     try {
       const pairs = await fetchTokenPairs(tokenAddress);
       const best = pickBestPair(pairs, tokenAddress);
-      if (best?.priceUsd) return Number(best.priceUsd);
+      if (best?.priceUsd) {
+        return { priceUsd: Number(best.priceUsd), liquidityUsd: best.liquidity?.usd ?? 0 };
+      }
     } catch (err) {
-      log.debug('current price fetch failed', { address: tokenAddress, ...errMeta(err) });
+      log.debug('market snapshot fetch failed', { address: tokenAddress, ...errMeta(err) });
     }
-    return 0;
+    return { priceUsd: 0, liquidityUsd: 0 };
+  }
+
+  /** Charge simulated gas for a paper trade; returns the amount charged. */
+  private takeGas(): number {
+    const gas = this.config.copytraderGasFeeUsd;
+    if (gas > 0) this.cashUsd -= gas;
+    return gas;
+  }
+
+  /**
+   * Realism gate: true when the token's pool is thinner than the configured
+   * floor (or has no measurable liquidity) — real capital could not fill a
+   * trade there. Unknown liquidity (fetch failure) counts as blocked; the
+   * caller simply retries next cycle.
+   */
+  private exitLiquidityBlocked(tokenAddress: string, snapshot?: { liquidityUsd: number }): boolean {
+    const liquidityUsd = snapshot ? snapshot.liquidityUsd : 0;
+    return liquidityUsd < this.config.copytraderMinLiquidityUsd;
+  }
+
+  /**
+   * AMM price impact on exits: a sell of `midProceedsUsd` against a pool with
+   * total liquidity L moves the price against the seller by roughly
+   * midProceeds/L (constant-product approximation for small trades). Capped
+   * at 50% so extreme cases degrade instead of zeroing out.
+   */
+  private exitImpactFactor(midProceedsUsd: number, liquidityUsd: number): number {
+    if (!(liquidityUsd > 0) || !(midProceedsUsd > 0)) return 1;
+    const impact = Math.min(0.5, midProceedsUsd / liquidityUsd);
+    return 1 - impact;
   }
 
   /**

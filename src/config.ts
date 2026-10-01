@@ -89,6 +89,14 @@ export interface ScanethConfig {
    * receive below market. Makes paper PNL realistic for live capital.
    */
   copytraderSlippagePct: number;
+  /** Simulated gas cost per paper trade (buys AND sells), in USD. */
+  copytraderGasFeeUsd: number;
+  /**
+   * Minimum DEX pool liquidity (USD) for a copyable token: entries below the
+   * floor are skipped and exits into thinner pools are refused — real capital
+   * could not fill them.
+   */
+  copytraderMinLiquidityUsd: number;
   /** File path for persisted paper-account state. Empty string disables persistence. */
   copytraderStatePath: string;
   /** Shared secret for admin endpoints (/dump, /restore, /exit, /reset). */
@@ -128,6 +136,8 @@ export function loadConfig(): ScanethConfig {
     copytraderScoutIntervalHours: num('COPYTRADER_SCOUT_INTERVAL_HOURS', 12),
     copytraderStopLossPct: num('COPYTRADER_STOP_LOSS_PCT', 40),
     copytraderSlippagePct: num('COPYTRADER_SLIPPAGE_PCT', 2),
+    copytraderGasFeeUsd: num('COPYTRADER_GAS_FEE_USD', 5),
+    copytraderMinLiquidityUsd: num('COPYTRADER_MIN_LIQUIDITY_USD', 10_000),
     copytraderStatePath: optionalStr('COPYTRADER_STATE_PATH') ?? 'data/paper-state.json',
     copytraderAdminKey: optionalStr('COPYTRADER_ADMIN_KEY'),
     startBlock: optionalStr('START_BLOCK') ? num('START_BLOCK', 0) : undefined,
@@ -175,6 +185,12 @@ function validate(c: ScanethConfig): void {
   }
   if (c.copytraderSlippagePct < 0 || c.copytraderSlippagePct > 50) {
     problems.push('COPYTRADER_SLIPPAGE_PCT must be 0-50');
+  }
+  if (c.copytraderGasFeeUsd < 0) {
+    problems.push('COPYTRADER_GAS_FEE_USD must be >= 0');
+  }
+  if (c.copytraderMinLiquidityUsd < 0) {
+    problems.push('COPYTRADER_MIN_LIQUIDITY_USD must be >= 0');
   }
   if (c.backtest && c.backtest.to < c.backtest.from) {
     problems.push('BACKTEST_TO must be greater than or equal to BACKTEST_FROM');
