@@ -19,6 +19,7 @@ import { createLogger, errMeta } from '../logger';
 import type { ScanethConfig } from '../config';
 import type { ScanethNotifier } from './notifier';
 import { fetchTokenPairs, pickBestPair } from './dexscreener';
+import { getTokenRisk } from './token-risk';
 
 const log = createLogger('scaneth:copytrader');
 
@@ -191,6 +192,9 @@ export class CopyTrader {
     attempts: number;
     nextAt: number;
   }>();
+
+  /** Positions whose honeypot-trap warning was already logged (noise control). */
+  private readonly trappedAlerted = new Set<string>();
 
   constructor(
     private readonly config: ScanethConfig,
@@ -457,11 +461,16 @@ export class CopyTrader {
 
     const qty = Number(pos.balance) / Math.pow(10, pos.decimals);
     // Manual override ignores the liquidity floor (human decision) but still
-    // pays slippage, AMM impact and gas.
+    // pays slippage, sell tax, AMM impact and gas.
     const market = await this.getMarketSnapshot(key);
     const midProceedsUsd = qty * price;
+    const settled = await this.settleExitProceeds(key, midProceedsUsd, false);
+    if (settled === null) {
+      log.warn('manual exit blocked — token simulates as honeypot', { token: key });
+      return false;
+    }
     const impactFactor = this.exitImpactFactor(midProceedsUsd, market.liquidityUsd);
-    const proceedsUsd = midProceedsUsd * this.exitFillFactor() * impactFactor;
+    const proceedsUsd = settled * impactFactor;
     const gasPaid = this.takeGas();
     const pnlUsd = proceedsUsd - pos.costBasisUsd - gasPaid;
     const capitalBefore = this.paperEquity();
@@ -780,8 +789,12 @@ export class CopyTrader {
 
       const qty = Number(pos.balance) / Math.pow(10, pos.decimals);
       const midProceedsUsd = qty * price;
+      // Panic exit: stop-losses in a dump run hotter than base slippage, pay
+      // the sell tax, and cannot fill at all if the token is trapped.
+      const settled = await this.settleExitProceeds(key, midProceedsUsd, true);
+      if (settled === null) continue;
       const impactFactor = this.exitImpactFactor(midProceedsUsd, market.liquidityUsd);
-      const proceedsUsd = midProceedsUsd * this.exitFillFactor() * impactFactor;
+      const proceedsUsd = settled * impactFactor;
       const gasPaid = this.takeGas();
       const pnlUsd = proceedsUsd - pos.costBasisUsd - gasPaid;
       const capitalBefore = this.paperEquity();
@@ -865,8 +878,12 @@ export class CopyTrader {
 
       const qty = Number(pos.balance) / Math.pow(10, pos.decimals);
       const midProceedsUsd = qty * price;
+      // Calm take-profit exit: base slippage + sell tax; trap-blocked if
+      // the token simulates as a honeypot.
+      const settled = await this.settleExitProceeds(key, midProceedsUsd, false);
+      if (settled === null) continue;
       const impactFactor = this.exitImpactFactor(midProceedsUsd, market.liquidityUsd);
-      const proceedsUsd = midProceedsUsd * this.exitFillFactor() * impactFactor;
+      const proceedsUsd = settled * impactFactor;
       const gasPaid = this.takeGas();
       const pnlUsd = proceedsUsd - pos.costBasisUsd - gasPaid;
       const capitalBefore = this.paperEquity();
@@ -1128,8 +1145,41 @@ export class CopyTrader {
     return 1 + this.config.copytraderSlippagePct / 100;
   }
 
-  private exitFillFactor(): number {
-    return Math.max(0, 1 - this.config.copytraderSlippagePct / 100);
+  /** Deterministic pseudo-random 0..100 roll seeded by a string (replay-safe). */
+  private hashPct(seed: string): number {
+    let h = 2166136261 >>> 0;
+    for (let i = 0; i < seed.length; i++) {
+      h ^= seed.charCodeAt(i);
+      h = Math.imul(h, 16777619) >>> 0;
+    }
+    return (h % 10_000) / 100;
+  }
+
+  /**
+   * Realism on the way out. Returns null when the token currently simulates
+   * as a honeypot — real capital is trapped and cannot exit; the caller
+   * retries later. Otherwise returns proceeds after slippage (panic exits run
+   * hotter) and the token's simulated sell tax. Unknown risk fails open.
+   */
+  private async settleExitProceeds(token: string, midProceedsUsd: number, panic: boolean): Promise<number | null> {
+    const risk = await getTokenRisk(token);
+    if (risk.honeypot) {
+      if (!this.trappedAlerted.has(token)) {
+        this.trappedAlerted.add(token);
+        log.warn('exit BLOCKED — token simulates as honeypot (position trapped)', {
+          token,
+          midProceedsUsd: Number(midProceedsUsd.toFixed(2)),
+        });
+      }
+      return null;
+    }
+    this.trappedAlerted.delete(token);
+    const slippagePct = panic
+      ? this.config.copytraderPanicSlippagePct
+      : this.config.copytraderSlippagePct;
+    const slipFactor = Math.max(0, 1 - slippagePct / 100);
+    const taxFactor = risk.ok ? Math.max(0, 1 - risk.sellTaxPct / 100) : 1;
+    return midProceedsUsd * slipFactor * taxFactor;
   }
 
   /** Refresh current prices of open paper positions via DexScreener. */
@@ -1412,14 +1462,54 @@ export class CopyTrader {
     // observable at detection time — not the wallet's own earlier fill.
     const entryPriceUsd = market.priceUsd > 0 ? market.priceUsd : trade.tokenPriceUsd;
 
+    // Live-execution reality 1: not every real fill succeeds. Anti-bot
+    // launch windows, reverting buy taxes, and gas wars drop a share of
+    // entries. Deterministic per-tx roll so restarts replay identically.
+    const failRoll = this.hashPct(trade.txHash + ':fail');
+    if (failRoll < this.config.copytraderFillFailurePct) {
+      log.warn('paper buy DID NOT FILL (simulated execution failure)', {
+        token: trade.tokenSymbol,
+        wallet: trade.wallet,
+        failRoll: Number(failRoll.toFixed(2)),
+        txHash: trade.txHash,
+      });
+      return;
+    }
+
+    // Live-execution reality 2: tax/honeypot screening. Confirmed honeypots
+    // and unexitable tax levels are unbuyable with real capital. Unknown
+    // (V3 pools, API down) fails open — the liquidity gate still applies.
+    const risk = await getTokenRisk(key);
+    if (risk.honeypot || (risk.ok && risk.sellTaxPct > this.config.copytraderMaxSellTaxPct)) {
+      log.warn('paper buy skipped — fails executability screen', {
+        token: trade.tokenSymbol,
+        honeypot: risk.honeypot,
+        sellTaxPct: risk.sellTaxPct,
+        maxSellTaxPct: this.config.copytraderMaxSellTaxPct,
+        screened: risk.ok ? 'simulated' : 'honeypot-flag',
+      });
+      return;
+    }
+
+    // Live-execution reality 3: MEV. Copying a visible buy seconds later
+    // exposes us to sandwiches; deterministic per-tx roll.
+    const mevRoll = this.hashPct(trade.txHash + ':mev');
+    const mevCostPct = mevRoll < this.config.copytraderSandwichProbPct
+      ? this.config.copytraderSandwichCostPct
+      : 0;
+    const buyTaxPct = risk.ok ? risk.buyTaxPct : 0;
+
     // Update paper position. Every position lives on ONE decimal scale:
     // re-derive the token quantity in the position's stored scale instead of
     // the trade's freshly-resolved decimals, which can differ per transaction
     // and would otherwise corrupt the PNL math by 10^x.
     let pos = this.positions.get(key);
     const positionDecimals = pos ? pos.decimals : trade.tokenDecimals;
-    // Realistic entry: detection-time price plus slippage above market.
-    const tokenQty = buyAmountUsd / (entryPriceUsd * this.entryFillFactor());
+    // Realistic entry: detection-time price + slippage, then tokens received
+    // shrink by the simulated buy tax and any MEV sandwich cost.
+    const tokenQty =
+      (buyAmountUsd / (entryPriceUsd * this.entryFillFactor())) *
+      (1 - (buyTaxPct + mevCostPct) / 100);
     const tokenAmountBigInt = BigInt(Math.floor(tokenQty * Math.pow(10, positionDecimals)));
 
     if (tokenAmountBigInt <= 0n) {
@@ -1471,6 +1561,8 @@ export class CopyTrader {
       gasPaid,
       entryPriceUsd,
       walletFillPriceUsd: trade.tokenPriceUsd,
+      buyTaxPct,
+      mevCostPct,
       liquidityUsd: market.liquidityUsd,
       tokenAmount: tokenAmountBigInt.toString(),
     });
@@ -1538,11 +1630,18 @@ export class CopyTrader {
       return;
     }
 
-    // Realistic exit: slippage below market PLUS AMM price impact — the sell
-    // itself moves the price against us in proportion to pool depth.
+    // Realistic exit: slippage (panic-priced when this mirrors a reconciled
+    // dump the parser missed), simulated sell tax, honeypot trap-block, and
+    // AMM price impact proportional to pool depth.
     const midProceedsUsd = qtySold * sellPriceUsd;
+    const panic = trade.txHash === 'reconciled';
+    const settled = await this.settleExitProceeds(key, midProceedsUsd, panic);
+    if (settled === null) {
+      log.warn('paper sell deferred — trapped, retrying next cycle', { token: trade.tokenAddress });
+      return;
+    }
     const impactFactor = this.exitImpactFactor(midProceedsUsd, market.liquidityUsd);
-    const proceedsUsd = midProceedsUsd * this.exitFillFactor() * impactFactor;
+    const proceedsUsd = settled * impactFactor;
     const costBasisSold = qtySold * pos.avgEntryPriceUsd;
     const gasPaid = this.takeGas();
     const pnlUsd = proceedsUsd - costBasisSold - gasPaid;
@@ -1571,6 +1670,7 @@ export class CopyTrader {
       sellPct,
       proceedsUsd,
       gasPaid,
+      panicExit: panic,
       impactFactor: Number(impactFactor.toFixed(3)),
       pnlUsd,
     });

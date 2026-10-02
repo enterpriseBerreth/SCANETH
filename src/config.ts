@@ -97,6 +97,20 @@ export interface ScanethConfig {
    * could not fill them.
    */
   copytraderMinLiquidityUsd: number;
+  /**
+   * Simulated fill-failure rate (% of entries): anti-bot launch windows,
+   * reverting buy taxes and gas wars make some real fills impossible.
+   * Deterministic per-tx so restarts replay the same outcomes.
+   */
+  copytraderFillFailurePct: number;
+  /** Probability (% of entries) of being sandwiched by MEV bots. */
+  copytraderSandwichProbPct: number;
+  /** Extra entry cost (%) when a sandwich hits. */
+  copytraderSandwichCostPct: number;
+  /** Slippage (%) on panic exits (stop-loss, reconciled sells) — dumps run hot. */
+  copytraderPanicSlippagePct: number;
+  /** Skip entries whose simulated sell tax exceeds this %. */
+  copytraderMaxSellTaxPct: number;
   /** File path for persisted paper-account state. Empty string disables persistence. */
   copytraderStatePath: string;
   /** Shared secret for admin endpoints (/dump, /restore, /exit, /reset). */
@@ -138,6 +152,11 @@ export function loadConfig(): ScanethConfig {
     copytraderSlippagePct: num('COPYTRADER_SLIPPAGE_PCT', 2),
     copytraderGasFeeUsd: num('COPYTRADER_GAS_FEE_USD', 5),
     copytraderMinLiquidityUsd: num('COPYTRADER_MIN_LIQUIDITY_USD', 10_000),
+    copytraderFillFailurePct: num('COPYTRADER_FILL_FAILURE_PCT', 10),
+    copytraderSandwichProbPct: num('COPYTRADER_SANDWICH_PROB_PCT', 20),
+    copytraderSandwichCostPct: num('COPYTRADER_SANDWICH_COST_PCT', 2),
+    copytraderPanicSlippagePct: num('COPYTRADER_PANIC_SLIPPAGE_PCT', 5),
+    copytraderMaxSellTaxPct: num('COPYTRADER_MAX_SELL_TAX_PCT', 30),
     copytraderStatePath: optionalStr('COPYTRADER_STATE_PATH') ?? 'data/paper-state.json',
     copytraderAdminKey: optionalStr('COPYTRADER_ADMIN_KEY'),
     startBlock: optionalStr('START_BLOCK') ? num('START_BLOCK', 0) : undefined,
@@ -191,6 +210,19 @@ function validate(c: ScanethConfig): void {
   }
   if (c.copytraderMinLiquidityUsd < 0) {
     problems.push('COPYTRADER_MIN_LIQUIDITY_USD must be >= 0');
+  }
+  for (const [name, val] of [
+    ['COPYTRADER_FILL_FAILURE_PCT', c.copytraderFillFailurePct],
+    ['COPYTRADER_SANDWICH_PROB_PCT', c.copytraderSandwichProbPct],
+    ['COPYTRADER_SANDWICH_COST_PCT', c.copytraderSandwichCostPct],
+    ['COPYTRADER_PANIC_SLIPPAGE_PCT', c.copytraderPanicSlippagePct],
+  ] as const) {
+    if (val < 0 || val > 100) {
+      problems.push(`${name} must be 0-100`);
+    }
+  }
+  if (c.copytraderMaxSellTaxPct < 0 || c.copytraderMaxSellTaxPct > 95) {
+    problems.push('COPYTRADER_MAX_SELL_TAX_PCT must be 0-95');
   }
   if (c.backtest && c.backtest.to < c.backtest.from) {
     problems.push('BACKTEST_TO must be greater than or equal to BACKTEST_FROM');
