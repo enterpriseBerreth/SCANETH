@@ -387,7 +387,7 @@ export class WalletScout {
     return { added, removed };
   }
 
-  /** Worst watched wallet with at least some observed history. */
+  /** Worst watched wallet with at least some observed history (owner wallets exempt). */
   private worstWallet(
     perf: Map<string, { realizedPnlUsd: number; unrealizedPnlUsd: number; trades: number }>,
     exclude: Set<string>,
@@ -396,6 +396,7 @@ export class WalletScout {
     let worstTotal = 0;
     for (const [wallet, p] of perf) {
       if (exclude.has(wallet) || p.trades < 3) continue; // need history before judging
+      if (this.copytrader.isUserWallet(wallet)) continue; // owner-added: never prune
       const total = p.realizedPnlUsd + p.unrealizedPnlUsd;
       if (worst === null || total < worstTotal) {
         worst = wallet;

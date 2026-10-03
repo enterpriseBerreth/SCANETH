@@ -154,6 +154,8 @@ export interface CopyTraderStats {
 
 export class CopyTrader {
   private readonly watchedWallets = new Set<string>();
+  /** Owner-configured wallets — protected from scout removal, forever. */
+  private readonly userWallets = new Set<string>();
   private readonly walletBalances = new Map<string, Map<string, bigint>>(); // wallet -> token -> balance
   private readonly walletPortfolios = new Map<string, Map<string, WalletPosition>>(); // wallet -> token -> position
   private readonly walletDailyStats = new Map<string, Map<string, WalletDailyStats>>(); // wallet -> day -> stats
@@ -202,7 +204,11 @@ export class CopyTrader {
     private readonly notifier: ScanethNotifier,
   ) {
     for (const w of config.copytraderWatchedWallets) {
-      this.watchedWallets.add(w.toLowerCase());
+      const key = w.toLowerCase();
+      this.watchedWallets.add(key);
+      // Env-configured wallets are hand-picked by the owner: the scout may
+      // promote/demote their clip size but never remove them.
+      this.userWallets.add(key);
     }
     this.cashUsd = config.copytraderStartingBudgetUsd;
   }
@@ -1355,10 +1361,19 @@ export class CopyTrader {
     return true;
   }
 
-  /** Remove a wallet from the watched set (scout engine). */
+  /** Owner-configured wallet (never removable by the scout). */
+  isUserWallet(wallet: string): boolean {
+    return this.userWallets.has(wallet.toLowerCase());
+  }
+
+  /** Remove a wallet from the watched set (scout engine). Owner wallets are protected. */
   removeWatchedWallet(wallet: string): boolean {
     const key = wallet.toLowerCase();
     if (!this.watchedWallets.has(key)) return false;
+    if (this.userWallets.has(key)) {
+      log.warn('scout removal blocked — owner-configured wallet', { wallet: key });
+      return false;
+    }
     this.watchedWallets.delete(key);
     this.premiumWallets.delete(key);
     log.info('scout removed wallet', { wallet: key });
