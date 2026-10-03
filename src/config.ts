@@ -111,6 +111,14 @@ export interface ScanethConfig {
   copytraderPanicSlippagePct: number;
   /** Skip entries whose simulated sell tax exceeds this %. */
   copytraderMaxSellTaxPct: number;
+  /** Scout lookback window (days) for candidate evaluation. */
+  copytraderScoutWindowDays: number;
+  /** Scout: candidate must have traded on at least this many distinct days in the window. */
+  copytraderScoutMinActiveDays: number;
+  /** Scout: candidate must have completed at least this many round trips in the window. */
+  copytraderScoutMinRoundTrips: number;
+  /** Scout: candidate aggregate PNL% over the window must be at least this. */
+  copytraderScoutMinPnlPct: number;
   /** File path for persisted paper-account state. Empty string disables persistence. */
   copytraderStatePath: string;
   /** Shared secret for admin endpoints (/dump, /restore, /exit, /reset). */
@@ -157,6 +165,10 @@ export function loadConfig(): ScanethConfig {
     copytraderSandwichCostPct: num('COPYTRADER_SANDWICH_COST_PCT', 2),
     copytraderPanicSlippagePct: num('COPYTRADER_PANIC_SLIPPAGE_PCT', 5),
     copytraderMaxSellTaxPct: num('COPYTRADER_MAX_SELL_TAX_PCT', 30),
+    copytraderScoutWindowDays: num('COPYTRADER_SCOUT_WINDOW_DAYS', 5),
+    copytraderScoutMinActiveDays: num('COPYTRADER_SCOUT_MIN_ACTIVE_DAYS', 3),
+    copytraderScoutMinRoundTrips: num('COPYTRADER_SCOUT_MIN_ROUND_TRIPS', 5),
+    copytraderScoutMinPnlPct: num('COPYTRADER_SCOUT_MIN_PNL_PCT', 20),
     copytraderStatePath: optionalStr('COPYTRADER_STATE_PATH') ?? 'data/paper-state.json',
     copytraderAdminKey: optionalStr('COPYTRADER_ADMIN_KEY'),
     startBlock: optionalStr('START_BLOCK') ? num('START_BLOCK', 0) : undefined,
@@ -223,6 +235,15 @@ function validate(c: ScanethConfig): void {
   }
   if (c.copytraderMaxSellTaxPct < 0 || c.copytraderMaxSellTaxPct > 95) {
     problems.push('COPYTRADER_MAX_SELL_TAX_PCT must be 0-95');
+  }
+  if (c.copytraderScoutWindowDays < 1 || c.copytraderScoutWindowDays > 30) {
+    problems.push('COPYTRADER_SCOUT_WINDOW_DAYS must be 1-30');
+  }
+  if (c.copytraderScoutMinActiveDays < 1 || c.copytraderScoutMinActiveDays > c.copytraderScoutWindowDays) {
+    problems.push('COPYTRADER_SCOUT_MIN_ACTIVE_DAYS must be 1..WINDOW_DAYS');
+  }
+  if (c.copytraderScoutMinRoundTrips < 1) {
+    problems.push('COPYTRADER_SCOUT_MIN_ROUND_TRIPS must be >= 1');
   }
   if (c.backtest && c.backtest.to < c.backtest.from) {
     problems.push('BACKTEST_TO must be greater than or equal to BACKTEST_FROM');

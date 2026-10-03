@@ -17,6 +17,8 @@ interface CandidateScore {
   wallet: string;
   pnlPct: number;
   roundTrips: number;
+  /** Distinct days with real trades inside the lookback window. */
+  activeDays: number;
 }
 
 export interface ScoutStats {
@@ -108,25 +110,30 @@ export class WalletScout {
   }
 
   /**
-   * Daily clip-tier tuning. New wallets are copied at the default $20 clip
-   * until they prove themselves on-chain: at least 3 completed round trips
-   * with positive aggregate PNL earns promotion to $100 clips. A premium
-   * wallet whose recent round trips turn negative is demoted back to $20.
+   * Daily clip-tier tuning. Promotion uses the SAME bar as admission: the
+   * wallet must be consistently active and highly profitable inside the
+   * 5-day window. A premium wallet whose recent round trips turn negative
+   * is demoted back to $20.
    */
   private async tuneTiers(): Promise<{ promoted: string[]; demoted: string[] }> {
     const promoted: string[] = [];
     const demoted: string[] = [];
+    const minTrips = this.config.copytraderScoutMinRoundTrips;
+    const minDays = this.config.copytraderScoutMinActiveDays;
+    const minPnl = this.config.copytraderScoutMinPnlPct;
 
     for (const wallet of this.copytrader.getWalletPerformance().keys()) {
       const score = await this.evaluateCandidate(wallet);
-      if (!score || score.roundTrips < 3) continue;
+      if (!score) continue;
 
-      if (!this.copytrader.isPremiumWallet(wallet) && score.pnlPct > 0) {
-        if (this.copytrader.promoteWallet(wallet)) {
-          promoted.push(wallet);
-          log.info('scout promoted wallet', { wallet, pnlPct: score.pnlPct, roundTrips: score.roundTrips });
+      if (!this.copytrader.isPremiumWallet(wallet)) {
+        if (score.roundTrips >= minTrips && score.activeDays >= minDays && score.pnlPct >= minPnl) {
+          if (this.copytrader.promoteWallet(wallet)) {
+            promoted.push(wallet);
+            log.info('scout promoted wallet', { wallet, pnlPct: score.pnlPct, roundTrips: score.roundTrips });
+          }
         }
-      } else if (this.copytrader.isPremiumWallet(wallet) && score.pnlPct < 0) {
+      } else if (score.roundTrips > 0 && score.pnlPct < 0) {
         if (this.copytrader.demoteWallet(wallet)) {
           demoted.push(wallet);
           log.info('scout demoted wallet', { wallet, pnlPct: score.pnlPct, roundTrips: score.roundTrips });
@@ -176,19 +183,26 @@ export class WalletScout {
     // Most active traders on hot tokens, excluding contracts.
     const ranked = [...traderCounts.entries()].sort((a, b) => b[1] - a[1]).map(([w]) => w);
     const evaluated: CandidateScore[] = [];
+    const minTrips = this.config.copytraderScoutMinRoundTrips;
+    const minDays = this.config.copytraderScoutMinActiveDays;
+    const minPnl = this.config.copytraderScoutMinPnlPct;
+
     for (const wallet of ranked) {
       if (evaluated.length >= 20) break;
       const code = await this.provider.getCode(wallet);
       if (code !== '0x') continue;
 
       const score = await this.evaluateCandidate(wallet);
-      if (score && score.roundTrips >= 3 && score.pnlPct > 0) {
+      if (score && score.roundTrips >= minTrips && score.activeDays >= minDays && score.pnlPct >= minPnl) {
         evaluated.push({ wallet, ...score });
       }
     }
 
     evaluated.sort((a, b) => b.pnlPct - a.pnlPct);
-    log.info('scout evaluated candidates', { count: evaluated.length });
+    log.info('scout evaluated candidates', {
+      count: evaluated.length,
+      bar: { minTrips, minDays, minPnl, windowDays: this.config.copytraderScoutWindowDays },
+    });
     return evaluated;
   }
 
@@ -216,28 +230,59 @@ export class WalletScout {
   }
 
   /**
-   * Evaluate a candidate wallet from its recent completed round trips:
-   * for each token it bought AND sold recently, compare ETH spent vs ETH
-   * received. Returns aggregate PNL% over completed trips.
+   * Evaluate a candidate wallet inside the lookback window (default 5 days):
+   * only in-window, wallet-sent, non-approve transactions count. Returns the
+   * number of distinct active days, completed round trips, and aggregate
+   * PNL% over those trips. Wallets must be consistently active AND
+   * profitable across the window to qualify.
    */
-  private async evaluateCandidate(wallet: string): Promise<{ pnlPct: number; roundTrips: number } | null> {
+  private async evaluateCandidate(
+    wallet: string,
+  ): Promise<{ pnlPct: number; roundTrips: number; activeDays: number } | null> {
     const wl = wallet.toLowerCase();
+    const windowStart = Date.now() - this.config.copytraderScoutWindowDays * 86_400_000;
     try {
-      const r = await fetch(`${BLOCKSCOUT}/addresses/${wallet}/transactions`, { headers: { accept: 'application/json' } });
-      if (!r.ok) return null;
-      const j = (await r.json()) as { items?: { hash: string; from?: { hash?: string }; method?: string; raw_input?: string; value?: string }[] };
-      const items = j.items ?? [];
+      // Pass 1: page through recent outgoing txs until we cover the window.
+      const inWindow: { hash: string; value: string; day: string }[] = [];
+      let url: string | null = `${BLOCKSCOUT}/addresses/${wallet}/transactions`;
+      for (let page = 0; page < 6 && url; page++) {
+        const r = await fetch(url, { headers: { accept: 'application/json' } });
+        if (!r.ok) break;
+        const j = (await r.json()) as {
+          items?: { hash: string; from?: { hash?: string }; timestamp?: string; value?: string; method?: string; raw_input?: string }[];
+          next_page_params?: Record<string, unknown> | null;
+        };
+        let oldest = Infinity;
+        for (const tx of j.items ?? []) {
+          const ts = tx.timestamp ? new Date(tx.timestamp).getTime() : 0;
+          if (ts) oldest = Math.min(oldest, ts);
+          if (ts < windowStart) continue; // outside the lookback window
+          if ((tx.from?.hash ?? '').toLowerCase() !== wl) continue;
+          // Approvals are housekeeping, not trading activity.
+          if ((tx.method ?? '') === 'approve' || (tx.raw_input ?? '').startsWith(APPROVE_SELECTOR)) continue;
+          const day = new Date(ts).toISOString().slice(0, 10);
+          inWindow.push({ hash: tx.hash, value: tx.value ?? '0', day });
+        }
+        if (oldest < windowStart || !j.next_page_params) break;
+        const qs = new URLSearchParams(
+          Object.entries(j.next_page_params).map(([k, v]) => [k, String(v)] as [string, string]),
+        ).toString();
+        url = `${BLOCKSCOUT}/addresses/${wallet}/transactions?${qs}`;
+        await new Promise((r2) => setTimeout(r2, 250));
+      }
 
+      // Consistency gate: real trading days inside the window.
+      const activeDays = new Set(inWindow.map((t) => t.day)).size;
+
+      // Pass 2: classify the in-window txs into buys/sells via receipts.
       const ethSpent = new Map<string, number>();
       const ethReceived = new Map<string, number>();
 
       let checked = 0;
-      for (const tx of items) {
-        if (checked >= 40) break;
-        if ((tx.from?.hash ?? '').toLowerCase() !== wl) continue;
-        if ((tx.method ?? '') === 'approve' || (tx.raw_input ?? '').startsWith(APPROVE_SELECTOR)) continue;
-        const valueEth = Number(BigInt(tx.value ?? '0')) / 1e18;
+      for (const tx of inWindow) {
+        if (checked >= 50) break;
         checked++;
+        const valueEth = Number(BigInt(tx.value)) / 1e18;
 
         const receipt = await this.provider.getTransactionReceipt(tx.hash);
         if (!receipt || receipt.status !== 1) continue;
@@ -307,7 +352,7 @@ export class WalletScout {
       }
 
       if (roundTrips === 0 || totalSpent <= 0) return null;
-      return { pnlPct: ((totalReceived - totalSpent) / totalSpent) * 100, roundTrips };
+      return { pnlPct: ((totalReceived - totalSpent) / totalSpent) * 100, roundTrips, activeDays };
     } catch (err) {
       log.debug('candidate evaluation failed', { wallet, ...errMeta(err) });
       return null;
@@ -366,7 +411,7 @@ export class WalletScout {
   ): Promise<void> {
     const lines: string[] = ['<b>SCANETH — Scout roster update</b>', ''];
     if (changes.added.length > 0) {
-      lines.push('<b>Added (profitable on hot ETH tokens — copied at $20 until proven):</b>');
+      lines.push('<b>Added (consistent + highly profitable over the 5-day window — copied at $20 until proven):</b>');
       for (const w of changes.added) lines.push(`<code>${w}</code>`);
       lines.push('');
     }
