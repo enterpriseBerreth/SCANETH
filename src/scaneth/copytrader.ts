@@ -376,10 +376,14 @@ export class CopyTrader {
     this.cashUsd = state.cashUsd;
     this.cumulativeRealizedUsd = Number.isFinite(state.cumulativeRealizedUsd) ? state.cumulativeRealizedUsd : 0;
     this.tradeCount = Number.isFinite(state.tradeCount) ? state.tradeCount : 0;
-    if (Array.isArray(state.premiumWallets) && state.premiumWallets.length > 0) {
-      this.premiumWallets.clear();
+    // Restore scout-managed tiers from the persisted set, but always
+    // re-assert the owner-designated premium wallets above whatever the
+    // file says — persisted drift must never shrink owner clips.
+    this.premiumWallets.clear();
+    if (Array.isArray(state.premiumWallets)) {
       for (const w of state.premiumWallets) this.premiumWallets.add(w.toLowerCase());
     }
+    for (const w of PREMIUM_WALLETS) this.premiumWallets.add(w);
     this.positions.clear();
     for (const p of state.positions ?? []) {
       const token = p.tokenAddress?.toLowerCase();
@@ -1397,6 +1401,12 @@ export class CopyTrader {
   /** Demote a degrading wallet back to $20 clips. Returns false if not premium. */
   demoteWallet(wallet: string): boolean {
     const key = wallet.toLowerCase();
+    // Owner-designated premium wallets are demoted only by owner decision,
+    // never automatically by the scout.
+    if (this.userWallets.has(key)) {
+      log.warn('scout demotion blocked — owner-configured premium wallet', { wallet: key });
+      return false;
+    }
     if (!this.premiumWallets.delete(key)) return false;
     log.info('wallet demoted to default clips', { wallet: key });
     return true;
