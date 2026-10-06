@@ -32,8 +32,8 @@ class ScanethBot {
   private httpServer?: Server;
   private stopping = false;
   private pollTimer?: NodeJS.Timeout;
-  /** Blocks already processed (by either WS stream or poll loop) — dedup guard. */
-  private readonly processedBlocks = new Set<number>();
+  private polling = false;
+  private lastProcessedBlock = 0;
 
   constructor(private readonly config: ScanethConfig) {
     this.notifier = new ScanethNotifier(config);
@@ -43,12 +43,29 @@ class ScanethBot {
     this.banner();
 
     this.providers = createProviders(this.config.rpcUrl, this.config.wsUrl);
-    this.scanner = new BlockScanner(this.providers.http, {
-      probeEth: this.config.probeEth,
-      maxTaxBps: this.config.maxTaxBps,
-      maxTopHolderPct: this.config.maxTopHolderPct,
-    });
     this.copytrader = new CopyTrader(this.config, this.providers.http, this.notifier);
+
+    const network = await this.providers.http.getNetwork();
+    log.info('connected', { chainId: network.chainId, name: network.name });
+
+    if (this.config.copytraderEnabled) {
+      await this.copytrader.start();
+      this.walletScout = new WalletScout(this.config, this.providers.http, this.notifier, this.copytrader);
+      this.walletScout.start();
+    }
+
+    if (this.config.backtest) {
+      this.scanner = new BlockScanner(this.providers.http, {
+        probeEth: this.config.probeEth,
+        maxTaxBps: this.config.maxTaxBps,
+        maxTopHolderPct: this.config.maxTopHolderPct,
+      });
+      log.info('backtest mode', { from: this.config.backtest.from, to: this.config.backtest.to });
+      const result = await this.scanner.scanRange(this.config.backtest.from, this.config.backtest.to);
+      await this.handleResult(result);
+      await this.shutdown();
+      return;
+    }
 
     this.httpServer = startServer({
       config: this.config,
@@ -60,36 +77,16 @@ class ScanethBot {
       positions: () => this.copytrader?.getOpenPositions() ?? [],
     });
 
-    const network = await this.providers.http.getNetwork();
-    log.info('connected', { chainId: network.chainId, name: network.name });
-
-    if (this.config.copytraderEnabled) {
-      this.copytrader.start();
-      this.walletScout = new WalletScout(this.config, this.providers.http, this.notifier, this.copytrader);
-      this.walletScout.start();
-    }
-
-    if (this.config.backtest) {
-      log.info('backtest mode', { from: this.config.backtest.from, to: this.config.backtest.to });
-      const result = await this.scanner.scanRange(this.config.backtest.from, this.config.backtest.to);
-      await this.handleResult(result);
-      await this.shutdown();
-      return;
-    }
-
     const startBlock = this.config.startBlock ?? (await this.providers.http.getBlockNumber());
-    log.info('starting scanner', { startBlock, ws: !!this.config.wsUrl });
+    this.lastProcessedBlock = startBlock - 1;
+    log.info('starting copywallet monitor', { startBlock, ws: !!this.config.wsUrl });
 
     if (this.config.wsUrl && this.providers.main.on) {
       this.providers.main.on('block', (blockNumber: number) => {
-        if (this.stopping) return;
-        void this.processBlock(blockNumber);
+        if (!this.stopping) void this.processThrough(blockNumber);
       });
     }
-    // Poll loop always runs as a safety net: it catches blocks missed during
-    // WebSocket drops (ethers auto-reconnects, but events can be lost) and
-    // corrects any lag. processBlock dedups, so overlap is harmless.
-    this.schedulePoll(startBlock);
+    this.schedulePoll();
   }
 
   private banner(): void {
@@ -105,58 +102,47 @@ class ScanethBot {
       copytrader: this.config.copytraderEnabled ? 'enabled' : 'disabled',
       telegram: this.notifier.isEnabled ? 'enabled' : 'disabled',
     });
-    log.info('research-only scanner — no transactions are ever sent');
+    log.info('paper-only copywallet monitor — no transactions are sent');
   }
 
-  private schedulePoll(expectedBlock: number): void {
+  private schedulePoll(): void {
     if (this.stopping) return;
     this.pollTimer = setTimeout(async () => {
-      let next = expectedBlock + 1;
       try {
         const latest = await this.providers!.http.getBlockNumber();
-        // If we've fallen too far behind, jump to the chain head. Grinding
-        // through old blocks is both slow and rejected by free RPCs (archive
-        // gating), which would leave the scanner permanently stuck.
-        const lag = latest - expectedBlock;
-        if (lag > 15) {
-          log.warn('scanner too far behind — jumping to chain head', {
-            expectedBlock,
-            latest,
-            skipped: lag,
-          });
-          next = latest;
-        } else {
-          const end = Math.min(latest, expectedBlock + 30);
-          for (let b = expectedBlock; b <= end; b++) {
-            if (this.stopping) return;
-            await this.processBlock(b);
-          }
-          next = end + 1;
-        }
+        await this.processThrough(latest);
       } catch (err) {
         log.error('poll failed', errMeta(err));
       }
-      this.schedulePoll(next);
+      this.schedulePoll();
     }, this.config.pollIntervalMs);
   }
 
-  private async processBlock(blockNumber: number): Promise<void> {
-    if (!this.scanner) return;
-    if (this.processedBlocks.has(blockNumber)) return;
-    this.processedBlocks.add(blockNumber);
-    // Keep the dedup set bounded: a 12s block cadence means ~7,200 entries/day.
-    if (this.processedBlocks.size > 2_000) {
-      const excess = this.processedBlocks.size - 1_000;
-      let removed = 0;
-      for (const b of this.processedBlocks) {
-        this.processedBlocks.delete(b);
-        if (++removed >= excess) break;
+  private async processThrough(latest: number): Promise<void> {
+    if (this.polling || this.stopping) return;
+    this.polling = true;
+    try {
+      if (latest - this.lastProcessedBlock > 15) {
+        log.warn('copywallet monitor lag exceeds 15 blocks — catching up', {
+          nextBlock: this.lastProcessedBlock + 1,
+          latest,
+        });
       }
-    }
-    const result = await this.scanner.processBlock(blockNumber);
-    await this.handleResult(result);
-    if (this.copytrader) {
-      await this.copytrader.processBlock(blockNumber);
+      for (let blockNumber = this.lastProcessedBlock + 1; blockNumber <= latest; blockNumber++) {
+        if (this.stopping) break;
+        if (this.config.copytraderEnabled && !(await this.copytrader!.processBlock(blockNumber))) {
+          this.state.lastError = `copywallet block ${blockNumber} could not be processed; retrying`;
+          break;
+        }
+        this.lastProcessedBlock = blockNumber;
+        this.state.lastError = undefined;
+        this.state.recordBlock(blockNumber);
+      }
+    } catch (err) {
+      this.state.lastError = err instanceof Error ? err.message : String(err);
+      log.error('copywallet monitor failed', errMeta(err));
+    } finally {
+      this.polling = false;
     }
   }
 
@@ -179,6 +165,7 @@ class ScanethBot {
     this.scanner?.stop();
     this.copytrader?.stop();
     this.walletScout?.stop();
+    await this.copytrader?.persistState();
 
     if (this.providers) {
       destroyProviders(this.providers);
@@ -218,4 +205,7 @@ async function main(): Promise<void> {
   await bot.start();
 }
 
-void main();
+void main().catch((err) => {
+  log.error('startup failed', errMeta(err));
+  process.exit(1);
+});

@@ -38,6 +38,12 @@ export class BotState {
     this.lastBlockAt = stats.lastBlockAt;
   }
 
+  recordBlock(blockNumber: number): void {
+    this.blocksProcessed += 1;
+    this.lastBlockNumber = blockNumber;
+    this.lastBlockAt = Date.now();
+  }
+
   recordLaunch(launch: TokenLaunch): void {
     this.recentLaunches.unshift(launch);
     if (this.recentLaunches.length > MAX_LOG) this.recentLaunches.pop();

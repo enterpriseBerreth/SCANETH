@@ -96,6 +96,7 @@ export class WalletScout {
       this.lastRunAt = Date.now();
       this.lastRunAdded = changes.added;
       this.lastRunRemoved = changes.removed;
+      await this.copytrader.persistState();
       if (changes.added.length > 0 || changes.removed.length > 0 || tiers.promoted.length > 0 || tiers.demoted.length > 0) {
         this.totalAdded += changes.added.length;
         this.totalRemoved += changes.removed.length;
@@ -271,10 +272,8 @@ export class WalletScout {
         await new Promise((r2) => setTimeout(r2, 250));
       }
 
-      // Consistency gate: real trading days inside the window.
-      const activeDays = new Set(inWindow.map((t) => t.day)).size;
+      const activeDays = new Set<string>();
 
-      // Pass 2: classify the in-window txs into buys/sells via receipts.
       const ethSpent = new Map<string, number>();
       const ethReceived = new Map<string, number>();
 
@@ -325,6 +324,7 @@ export class WalletScout {
           if (tokensOut.has(token)) continue; // token->token swap, skip
           const paid = ethOut + Number(wethFromWallet) / 1e18;
           if (paid >= MIN_TX_VALUE_ETH) {
+            activeDays.add(tx.day);
             ethSpent.set(token, (ethSpent.get(token) ?? 0) + paid);
           }
         }
@@ -334,6 +334,7 @@ export class WalletScout {
           if (tokensIn.has(token)) continue;
           const got = Number(wethToWallet) / 1e18 + Number(unwrapped) / 1e18;
           if (got >= MIN_TX_VALUE_ETH) {
+            activeDays.add(tx.day);
             ethReceived.set(token, (ethReceived.get(token) ?? 0) + got);
           }
         }
@@ -352,7 +353,7 @@ export class WalletScout {
       }
 
       if (roundTrips === 0 || totalSpent <= 0) return null;
-      return { pnlPct: ((totalReceived - totalSpent) / totalSpent) * 100, roundTrips, activeDays };
+      return { pnlPct: ((totalReceived - totalSpent) / totalSpent) * 100, roundTrips, activeDays: activeDays.size };
     } catch (err) {
       log.debug('candidate evaluation failed', { wallet, ...errMeta(err) });
       return null;

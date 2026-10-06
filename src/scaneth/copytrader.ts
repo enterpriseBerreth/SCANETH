@@ -12,7 +12,7 @@
  * No real transactions are sent. This is a simulation layer only.
  */
 
-import { mkdir, readFile, writeFile } from 'node:fs/promises';
+import { mkdir, readFile, rename, writeFile } from 'node:fs/promises';
 import { dirname } from 'node:path';
 import { Contract, type Provider, type TransactionReceipt, type TransactionResponse } from 'ethers';
 import { createLogger, errMeta } from '../logger';
@@ -76,6 +76,15 @@ export interface PersistedState {
   tradeCount: number;
   premiumWallets: string[];
   positions: PersistedPosition[];
+  scoutWallets?: string[];
+  shadowStats?: ShadowWalletStats[];
+  walletBalances?: Record<string, Record<string, string>>;
+  walletPortfolios?: Record<string, Record<string, { balance: string; costBasisUsd: number; avgEntryPriceUsd: number; decimals: number }>>;
+  walletDailyStats?: Record<string, Record<string, WalletDailyStats>>;
+  walletTradeCounts?: Record<string, number>;
+  pendingBuys?: Array<{ wallet: string; tokenAddress: string; tokenAmount: string; ethAmount: string; ts: number; txHash: string; blockNumber: number; attempts: number; nextAt: number }>;
+  dayStartEquityUsd?: number;
+  dayStartMstDay?: string;
 }
 
 export interface PaperPosition {
@@ -184,6 +193,9 @@ export class CopyTrader {
   private ethUsdPrice = 0;
   private priceTimer?: NodeJS.Timeout;
   private reportTimer?: NodeJS.Timeout;
+  private persistQueue: Promise<void> = Promise.resolve();
+  private dayStartEquityUsd: number;
+  private dayStartMstDay = currentMstDay();
   private running = false;
   /**
    * Wallets copied at the premium $100 clip. Seeded with the proven
@@ -235,6 +247,7 @@ export class CopyTrader {
       }
     }
     this.cashUsd = config.copytraderStartingBudgetUsd;
+    this.dayStartEquityUsd = this.cashUsd;
   }
 
   /** Open paper positions with full marking detail (for /positions). */
@@ -308,16 +321,16 @@ export class CopyTrader {
     };
   }
 
-  start(): void {
+  async start(): Promise<void> {
     if (this.running) return;
+    await this.restoreOrInit();
     this.running = true;
     log.info('paper copytrader started', {
       watchedWallets: this.watchedWallets.size,
       buyAmountUsd: this.config.copytraderBuyAmountUsd,
     });
-    void this.restoreOrInit();
     void this.refreshEthPrice();
-    this.scheduleDailyWalletReport();
+    if (this.config.dailyReportEnabled) this.scheduleDailyWalletReport();
   }
 
   /**
@@ -328,22 +341,21 @@ export class CopyTrader {
   private async restoreOrInit(): Promise<void> {
     const path = this.config.copytraderStatePath;
     if (!path) return;
+    let raw: string;
     try {
-      const raw = await readFile(path, 'utf8');
-      const state = JSON.parse(raw) as PersistedState;
-      await this.restoreState(state);
-      log.info('paper state restored from disk', {
-        path,
-        positions: this.positions.size,
-        cashUsd: Number(this.cashUsd.toFixed(2)),
-      });
+      raw = await readFile(path, 'utf8');
     } catch (err) {
-      const code = (err as NodeJS.ErrnoException)?.code;
-      if (code !== 'ENOENT') {
-        log.warn('paper state load failed — starting fresh', { path, ...errMeta(err) });
-      }
+      if ((err as NodeJS.ErrnoException)?.code !== 'ENOENT') throw err;
       await this.persistState();
+      return;
     }
+    const state = JSON.parse(raw) as PersistedState;
+    await this.restoreState(state);
+    log.info('paper state restored from disk', {
+      path,
+      positions: this.positions.size,
+      cashUsd: Number(this.cashUsd.toFixed(2)),
+    });
   }
 
   stop(): void {
@@ -375,6 +387,22 @@ export class CopyTrader {
         updatedAt: pos.updatedAt,
         contributors: [...pos.contributors],
       })),
+      scoutWallets: [...this.watchedWallets].filter((wallet) => !this.userWallets.has(wallet)),
+      shadowStats: [...this.shadowStats.values()],
+      walletBalances: Object.fromEntries([...this.walletBalances].map(([wallet, balances]) =>
+        [wallet, Object.fromEntries([...balances].map(([token, balance]) => [token, balance.toString()]))])),
+      walletPortfolios: Object.fromEntries([...this.walletPortfolios].map(([wallet, positions]) =>
+        [wallet, Object.fromEntries([...positions].map(([token, pos]) => [token, {
+          ...pos, balance: pos.balance.toString(),
+        }]))])),
+      walletDailyStats: Object.fromEntries([...this.walletDailyStats].map(([wallet, days]) =>
+        [wallet, Object.fromEntries(days)])),
+      walletTradeCounts: Object.fromEntries(this.walletTradeCounts),
+      pendingBuys: [...this.pendingBuys.values()].map((item) => ({
+        ...item, tokenAmount: item.tokenAmount.toString(), ethAmount: item.ethAmount.toString(),
+      })),
+      dayStartEquityUsd: this.dayStartEquityUsd,
+      dayStartMstDay: this.dayStartMstDay,
     };
   }
 
@@ -382,12 +410,18 @@ export class CopyTrader {
   async persistState(): Promise<void> {
     const path = this.config.copytraderStatePath;
     if (!path) return;
-    try {
-      await mkdir(dirname(path), { recursive: true });
-      await writeFile(path, JSON.stringify(this.serializeState(), null, 2));
-    } catch (err) {
-      log.warn('paper state persist failed', { path, ...errMeta(err) });
-    }
+    const snapshot = JSON.stringify(this.serializeState(), null, 2);
+    this.persistQueue = this.persistQueue.then(async () => {
+      const temporaryPath = `${path}.${process.pid}.tmp`;
+      try {
+        await mkdir(dirname(path), { recursive: true });
+        await writeFile(temporaryPath, snapshot);
+        await rename(temporaryPath, path);
+      } catch (err) {
+        log.warn('paper state persist failed', { path, ...errMeta(err) });
+      }
+    });
+    await this.persistQueue;
   }
 
   /** Apply a serialized paper account (from disk or a POST /restore payload). */
@@ -397,6 +431,12 @@ export class CopyTrader {
     }
     if (!Number.isFinite(state.cashUsd) || state.cashUsd < 0) {
       throw new Error('invalid cashUsd in paper state payload');
+    }
+    if (!Array.isArray(state.positions) || state.positions.some((pos) =>
+      !/^0x[0-9a-fA-F]{40}$/.test(pos.tokenAddress ?? '') ||
+      !Number.isFinite(pos.costBasisUsd) || pos.costBasisUsd < 0 ||
+      !/^\d+$/.test(pos.balance ?? ''))) {
+      throw new Error('invalid positions in paper state payload');
     }
     this.cashUsd = state.cashUsd;
     this.cumulativeRealizedUsd = Number.isFinite(state.cumulativeRealizedUsd) ? state.cumulativeRealizedUsd : 0;
@@ -415,6 +455,20 @@ export class CopyTrader {
     for (const w of this.userWallets) {
       if (!PREMIUM_WALLETS.has(w)) this.premiumWallets.delete(w);
     }
+    this.watchedWallets.clear();
+    for (const wallet of this.userWallets) this.watchedWallets.add(wallet);
+    for (const wallet of state.scoutWallets ?? []) {
+      const key = wallet.toLowerCase();
+      if (/^0x[0-9a-f]{40}$/.test(key) && !this.shadowWallets.has(key)) this.watchedWallets.add(key);
+    }
+    for (const stats of state.shadowStats ?? []) {
+      const key = stats.wallet?.toLowerCase();
+      if (key && this.shadowWallets.has(key)) this.shadowStats.set(key, { ...stats, wallet: key });
+    }
+    this.walletBalances.clear();
+    this.walletPortfolios.clear();
+    this.walletDailyStats.clear();
+    this.walletTradeCounts.clear();
     this.positions.clear();
     for (const p of state.positions ?? []) {
       const token = p.tokenAddress?.toLowerCase();
@@ -447,8 +501,32 @@ export class CopyTrader {
         contributors: new Set((p.contributors ?? []).map((w) => w.toLowerCase())),
       };
       this.positions.set(token, pos);
-      await this.seedWalletTrackingFromChain(token, pos);
+      if (!state.walletBalances) await this.seedWalletTrackingFromChain(token, pos);
     }
+    for (const [wallet, balances] of Object.entries(state.walletBalances ?? {})) {
+      if (!this.watchedWallets.has(wallet)) continue;
+      this.walletBalances.set(wallet, new Map(Object.entries(balances).map(([token, balance]) => [token, BigInt(balance)])));
+    }
+    for (const [wallet, positions] of Object.entries(state.walletPortfolios ?? {})) {
+      if (!this.watchedWallets.has(wallet)) continue;
+      this.walletPortfolios.set(wallet, new Map(Object.entries(positions).map(([token, pos]) =>
+        [token, { ...pos, balance: BigInt(pos.balance) }])));
+    }
+    for (const [wallet, days] of Object.entries(state.walletDailyStats ?? {})) {
+      if (this.watchedWallets.has(wallet)) this.walletDailyStats.set(wallet, new Map(Object.entries(days)));
+    }
+    for (const [wallet, count] of Object.entries(state.walletTradeCounts ?? {})) {
+      if (this.watchedWallets.has(wallet)) this.walletTradeCounts.set(wallet, count);
+    }
+    this.pendingBuys.clear();
+    for (const item of state.pendingBuys ?? []) {
+      if (!this.watchedWallets.has(item.wallet) || Date.now() - item.ts > 30 * 60_000) continue;
+      this.pendingBuys.set(`${item.wallet}:${item.txHash}:${item.tokenAddress}`, {
+        ...item, tokenAmount: BigInt(item.tokenAmount), ethAmount: BigInt(item.ethAmount),
+      });
+    }
+    this.dayStartEquityUsd = Number.isFinite(state.dayStartEquityUsd) ? state.dayStartEquityUsd! : this.paperEquity();
+    this.dayStartMstDay = state.dayStartMstDay ?? currentMstDay();
     await this.persistState();
   }
 
@@ -512,9 +590,9 @@ export class CopyTrader {
     }
     const impactFactor = this.exitImpactFactor(midProceedsUsd, market.liquidityUsd);
     const proceedsUsd = settled * impactFactor;
+    const capitalBefore = this.paperEquity();
     const gasPaid = this.takeGas();
     const pnlUsd = proceedsUsd - pos.costBasisUsd - gasPaid;
-    const capitalBefore = this.paperEquity();
 
     pos.balance = 0n;
     pos.realizedPnlUsd += pnlUsd;
@@ -523,6 +601,8 @@ export class CopyTrader {
     pos.updatedAt = Date.now();
     this.cashUsd += proceedsUsd;
     this.positions.delete(key);
+    this.tradeCount++;
+    await this.persistState();
 
     log.warn('manual exit executed', {
       token: pos.symbol,
@@ -534,7 +614,6 @@ export class CopyTrader {
     });
 
     await this.sendManualExitAlert(pos, proceedsUsd, pnlUsd, capitalBefore);
-    await this.persistState();
     return true;
   }
 
@@ -581,6 +660,8 @@ export class CopyTrader {
     this.walletTradeCounts.clear();
     this.pendingBuys.clear();
     this.cashUsd = this.config.copytraderStartingBudgetUsd;
+    this.dayStartEquityUsd = this.cashUsd;
+    this.dayStartMstDay = currentMstDay();
     this.cumulativeRealizedUsd = 0;
     this.tradeCount = 0;
     this.premiumWallets.clear();
@@ -593,13 +674,11 @@ export class CopyTrader {
    * Inspect a block for watched-wallet activity.
    *
    * Trade discovery is log-driven: any transaction whose ERC-20 Transfers
-   * touch a watched wallet is inspected, regardless of who SENT it. This
-   * catches trades routed through executor/bot contracts (tx.from != wallet),
-   * which a tx.from-only scan misses entirely. Falls back to a tx.from scan
-   * if the transfer-log query fails.
+   * touch a watched wallet is inspected, regardless of who SENT it.
+   * A failed transfer-log query retries the block instead of losing trades.
    */
-  async processBlock(blockNumber: number): Promise<void> {
-    if (this.watchedWallets.size === 0) return;
+  async processBlock(blockNumber: number): Promise<boolean> {
+    if (this.watchedWallets.size === 0 && this.shadowWallets.size === 0) return true;
 
     try {
       // drpc "Unknown block" race right after the WS announcement: retry
@@ -614,7 +693,7 @@ export class CopyTrader {
           await new Promise((r) => setTimeout(r, 400));
         }
       }
-      if (!block) return;
+      if (!block) return false;
 
       // txHash -> wallets (watched + shadow) whose transfers appear in it.
       const candidates = new Map<string, Set<string>>();
@@ -638,48 +717,45 @@ export class CopyTrader {
           }
         }
       } catch (err) {
-        log.debug('transfer-log scan failed — falling back to tx.from scan', { blockNumber, ...errMeta(err) });
-        for (const tx of block.prefetchedTransactions) {
-          const from = tx.from?.toLowerCase();
-          if (from && this.watchedWallets.has(from)) {
-            candidates.set(tx.hash, new Set([from]));
-          }
-        }
+        log.warn('transfer-log scan failed — retrying block', { blockNumber, ...errMeta(err) });
+        return false;
       }
 
       const txByHash = new Map(block.prefetchedTransactions.map((t) => [t.hash, t]));
       const trades: CopyTrade[] = [];
+      const shadowTrades: CopyTrade[] = [];
 
       for (const [txHash, wallets] of candidates) {
-        const tx = txByHash.get(txHash);
-        if (!tx) continue;
+        const tx = txByHash.get(txHash) ?? await this.provider.getTransaction(txHash);
+        if (!tx) return false;
         try {
           const receipt = await this.provider.getTransactionReceipt(txHash);
-          if (!receipt || receipt.status !== 1) continue;
+          if (!receipt) throw new Error('transaction receipt not available yet');
+          if (receipt.status !== 1) continue;
 
           for (const wallet of wallets) {
             const trade = await this.parseTrade(tx, receipt, wallet);
             if (!trade) continue;
-            // Shadow wallets are observed, never copied.
             if (this.shadowWallets.has(wallet)) {
-              this.observeShadowTrade(trade);
+              shadowTrades.push(trade);
               continue;
             }
             trades.push(trade);
           }
         } catch (err) {
-          log.debug('copytrade inspection failed', { txHash, ...errMeta(err) });
+          log.warn('copytrade inspection failed — retrying block', { txHash, ...errMeta(err) });
+          return false;
         }
       }
 
-      // Execute every detected trade — no duplicate-token filtering.
+      for (const trade of shadowTrades) this.observeShadowTrade(trade);
       for (const trade of trades) {
         await this.executePaperTrade(trade);
       }
+      return true;
     } catch (err) {
-      // Warn, not error: the 60s balance-reconciliation sweep backstops any
-      // missed sells, so a final scan failure here costs latency, not state.
-      log.warn('copytrader block scan failed', { blockNumber, ...errMeta(err) });
+      log.warn('copytrader block scan failed — retrying', { blockNumber, ...errMeta(err) });
+      return false;
     }
   }
 
@@ -728,7 +804,7 @@ export class CopyTrader {
           if (pos.balance <= 0n) continue;
           const currentPrice = await this.getCurrentTokenPrice(tokenLower);
           if (!Number.isFinite(currentPrice) || currentPrice <= 0) continue;
-          const tokenQty = Number(pos.balance) / Math.pow(10, pos.decimals || 18);
+          const tokenQty = Number(pos.balance) / Math.pow(10, pos.decimals);
           const marketValue = tokenQty * currentPrice;
           const cost = tokenQty * pos.avgEntryPriceUsd;
           unrealizedUsd += marketValue - cost;
@@ -754,9 +830,8 @@ export class CopyTrader {
     walletPnls.sort((a, b) => b.totalPnlUsd - a.totalPnlUsd);
 
     // Day totals: all copied trades combined into one PNL figure.
-    const dayTotalPnlUsd = walletPnls.reduce((sum, w) => sum + w.totalPnlUsd, 0);
-    const dayInvestedUsd = walletPnls.reduce((sum, w) => sum + w.investedUsd, 0);
-    const dayTotalPnlPct = dayInvestedUsd > 0 ? (dayTotalPnlUsd / dayInvestedUsd) * 100 : 0;
+    const dayTotalPnlUsd = this.paperEquity() - this.dayStartEquityUsd;
+    const dayTotalPnlPct = this.dayStartEquityUsd > 0 ? (dayTotalPnlUsd / this.dayStartEquityUsd) * 100 : 0;
     const dayTrades = walletPnls.reduce((sum, w) => sum + w.trades, 0);
 
     if (walletPnls.length === 0) {
@@ -801,7 +876,12 @@ export class CopyTrader {
 
     const ok = await this.notifier.sendRaw(message);
     if (ok) {
+      this.dayStartEquityUsd = this.paperEquity();
+      this.dayStartMstDay = currentMstDay();
+      await this.persistState();
       log.info('wallet ranking report sent', { previousDay, wallets: walletPnls.length });
+    } else {
+      log.warn('wallet ranking report failed', { previousDay });
     }
   }
 
@@ -809,34 +889,27 @@ export class CopyTrader {
     if (!this.running) return;
 
     try {
-      const feed = new Contract(CHAINLINK_ETH_USD_FEED, CHAINLINK_FEED_ABI, this.provider);
-      const answer = await (feed.latestAnswer as () => Promise<bigint>)();
-      this.ethUsdPrice = Number(answer) / 1e8;
-      log.debug('ETH/USD price refreshed', { price: this.ethUsdPrice });
+      try {
+        const feed = new Contract(CHAINLINK_ETH_USD_FEED, CHAINLINK_FEED_ABI, this.provider);
+        const answer = await (feed.latestAnswer as () => Promise<bigint>)();
+        this.ethUsdPrice = Number(answer) / 1e8;
+        log.debug('ETH/USD price refreshed', { price: this.ethUsdPrice });
+      } catch (err) {
+        log.debug('ETH/USD price refresh failed', errMeta(err));
+      }
+
+      await this.refreshPositionPrices();
+      await this.retryPendingBuys();
+      await this.enforceAutoTakeProfit();
+      await this.enforceStopLoss();
+      await this.reconcileWalletPositions();
+      await this.persistState();
     } catch (err) {
-      log.debug('ETH/USD price refresh failed', errMeta(err));
+      log.warn('paper account refresh failed', errMeta(err));
+      await this.persistState();
+    } finally {
+      if (this.running) this.priceTimer = setTimeout(() => void this.refreshEthPrice(), 60_000);
     }
-
-    // Mark open paper positions to market so unrealized PNL reflects reality.
-    await this.refreshPositionPrices();
-
-    // Apply deferred buys whose tokens have listed a market pair by now.
-    await this.retryPendingBuys();
-
-    // Exit stale profitable positions from the auto-take-profit wallets.
-    await this.enforceAutoTakeProfit();
-
-    // Auto-exit positions that have dropped past the stop-loss threshold.
-    await this.enforceStopLoss();
-
-    // Mirror sells the pattern parser cannot see (native sell functions,
-    // executor contracts) by comparing on-chain balances to tracked ones.
-    await this.reconcileWalletPositions();
-
-    // Persist marks/trades so restarts (deploy or crash) resume exactly here.
-    await this.persistState();
-
-    this.priceTimer = setTimeout(() => void this.refreshEthPrice(), 60_000);
   }
 
   /**
@@ -880,6 +953,8 @@ export class CopyTrader {
       pos.updatedAt = Date.now();
       this.cashUsd += proceedsUsd;
       this.positions.delete(key);
+      this.tradeCount++;
+      await this.persistState();
 
       log.warn('stop-loss triggered', {
         token: pos.symbol,
@@ -911,6 +986,7 @@ export class CopyTrader {
       `<b>SCANETH — Paper copytrade SELL (stop-loss)</b>`,
       '',
       `Token: <code>${pos.tokenAddress}</code>`,
+      `Copied wallet: ${[...pos.contributors].map((wallet) => `<code>${wallet}</code>`).join(', ')}`,
       '',
       `PNL: <b>-$${Math.abs(pnlUsd).toFixed(2)} (-${Math.abs(pnlPct).toFixed(2)}%)</b>`,
       `Capital before trade: $${capitalBefore.toFixed(2)}`,
@@ -964,6 +1040,8 @@ export class CopyTrader {
       pos.updatedAt = Date.now();
       this.cashUsd += proceedsUsd;
       this.positions.delete(key);
+      this.tradeCount++;
+      await this.persistState();
 
       log.info('auto-take-profit exit', {
         token: pos.symbol,
@@ -995,6 +1073,7 @@ export class CopyTrader {
       `<b>SCANETH — Paper copytrade SELL (auto-take-profit)</b>`,
       '',
       `Token: <code>${pos.tokenAddress}</code>`,
+      `Copied wallet: ${[...pos.contributors].map((wallet) => `<code>${wallet}</code>`).join(', ')}`,
       '',
       `PNL: <b>${pnlSign}$${pnlUsd.toFixed(2)} (${pnlSign}${pnlPct.toFixed(2)}%)</b>`,
       `Capital before trade: $${capitalBefore.toFixed(2)}`,
@@ -1016,8 +1095,9 @@ export class CopyTrader {
     ethAmount: bigint,
     tx: TransactionResponse,
   ): void {
-    if (this.pendingBuys.has(tokenAddress)) return;
-    this.pendingBuys.set(tokenAddress, {
+    const pendingKey = `${wallet}:${tx.hash}:${tokenAddress}`;
+    if (this.pendingBuys.has(pendingKey)) return;
+    this.pendingBuys.set(pendingKey, {
       wallet,
       tokenAddress,
       tokenAmount,
@@ -1040,9 +1120,10 @@ export class CopyTrader {
     if (this.pendingBuys.size === 0 || !this.running) return;
     const now = Date.now();
 
-    for (const [tokenAddress, item] of [...this.pendingBuys]) {
+    for (const [pendingKey, item] of [...this.pendingBuys]) {
       if (item.nextAt > now) continue;
-      this.pendingBuys.delete(tokenAddress);
+      this.pendingBuys.delete(pendingKey);
+      const { tokenAddress } = item;
 
       const dexPrice = await this.getCurrentTokenPrice(tokenAddress);
       if (!(dexPrice > 0)) {
@@ -1052,7 +1133,7 @@ export class CopyTrader {
           continue;
         }
         item.nextAt = now + 60_000;
-        this.pendingBuys.set(tokenAddress, item);
+        this.pendingBuys.set(pendingKey, item);
         continue;
       }
 
@@ -1081,7 +1162,7 @@ export class CopyTrader {
       const impliedPrice = (d: number): number => {
         const qty = Number(item.tokenAmount) / Math.pow(10, d);
         if (!(qty > 0)) return NaN;
-        return (Number(item.ethAmount) * ethPriceUsd) / qty;
+        return (Number(item.ethAmount) / 1e18 * ethPriceUsd) / qty;
       };
       let best = 18;
       let bestOff = Infinity;
@@ -1339,13 +1420,15 @@ export class CopyTrader {
 
     // Buy: wallet paid ETH or WETH and received a non-WETH token.
     const bought = [...tokenIn.entries()][0];
-    if (bought && (tx.value > 0n || wethOut > 0n)) {
+    if (bought && ((isFromWallet && tx.value > 0n) || wethOut > 0n)) {
       const [tokenAddress, tokenAmount] = bought;
       const ethAmount = (isFromWallet ? tx.value : 0n) + wethOut;
       if (tokenAmount <= 0n) return null;
       const { decimals, tokenPriceUsd, anchored } = await this.resolveDecimalsAndPrice(tokenAddress, tokenAmount, ethAmount, ethPriceUsd);
       if (!anchored) {
-        // No market pair yet — sizing now would rely on a blind implied price.
+        if (this.shadowWallets.has(wallet)) {
+          return this.buildTrade(wallet, 'buy', tokenAddress, decimals, tokenAmount, ethAmount, ethPriceUsd, 0, tx);
+        }
         this.schedulePendingBuy(wallet, tokenAddress, tokenAmount, ethAmount, tx);
         return null;
       }
@@ -1404,10 +1487,8 @@ export class CopyTrader {
   }
 
   private async executePaperTrade(trade: CopyTrade): Promise<void> {
-    this.tradeCount++;
     const wKey = trade.wallet.toLowerCase();
     this.walletTradeCounts.set(wKey, (this.walletTradeCounts.get(wKey) ?? 0) + 1);
-    this.getWalletDayStats(trade.wallet, currentMstDay()).trades++;
     if (trade.type === 'buy') {
       await this.executePaperBuy(trade);
     } else {
@@ -1418,7 +1499,7 @@ export class CopyTrader {
   /** Add a wallet to the watched set (scout engine). Returns false if already watched. */
   addWatchedWallet(wallet: string): boolean {
     const key = wallet.toLowerCase();
-    if (this.watchedWallets.has(key)) return false;
+    if (this.watchedWallets.has(key) || this.shadowWallets.has(key)) return false;
     this.watchedWallets.add(key);
     log.info('scout added wallet', { wallet: key });
     return true;
@@ -1492,7 +1573,7 @@ export class CopyTrader {
           if (pos.balance <= 0n) continue;
           const live = this.positions.get(token);
           const price = live && live.currentPriceUsd > 0 ? live.currentPriceUsd : pos.avgEntryPriceUsd;
-          unrealized += (Number(pos.balance) / Math.pow(10, pos.decimals || 18)) * (price - pos.avgEntryPriceUsd);
+          unrealized += (Number(pos.balance) / Math.pow(10, pos.decimals)) * (price - pos.avgEntryPriceUsd);
         }
       }
 
@@ -1637,6 +1718,9 @@ export class CopyTrader {
     const day = currentMstDay();
     const dayStats = this.getWalletDayStats(trade.wallet, day);
     dayStats.costBasisUsd += buyAmountUsd;
+    dayStats.trades++;
+    this.tradeCount++;
+    await this.persistState();
 
     log.info('paper buy executed', {
       wallet: trade.wallet,
@@ -1660,10 +1744,10 @@ export class CopyTrader {
     // Track the watched wallet's own balance for EVERY detected sell.
     const walletBalances = this.getWalletBalanceMap(trade.wallet);
     const walletBalanceBefore = walletBalances.get(key) ?? 0n;
-    walletBalances.set(key, walletBalanceBefore > trade.tokenAmount ? walletBalanceBefore - trade.tokenAmount : 0n);
 
     const pos = this.positions.get(key);
     if (!pos || pos.balance <= 0n) {
+      walletBalances.set(key, walletBalanceBefore > trade.tokenAmount ? walletBalanceBefore - trade.tokenAmount : 0n);
       log.debug('paper sell ignored — no position', { token: trade.tokenAddress });
       return;
     }
@@ -1677,6 +1761,7 @@ export class CopyTrader {
     const ourSellAmount = BigInt(Math.floor(Number(pos.balance) * sellPct));
 
     if (ourSellAmount <= 0n) {
+      walletBalances.set(key, walletBalanceBefore > trade.tokenAmount ? walletBalanceBefore - trade.tokenAmount : 0n);
       log.debug('paper sell too small', { token: trade.tokenAddress });
       return;
     }
@@ -1689,7 +1774,8 @@ export class CopyTrader {
     // Guard against a bogus sell-time price: if it deviates from the live
     // mark price by >~30x, the sell-side decimals/price resolution failed —
     // fall back to the mark price (refreshed from DexScreener every 60s).
-    let sellPriceUsd = trade.tokenPriceUsd;
+    const market = await this.getMarketSnapshot(key);
+    let sellPriceUsd = market.priceUsd > 0 ? market.priceUsd : trade.tokenPriceUsd;
     if (pos.currentPriceUsd > 0 && Number.isFinite(sellPriceUsd) && sellPriceUsd > 0) {
       const offBy = Math.abs(Math.log10(sellPriceUsd / pos.currentPriceUsd));
       if (Number.isFinite(offBy) && offBy > 1.5) {
@@ -1704,8 +1790,6 @@ export class CopyTrader {
 
     // Exits carry no liquidity floor: real capital dumps into whatever
     // liquidity remains and eats the impact (modeled below).
-    const market = await this.getMarketSnapshot(key);
-
     // Realistic exit: slippage (panic-priced when this mirrors a reconciled
     // dump the parser missed), simulated sell tax, honeypot trap-block, and
     // AMM price impact proportional to pool depth.
@@ -1721,24 +1805,30 @@ export class CopyTrader {
     const costBasisSold = qtySold * pos.avgEntryPriceUsd;
     const gasPaid = this.takeGas();
     const pnlUsd = proceedsUsd - costBasisSold - gasPaid;
+    walletBalances.set(key, walletBalanceBefore > trade.tokenAmount ? walletBalanceBefore - trade.tokenAmount : 0n);
 
     pos.balance -= ourSellAmount;
     pos.realizedPnlUsd += pnlUsd;
     this.cumulativeRealizedUsd += pnlUsd;
     pos.costBasisUsd = Math.max(0, pos.costBasisUsd - costBasisSold);
-    pos.currentPriceUsd = trade.tokenPriceUsd;
+    pos.currentPriceUsd = sellPriceUsd;
     pos.updatedAt = trade.timestamp;
 
     // Credit sale proceeds back to the paper cash budget (gas already debited).
     this.cashUsd += proceedsUsd;
 
     // Update wallet portfolio.
-    this.updateWalletPortfolioSell(trade.wallet, key, trade.tokenAmount, trade.tokenDecimals);
+    this.updateWalletPortfolioSell(trade.wallet, key, trade.tokenAmount);
 
     // Track daily realized PNL.
     const day = currentMstDay();
     const dayStats = this.getWalletDayStats(trade.wallet, day);
     dayStats.realizedPnlUsd += pnlUsd;
+    dayStats.trades++;
+    this.tradeCount++;
+
+    if (pos.balance <= 0n) this.positions.delete(key);
+    await this.persistState();
 
     log.info('paper sell executed', {
       wallet: trade.wallet,
@@ -1763,11 +1853,6 @@ export class CopyTrader {
       pnlUsd,
       capitalBefore,
     );
-
-    // Clean up empty positions.
-    if (pos.balance <= 0n) {
-      this.positions.delete(key);
-    }
   }
 
   private updateWalletPortfolioBuy(
@@ -1791,22 +1876,16 @@ export class CopyTrader {
       portfolio.set(tokenKey, pos);
     }
 
-    // Normalize the incoming raw amount into the stored decimal scale so
-    // repeated buys never mix units within one wallet position.
-    let amount = tokenAmount;
     if (pos.decimals !== decimals) {
-      amount = BigInt(Math.max(1, Math.floor(Number(tokenAmount) * Math.pow(10, pos.decimals - decimals))));
-      log.warn('wallet portfolio decimals mismatch — normalized to stored scale', {
-        wallet: walletKey,
-        token: tokenKey,
-        stored: pos.decimals,
-        trade: decimals,
+      log.warn('wallet portfolio decimals corrected', {
+        wallet: walletKey, token: tokenKey, stored: pos.decimals, trade: decimals,
       });
+      pos.decimals = decimals;
     }
 
-    const buyUsd = (Number(amount) / Math.pow(10, pos.decimals)) * tokenPriceUsd;
+    const buyUsd = (Number(tokenAmount) / Math.pow(10, pos.decimals)) * tokenPriceUsd;
     const newCost = pos.costBasisUsd + buyUsd;
-    const newBalance = pos.balance + amount;
+    const newBalance = pos.balance + tokenAmount;
     pos.avgEntryPriceUsd = newCost / (Number(newBalance) / Math.pow(10, pos.decimals));
     pos.costBasisUsd = newCost;
     pos.balance = newBalance;
@@ -1816,7 +1895,6 @@ export class CopyTrader {
     wallet: string,
     tokenKey: string,
     sellAmount: bigint,
-    sellDecimals: number,
   ): void {
     const walletKey = wallet.toLowerCase();
     const portfolio = this.walletPortfolios.get(walletKey);
@@ -1825,12 +1903,8 @@ export class CopyTrader {
     const pos = portfolio.get(tokenKey);
     if (!pos) return;
 
-    // Normalize the sell amount into the stored scale before applying it.
-    let amount = sellAmount;
-    if (pos.decimals !== sellDecimals) {
-      amount = BigInt(Math.max(0, Math.floor(Number(sellAmount) * Math.pow(10, pos.decimals - sellDecimals))));
-    }
-
+    const amount = sellAmount > pos.balance ? pos.balance : sellAmount;
+    if (amount <= 0n) return;
     const costBasisSold = (Number(amount) / Number(pos.balance)) * pos.costBasisUsd;
     pos.balance -= amount;
     pos.costBasisUsd = Math.max(0, pos.costBasisUsd - costBasisSold);
@@ -1928,7 +2002,7 @@ export class CopyTrader {
     const impliedPrice = (d: number): number => {
       const qty = Number(tokenAmountRaw) / Math.pow(10, d);
       if (!(qty > 0)) return NaN;
-      return (Number(ethAmount) * ethPriceUsd) / qty;
+      return (Number(ethAmount) / 1e18 * ethPriceUsd) / qty;
     };
 
     let price = impliedPrice(decimals);
