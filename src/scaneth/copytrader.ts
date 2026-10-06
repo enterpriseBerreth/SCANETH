@@ -47,6 +47,7 @@ const AUTO_TP_MIN_AGE_MS = 24 * 3_600_000;
 const PREMIUM_WALLETS = new Set([
   '0xb51ff2f65b935142aab32abefa1c0e29a4161d31',
   '0xc05ef5e1fd014267f66fa24b260f361af7d79122',
+  '0xae3c9dfd4dd4700d2382e985fb348b71b1341b5d',
 ]);
 const PREMIUM_BUY_USD = 100;
 
