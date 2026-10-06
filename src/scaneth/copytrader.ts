@@ -184,8 +184,6 @@ export class CopyTrader {
   private readonly walletDailyStats = new Map<string, Map<string, WalletDailyStats>>(); // wallet -> day -> stats
   private readonly positions = new Map<string, PaperPosition>(); // token -> aggregated position
   private tradeCount = 0;
-  /** All realized PNL since start, including closed/deleted positions. */
-  private cumulativeRealizedUsd = 0;
   /** Trades observed per watched wallet (for scout ranking). */
   private readonly walletTradeCounts = new Map<string, number>();
   /** Remaining paper cash. Starts at the configured budget, decreases on buys, grows on sells. */
@@ -315,7 +313,7 @@ export class CopyTrader {
         ? (totalPnl / this.config.copytraderStartingBudgetUsd) * 100
         : 0,
       totalCostBasisUsd: totalCostBasis,
-      totalRealizedPnlUsd: this.cumulativeRealizedUsd,
+      totalRealizedPnlUsd: this.cashUsd + totalCostBasis - this.config.copytraderStartingBudgetUsd,
       totalUnrealizedPnlUsd: totalUnrealized,
       tradeCount: this.tradeCount,
     };
@@ -370,7 +368,7 @@ export class CopyTrader {
       version: 1,
       savedAt: Date.now(),
       cashUsd: this.cashUsd,
-      cumulativeRealizedUsd: this.cumulativeRealizedUsd,
+      cumulativeRealizedUsd: this.getStats().totalRealizedPnlUsd,
       tradeCount: this.tradeCount,
       premiumWallets: [...this.premiumWallets],
       positions: [...this.positions.values()].map((pos) => ({
@@ -439,7 +437,6 @@ export class CopyTrader {
       throw new Error('invalid positions in paper state payload');
     }
     this.cashUsd = state.cashUsd;
-    this.cumulativeRealizedUsd = Number.isFinite(state.cumulativeRealizedUsd) ? state.cumulativeRealizedUsd : 0;
     this.tradeCount = Number.isFinite(state.tradeCount) ? state.tradeCount : 0;
     // Restore scout-managed tiers from the persisted set, but always
     // re-assert the owner-designated premium wallets above whatever the
@@ -596,7 +593,6 @@ export class CopyTrader {
 
     pos.balance = 0n;
     pos.realizedPnlUsd += pnlUsd;
-    this.cumulativeRealizedUsd += pnlUsd;
     pos.costBasisUsd = 0;
     pos.updatedAt = Date.now();
     this.cashUsd += proceedsUsd;
@@ -662,7 +658,6 @@ export class CopyTrader {
     this.cashUsd = this.config.copytraderStartingBudgetUsd;
     this.dayStartEquityUsd = this.cashUsd;
     this.dayStartMstDay = currentMstDay();
-    this.cumulativeRealizedUsd = 0;
     this.tradeCount = 0;
     this.premiumWallets.clear();
     for (const w of PREMIUM_WALLETS) this.premiumWallets.add(w);
@@ -948,7 +943,6 @@ export class CopyTrader {
 
       pos.balance = 0n;
       pos.realizedPnlUsd += pnlUsd;
-      this.cumulativeRealizedUsd += pnlUsd;
       pos.costBasisUsd = 0;
       pos.updatedAt = Date.now();
       this.cashUsd += proceedsUsd;
@@ -1035,7 +1029,6 @@ export class CopyTrader {
 
       pos.balance = 0n;
       pos.realizedPnlUsd += pnlUsd;
-      this.cumulativeRealizedUsd += pnlUsd;
       pos.costBasisUsd = 0;
       pos.updatedAt = Date.now();
       this.cashUsd += proceedsUsd;
@@ -1809,7 +1802,6 @@ export class CopyTrader {
 
     pos.balance -= ourSellAmount;
     pos.realizedPnlUsd += pnlUsd;
-    this.cumulativeRealizedUsd += pnlUsd;
     pos.costBasisUsd = Math.max(0, pos.costBasisUsd - costBasisSold);
     pos.currentPriceUsd = sellPriceUsd;
     pos.updatedAt = trade.timestamp;
