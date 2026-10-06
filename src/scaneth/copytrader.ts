@@ -384,6 +384,12 @@ export class CopyTrader {
       for (const w of state.premiumWallets) this.premiumWallets.add(w.toLowerCase());
     }
     for (const w of PREMIUM_WALLETS) this.premiumWallets.add(w);
+    // Owner wallets NOT in the owner-designated premium set must never
+    // inherit premium tiers from persisted drift (they trade at $20 unless
+    // the owner upgrades them by editing PREMIUM_WALLETS).
+    for (const w of this.userWallets) {
+      if (!PREMIUM_WALLETS.has(w)) this.premiumWallets.delete(w);
+    }
     this.positions.clear();
     for (const p of state.positions ?? []) {
       const token = p.tokenAddress?.toLowerCase();
@@ -571,7 +577,18 @@ export class CopyTrader {
     if (this.watchedWallets.size === 0) return;
 
     try {
-      const block = await this.provider.getBlock(blockNumber, true);
+      // drpc "Unknown block" race right after the WS announcement: retry
+      // briefly — a missed block is a missed copied trade, not just latency.
+      let block: Awaited<ReturnType<Provider['getBlock']>> = null;
+      for (let attempt = 0; attempt < 3; attempt++) {
+        try {
+          block = await this.provider.getBlock(blockNumber, true);
+          break;
+        } catch (err) {
+          if (attempt === 2) throw err;
+          await new Promise((r) => setTimeout(r, 400));
+        }
+      }
       if (!block) return;
 
       // txHash -> watched wallets whose transfers appear in it.
@@ -628,7 +645,9 @@ export class CopyTrader {
         await this.executePaperTrade(trade);
       }
     } catch (err) {
-      log.error('copytrader block scan failed', { blockNumber, ...errMeta(err) });
+      // Warn, not error: the 60s balance-reconciliation sweep backstops any
+      // missed sells, so a final scan failure here costs latency, not state.
+      log.warn('copytrader block scan failed', { blockNumber, ...errMeta(err) });
     }
   }
 
@@ -788,14 +807,9 @@ export class CopyTrader {
       const dropPct = ((price - pos.avgEntryPriceUsd) / pos.avgEntryPriceUsd) * 100;
       if (dropPct > -stopPct) continue;
 
-      // Realism: cannot exit into a pool thinner than the floor — retry next cycle.
+      // Exits carry no liquidity floor: real capital dumps into whatever
+      // liquidity remains and eats the impact (modeled below).
       const market = await this.getMarketSnapshot(key);
-      if (this.exitLiquidityBlocked(key, market)) {
-        log.warn('stop-loss blocked — liquidity below executable floor', {
-          token: key, liquidityUsd: market.liquidityUsd,
-        });
-        continue;
-      }
 
       const qty = Number(pos.balance) / Math.pow(10, pos.decimals);
       const midProceedsUsd = qty * price;
@@ -877,14 +891,9 @@ export class CopyTrader {
       if (!(price > 0) || !(pos.avgEntryPriceUsd > 0)) continue;
       if (price <= pos.avgEntryPriceUsd) continue; // only profitable exits
 
-      // Realism: cannot exit into a pool thinner than the floor — retry next cycle.
+      // Exits carry no liquidity floor: real capital dumps into whatever
+      // liquidity remains and eats the impact (modeled below).
       const market = await this.getMarketSnapshot(key);
-      if (this.exitLiquidityBlocked(key, market)) {
-        log.warn('auto-take-profit blocked — liquidity below executable floor', {
-          token: key, liquidityUsd: market.liquidityUsd,
-        });
-        continue;
-      }
 
       const qty = Number(pos.balance) / Math.pow(10, pos.decimals);
       const midProceedsUsd = qty * price;
@@ -1643,17 +1652,9 @@ export class CopyTrader {
       }
     }
 
-    // Live-executability gate on the way OUT: a pool thinner than the floor
-    // cannot absorb the exit — real capital stays stuck. Retry next cycle.
+    // Exits carry no liquidity floor: real capital dumps into whatever
+    // liquidity remains and eats the impact (modeled below).
     const market = await this.getMarketSnapshot(key);
-    if (this.exitLiquidityBlocked(key, market)) {
-      log.warn('paper sell skipped — liquidity below executable floor', {
-        token: trade.tokenAddress,
-        liquidityUsd: market.liquidityUsd,
-        floorUsd: this.config.copytraderMinLiquidityUsd,
-      });
-      return;
-    }
 
     // Realistic exit: slippage (panic-priced when this mirrors a reconciled
     // dump the parser missed), simulated sell tax, honeypot trap-block, and

@@ -92,7 +92,19 @@ export class BlockScanner {
     };
 
     try {
-      const logs = await this.provider.getLogs({ fromBlock: blockNumber, toBlock: blockNumber });
+      // drpc occasionally 400s with "Unknown block" right after the WS
+      // announcement (indexing race). Retry briefly before giving up; the
+      // HTTP poll fallback also re-covers missed blocks.
+      let logs: Awaited<ReturnType<Provider['getLogs']>> = [];
+      for (let attempt = 0; attempt < 3; attempt++) {
+        try {
+          logs = await this.provider.getLogs({ fromBlock: blockNumber, toBlock: blockNumber });
+          break;
+        } catch (err) {
+          if (attempt === 2) throw err;
+          await new Promise((r) => setTimeout(r, 400));
+        }
+      }
 
       this.stats.lastBlockNumber = blockNumber;
       this.stats.lastBlockAt = Date.now();
@@ -142,7 +154,9 @@ export class BlockScanner {
 
       return result;
     } catch (err) {
-      log.error('block scan failed', { blockNumber, ...errMeta(err) });
+      // Downgrade to warn: the HTTP poll fallback re-processes this block,
+      // so a final failure here is latency, not data loss.
+      log.warn('block scan failed — poll fallback will retry', { blockNumber, ...errMeta(err) });
       return result;
     }
   }
