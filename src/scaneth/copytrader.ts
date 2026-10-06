@@ -136,8 +136,18 @@ export interface CopyTrade {
   timestamp: number;
 }
 
+export interface ShadowWalletStats {
+  wallet: string;
+  tradesObserved: number;
+  buys: number;
+  sells: number;
+  lastTradeAt: number | null;
+  lastTradeSummary: string | null;
+}
+
 export interface CopyTraderStats {
   watchedWallets: string[];
+  shadowWallets: ShadowWalletStats[];
   positionCount: number;
   buyAmountUsd: number;
   startingBudgetUsd: number;
@@ -156,6 +166,9 @@ export class CopyTrader {
   private readonly watchedWallets = new Set<string>();
   /** Owner-configured wallets — protected from scout removal, forever. */
   private readonly userWallets = new Set<string>();
+  /** Observed-but-never-copied wallets (owner keeps an eye on them). */
+  private readonly shadowWallets = new Set<string>();
+  private readonly shadowStats = new Map<string, ShadowWalletStats>();
   private readonly walletBalances = new Map<string, Map<string, bigint>>(); // wallet -> token -> balance
   private readonly walletPortfolios = new Map<string, Map<string, WalletPosition>>(); // wallet -> token -> position
   private readonly walletDailyStats = new Map<string, Map<string, WalletDailyStats>>(); // wallet -> day -> stats
@@ -209,6 +222,16 @@ export class CopyTrader {
       // Env-configured wallets are hand-picked by the owner: the scout may
       // promote/demote their clip size but never remove them.
       this.userWallets.add(key);
+    }
+    for (const w of config.copytraderShadowWallets) {
+      const key = w.toLowerCase();
+      if (!this.watchedWallets.has(key)) {
+        this.shadowWallets.add(key);
+        this.shadowStats.set(key, {
+          wallet: key, tradesObserved: 0, buys: 0, sells: 0,
+          lastTradeAt: null, lastTradeSummary: null,
+        });
+      }
     }
     this.cashUsd = config.copytraderStartingBudgetUsd;
   }
@@ -266,6 +289,7 @@ export class CopyTrader {
 
     return {
       watchedWallets: [...this.watchedWallets],
+      shadowWallets: [...this.shadowStats.values()],
       positionCount: this.positions.size,
       buyAmountUsd: this.config.copytraderBuyAmountUsd,
       startingBudgetUsd: this.config.copytraderStartingBudgetUsd,
@@ -591,10 +615,11 @@ export class CopyTrader {
       }
       if (!block) return;
 
-      // txHash -> watched wallets whose transfers appear in it.
+      // txHash -> wallets (watched + shadow) whose transfers appear in it.
       const candidates = new Map<string, Set<string>>();
+      const observedWallets = new Set([...this.watchedWallets, ...this.shadowWallets]);
       try {
-        const padded = [...this.watchedWallets].map((w) => '0x' + w.slice(2).padStart(64, '0'));
+        const padded = [...observedWallets].map((w) => '0x' + w.slice(2).padStart(64, '0'));
         const [inLogs, outLogs] = await Promise.all([
           this.provider.getLogs({ topics: [TRANSFER_TOPIC, null, padded], fromBlock: blockNumber, toBlock: blockNumber }),
           this.provider.getLogs({ topics: [TRANSFER_TOPIC, padded, null], fromBlock: blockNumber, toBlock: blockNumber }),
@@ -607,7 +632,7 @@ export class CopyTrader {
             set = new Set<string>();
             candidates.set(lg.transactionHash, set);
           }
-          for (const w of this.watchedWallets) {
+          for (const w of observedWallets) {
             if (from === w || to === w) set.add(w);
           }
         }
@@ -633,7 +658,13 @@ export class CopyTrader {
 
           for (const wallet of wallets) {
             const trade = await this.parseTrade(tx, receipt, wallet);
-            if (trade) trades.push(trade);
+            if (!trade) continue;
+            // Shadow wallets are observed, never copied.
+            if (this.shadowWallets.has(wallet)) {
+              this.observeShadowTrade(trade);
+              continue;
+            }
+            trades.push(trade);
           }
         } catch (err) {
           log.debug('copytrade inspection failed', { txHash, ...errMeta(err) });
@@ -649,6 +680,24 @@ export class CopyTrader {
       // missed sells, so a final scan failure here costs latency, not state.
       log.warn('copytrader block scan failed', { blockNumber, ...errMeta(err) });
     }
+  }
+
+  /** Record a shadow-wallet trade for stats (no copying, no alerts). */
+  private observeShadowTrade(trade: CopyTrade): void {
+    const stats = this.shadowStats.get(trade.wallet);
+    if (!stats) return;
+    stats.tradesObserved++;
+    if (trade.type === 'buy') stats.buys++;
+    else stats.sells++;
+    stats.lastTradeAt = trade.timestamp;
+    stats.lastTradeSummary = `${trade.type} ${trade.tokenSymbol} @ $${trade.tokenPriceUsd.toPrecision(4)}`;
+    log.info('shadow wallet trade observed (not copied)', {
+      wallet: trade.wallet,
+      type: trade.type,
+      token: trade.tokenSymbol,
+      priceUsd: trade.tokenPriceUsd,
+      ethAmount: Number(trade.ethAmount) / 1e18,
+    });
   }
 
   private scheduleDailyWalletReport(): void {

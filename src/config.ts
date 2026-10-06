@@ -72,6 +72,8 @@ export interface ScanethConfig {
   copytraderEnabled: boolean;
   /** Comma-separated list of wallet addresses to copy. */
   copytraderWatchedWallets: string[];
+  /** Comma-separated wallet addresses observed for stats only — never copied. */
+  copytraderShadowWallets: string[];
   /** USD amount to simulate on each copied buy. */
   copytraderBuyAmountUsd: number;
   /** Paper trading budget. Buys stop when cash is exhausted. */
@@ -151,6 +153,7 @@ export function loadConfig(): ScanethConfig {
     dailyReportHourUtc: num('DAILY_REPORT_HOUR_UTC', 7),
     copytraderEnabled: bool('COPYTRADER_ENABLED', false),
     copytraderWatchedWallets: addressList('COPYTRADER_WATCHED_WALLETS'),
+    copytraderShadowWallets: addressList('COPYTRADER_SHADOW_WALLETS'),
     copytraderBuyAmountUsd: num('COPYTRADER_BUY_AMOUNT_USD', 20),
     copytraderStartingBudgetUsd: num('COPYTRADER_STARTING_BUDGET_USD', 1000),
     copytraderAutoScoutEnabled: bool('COPYTRADER_AUTO_SCOUT_ENABLED', true),
