@@ -14,7 +14,7 @@
 
 import { mkdir, readFile, rename, writeFile } from 'node:fs/promises';
 import { dirname } from 'node:path';
-import { Contract, type Provider, type TransactionReceipt, type TransactionResponse } from 'ethers';
+import { Contract, JsonRpcProvider, type Provider, type TransactionReceipt, type TransactionResponse } from 'ethers';
 import { createLogger, errMeta } from '../logger';
 import type { ScanethConfig } from '../config';
 import type { ScanethNotifier } from './notifier';
@@ -43,12 +43,21 @@ const AUTO_TP_WALLETS = new Set([
 ]);
 const AUTO_TP_MIN_AGE_MS = 24 * 3_600_000;
 
+/**
+ * Owner-designated clip tiers (USD copied per buy). Tier order is by proven
+ * profitability; editing clipUsd here is the ONLY way owner clips change —
+ * persisted state can never shrink them.
+ */
+const OWNER_CLIP_TIERS: ReadonlyArray<{ wallet: string; clipUsd: number }> = [
+  { wallet: '0xc05ef5e1fd014267f66fa24b260f361af7d79122', clipUsd: 200 },
+  { wallet: '0xb51ff2f65b935142aab32abefa1c0e29a4161d31', clipUsd: 100 },
+  { wallet: '0xae3c9dfd4dd4700d2382e985fb348b71b1341b5d', clipUsd: 100 },
+];
+const OWNER_CLIP_USD = new Map(OWNER_CLIP_TIERS.map((t) => [t.wallet, t.clipUsd] as const));
+
 /** Wallets whose buys are copied at a premium clip (strongest performers). */
-const PREMIUM_WALLETS = new Set([
-  '0xb51ff2f65b935142aab32abefa1c0e29a4161d31',
-  '0xc05ef5e1fd014267f66fa24b260f361af7d79122',
-  '0xae3c9dfd4dd4700d2382e985fb348b71b1341b5d',
-]);
+const PREMIUM_WALLETS = new Set(OWNER_CLIP_TIERS.map((t) => t.wallet));
+/** Clip for scout-promoted (non-owner) premium wallets. */
 const PREMIUM_BUY_USD = 100;
 
 /** Serialized paper position (bigint balance as string). */
@@ -196,11 +205,25 @@ export class CopyTrader {
   private dayStartMstDay = currentMstDay();
   private running = false;
   /**
-   * Wallets copied at the premium $100 clip. Seeded with the proven
-   * performers; the scout promotes proven newcomers and demotes degrading
-   * wallets at each daily cycle.
+   * Wallets eligible for premium copying. Owner clips come from
+   * OWNER_CLIP_TIERS (see executePaperTrade); scout-promoted newcomers copy
+   * at PREMIUM_BUY_USD and are demoted by the scout when they degrade.
    */
   private readonly premiumWallets = new Set(PREMIUM_WALLETS);
+  /** Lazily-created backup RPC used when the primary times out mid-scan. */
+  private fallbackProvider?: JsonRpcProvider;
+
+  private getFallbackProvider(): JsonRpcProvider {
+    if (!this.fallbackProvider) {
+      this.fallbackProvider = new JsonRpcProvider(this.config.fallbackRpcUrl, undefined, {
+        staticNetwork: true,
+        batchMaxCount: 3,
+      });
+      log.info('fallback rpc provider initialized', { url: this.config.fallbackRpcUrl });
+    }
+    return this.fallbackProvider;
+  }
+
   /**
    * Buys whose token had no DexScreener pair yet at detection time. Sizing
    * them immediately would rely on a blind 18-decimal implied price — the
@@ -693,13 +716,8 @@ export class CopyTrader {
       // txHash -> wallets (watched + shadow) whose transfers appear in it.
       const candidates = new Map<string, Set<string>>();
       const observedWallets = new Set([...this.watchedWallets, ...this.shadowWallets]);
-      try {
-        const padded = [...observedWallets].map((w) => '0x' + w.slice(2).padStart(64, '0'));
-        const [inLogs, outLogs] = await Promise.all([
-          this.provider.getLogs({ topics: [TRANSFER_TOPIC, null, padded], fromBlock: blockNumber, toBlock: blockNumber }),
-          this.provider.getLogs({ topics: [TRANSFER_TOPIC, padded, null], fromBlock: blockNumber, toBlock: blockNumber }),
-        ]);
-        for (const lg of [...inLogs, ...outLogs]) {
+      const addLogs = (logs: ReadonlyArray<{ transactionHash: string; topics: readonly string[] }>) => {
+        for (const lg of logs) {
           const from = lg.topics[1] ? '0x' + lg.topics[1].slice(26).toLowerCase() : '';
           const to = lg.topics[2] ? '0x' + lg.topics[2].slice(26).toLowerCase() : '';
           let set = candidates.get(lg.transactionHash);
@@ -711,9 +729,35 @@ export class CopyTrader {
             if (from === w || to === w) set.add(w);
           }
         }
+      };
+      try {
+        const padded = [...observedWallets].map((w) => '0x' + w.slice(2).padStart(64, '0'));
+        const [inLogs, outLogs] = await Promise.all([
+          this.provider.getLogs({ topics: [TRANSFER_TOPIC, null, padded], fromBlock: blockNumber, toBlock: blockNumber }),
+          this.provider.getLogs({ topics: [TRANSFER_TOPIC, padded, null], fromBlock: blockNumber, toBlock: blockNumber }),
+        ]);
+        addLogs([...inLogs, ...outLogs]);
       } catch (err) {
-        log.warn('transfer-log scan failed — retrying block', { blockNumber, ...errMeta(err) });
-        return false;
+        // drpc free plan intermittently times out on single-block getLogs.
+        // Retry once against the fallback RPC before deferring the block —
+        // a stalled monitor delays every copied trade, not just this one.
+        try {
+          const fallback = this.getFallbackProvider();
+          const padded = [...observedWallets].map((w) => '0x' + w.slice(2).padStart(64, '0'));
+          const [inLogs, outLogs] = await Promise.all([
+            fallback.getLogs({ topics: [TRANSFER_TOPIC, null, padded], fromBlock: blockNumber, toBlock: blockNumber }),
+            fallback.getLogs({ topics: [TRANSFER_TOPIC, padded, null], fromBlock: blockNumber, toBlock: blockNumber }),
+          ]);
+          addLogs([...inLogs, ...outLogs]);
+          log.warn('primary rpc failed — block scanned via fallback rpc', { blockNumber, ...errMeta(err) });
+        } catch (fallbackErr) {
+          log.warn('transfer-log scan failed on primary and fallback — retrying block', {
+            blockNumber,
+            ...errMeta(err),
+            fallbackError: (fallbackErr as Error)?.message ?? String(fallbackErr),
+          });
+          return false;
+        }
       }
 
       const txByHash = new Map(block.prefetchedTransactions.map((t) => [t.hash, t]));
@@ -1590,12 +1634,14 @@ export class CopyTrader {
     this.updateWalletPortfolioBuy(trade.wallet, trade.tokenAddress, trade.tokenAmount, trade.tokenDecimals, trade.tokenPriceUsd);
 
     /**
-     * Per-wallet buy sizing: premium wallets (see PREMIUM_WALLETS) are copied
-     * at a premium clip. All other wallets use the default.
+     * Per-wallet buy sizing: owner-designated tiers first (OWNER_CLIP_TIERS),
+     * then scout-promoted premium wallets, then the default clip.
      */
-    const buyAmountUsd = this.premiumWallets.has(trade.wallet.toLowerCase())
-      ? PREMIUM_BUY_USD
-      : this.config.copytraderBuyAmountUsd;
+    const walletKey = trade.wallet.toLowerCase();
+    const buyAmountUsd = OWNER_CLIP_USD.get(walletKey)
+      ?? (this.premiumWallets.has(walletKey)
+        ? PREMIUM_BUY_USD
+        : this.config.copytraderBuyAmountUsd);
 
     // Respect the paper cash budget (gas included — real trades pay both).
     const gasEstimate = this.config.copytraderGasFeeUsd;

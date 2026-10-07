@@ -39,6 +39,8 @@ function bool(key: string, fallback: boolean): boolean {
 export interface ScanethConfig {
   /** Ethereum RPC endpoint (HTTP). */
   rpcUrl: string;
+  /** Backup RPC used when the primary fails or times out mid-scan. */
+  fallbackRpcUrl: string;
   /** Optional WebSocket endpoint for real-time blocks. */
   wsUrl?: string;
   /** HTTP server port for healthchecks. */
@@ -141,6 +143,7 @@ function addressList(key: string): string[] {
 export function loadConfig(): ScanethConfig {
   const config: ScanethConfig = {
     rpcUrl: str('ETHEREUM_RPC_URL', 'https://ethereum-rpc.publicnode.com'),
+    fallbackRpcUrl: str('ETHEREUM_FALLBACK_RPC_URL', 'https://eth.llamarpc.com'),
     wsUrl: optionalStr('ETHEREUM_WS_URL'),
     port: num('PORT', 3000),
     probeEth: num('PROBE_ETH', 0.001),
