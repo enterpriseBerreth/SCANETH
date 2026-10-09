@@ -94,6 +94,8 @@ export interface PersistedState {
   pendingBuys?: Array<{ wallet: string; tokenAddress: string; tokenAmount: string; ethAmount: string; ts: number; txHash: string; blockNumber: number; attempts: number; nextAt: number }>;
   dayStartEquityUsd?: number;
   dayStartMstDay?: string;
+  lastProcessedBlock?: number;
+  processedTradeKeys?: string[];
 }
 
 export interface PaperPosition {
@@ -201,6 +203,8 @@ export class CopyTrader {
   private priceTimer?: NodeJS.Timeout;
   private reportTimer?: NodeJS.Timeout;
   private persistQueue: Promise<void> = Promise.resolve();
+  private lastProcessedBlock = 0;
+  private readonly processedTradeKeys = new Set<string>();
   private dayStartEquityUsd: number;
   private dayStartMstDay = currentMstDay();
   private running = false;
@@ -424,6 +428,8 @@ export class CopyTrader {
       })),
       dayStartEquityUsd: this.dayStartEquityUsd,
       dayStartMstDay: this.dayStartMstDay,
+      lastProcessedBlock: this.lastProcessedBlock,
+      processedTradeKeys: [...this.processedTradeKeys],
     };
   }
 
@@ -547,6 +553,11 @@ export class CopyTrader {
     }
     this.dayStartEquityUsd = Number.isFinite(state.dayStartEquityUsd) ? state.dayStartEquityUsd! : this.paperEquity();
     this.dayStartMstDay = state.dayStartMstDay ?? currentMstDay();
+    this.lastProcessedBlock = Number.isFinite(state.lastProcessedBlock) ? state.lastProcessedBlock! : 0;
+    this.processedTradeKeys.clear();
+    for (const key of state.processedTradeKeys ?? []) {
+      if (typeof key === 'string') this.processedTradeKeys.add(key);
+    }
     await this.persistState();
   }
 
@@ -688,6 +699,10 @@ export class CopyTrader {
     log.warn('paper account reset to starting budget');
   }
 
+  getLastProcessedBlock(): number {
+    return this.lastProcessedBlock;
+  }
+
   /**
    * Inspect a block for watched-wallet activity.
    *
@@ -696,7 +711,14 @@ export class CopyTrader {
    * A failed transfer-log query retries the block instead of losing trades.
    */
   async processBlock(blockNumber: number): Promise<boolean> {
-    if (this.watchedWallets.size === 0 && this.shadowWallets.size === 0) return true;
+    if (this.watchedWallets.size === 0 && this.shadowWallets.size === 0) {
+      this.lastProcessedBlock = blockNumber;
+      return true;
+    }
+
+    // Already-processed blocks are skipped so restarts resume at the last
+    // persisted checkpoint rather than re-walking history.
+    if (blockNumber <= this.lastProcessedBlock) return true;
 
     try {
       // drpc "Unknown block" race right after the WS announcement: retry
@@ -789,8 +811,15 @@ export class CopyTrader {
 
       for (const trade of shadowTrades) this.observeShadowTrade(trade);
       for (const trade of trades) {
+        const tradeKey = `${trade.txHash}:${trade.wallet}:${trade.tokenAddress}:${trade.type}`;
+        if (this.processedTradeKeys.has(tradeKey)) {
+          log.debug('copytrade already processed — skipping duplicate', { tradeKey });
+          continue;
+        }
+        this.recordTradeKey(tradeKey);
         await this.executePaperTrade(trade);
       }
+      this.lastProcessedBlock = blockNumber;
       return true;
     } catch (err) {
       log.warn('copytrader block scan failed — retrying', { blockNumber, ...errMeta(err) });
@@ -938,6 +967,7 @@ export class CopyTrader {
       }
 
       await this.refreshPositionPrices();
+      await this.cleanupDustPositions();
       await this.retryPendingBuys();
       await this.enforceAutoTakeProfit();
       await this.enforceStopLoss();
@@ -1396,6 +1426,21 @@ export class CopyTrader {
   }
 
   /**
+   * Remove positions whose token balance has rounded to effectively zero
+   * (less than 1e-6 units). These are leftover dust from prior full exits
+   * and would otherwise show as open positions with zero cost basis.
+   */
+  private async cleanupDustPositions(): Promise<void> {
+    for (const [key, pos] of [...this.positions]) {
+      const units = Number(pos.balance) / Math.pow(10, pos.decimals);
+      if (units > 0 && units < 1e-6) {
+        log.info('cleaning up dust position', { token: pos.symbol, balance: pos.balance.toString(), units });
+        this.positions.delete(key);
+      }
+    }
+  }
+
+  /**
    * Detect a buy/sell from ERC-20 Transfer events in the transaction receipt.
    *
    * This works for ANY router or aggregator (Uniswap V2/V3/Universal Router,
@@ -1796,8 +1841,14 @@ export class CopyTrader {
 
     // Any watched wallet's exit counts: mirror the fraction of THEIR
     // position that they sold, applied to our aggregated position.
-    const sellPct = walletBalanceBefore > 0n ? Math.min(1, Number(trade.tokenAmount) / Number(walletBalanceBefore)) : 1;
-    const ourSellAmount = BigInt(Math.floor(Number(pos.balance) * sellPct));
+    // Use bigint math so full exits consume the entire position and leave no
+    // rounding dust behind.
+    const ourSellAmount = walletBalanceBefore > 0n
+      ? (pos.balance * trade.tokenAmount) / walletBalanceBefore
+      : pos.balance;
+    const sellPct = walletBalanceBefore > 0n
+      ? Math.min(1, Number(trade.tokenAmount) / Number(walletBalanceBefore))
+      : 1;
 
     if (ourSellAmount <= 0n) {
       walletBalances.set(key, walletBalanceBefore > trade.tokenAmount ? walletBalanceBefore - trade.tokenAmount : 0n);
@@ -2108,6 +2159,20 @@ export class CopyTrader {
     if (!ok) {
       log.warn('copytrade alert failed', { txHash: trade.txHash });
     }
+  }
+
+  private recordTradeKey(key: string): void {
+    // Prevent memory bloat on long runs: keep the most recent 50k keys.
+    // Duplicate suppression is only needed within a short retry/reorg window,
+    // so dropping very old keys is safe.
+    if (this.processedTradeKeys.size >= 50_000) {
+      let cleared = 0;
+      for (const old of this.processedTradeKeys) {
+        this.processedTradeKeys.delete(old);
+        if (++cleared >= 25_000) break;
+      }
+    }
+    this.processedTradeKeys.add(key);
   }
 
   private getWalletBalanceMap(wallet: string): Map<string, bigint> {

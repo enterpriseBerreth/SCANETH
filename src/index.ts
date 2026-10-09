@@ -78,8 +78,8 @@ class ScanethBot {
     });
 
     const startBlock = this.config.startBlock ?? (await this.providers.http.getBlockNumber());
-    this.lastProcessedBlock = startBlock - 1;
-    log.info('starting copywallet monitor', { startBlock, ws: !!this.config.wsUrl });
+    this.lastProcessedBlock = Math.max(this.copytrader!.getLastProcessedBlock(), startBlock - 1);
+    log.info('starting copywallet monitor', { startBlock, resumeFrom: this.lastProcessedBlock + 1, ws: !!this.config.wsUrl });
 
     if (this.config.wsUrl && this.providers.main.on) {
       this.providers.main.on('block', (blockNumber: number) => {

@@ -141,9 +141,12 @@ function addressList(key: string): string[] {
 }
 
 export function loadConfig(): ScanethConfig {
+  const rpcUrl = str('ETHEREUM_RPC_URL', 'https://ethereum-rpc.publicnode.com');
   const config: ScanethConfig = {
-    rpcUrl: str('ETHEREUM_RPC_URL', 'https://ethereum-rpc.publicnode.com'),
-    fallbackRpcUrl: str('ETHEREUM_FALLBACK_RPC_URL', 'https://eth.llamarpc.com'),
+    rpcUrl,
+    fallbackRpcUrl: str('ETHEREUM_FALLBACK_RPC_URL', rpcUrl.includes('publicnode.com')
+      ? 'https://eth.drpc.org'
+      : 'https://ethereum-rpc.publicnode.com'),
     wsUrl: optionalStr('ETHEREUM_WS_URL'),
     port: num('PORT', 3000),
     probeEth: num('PROBE_ETH', 0.001),

@@ -1,8 +1,8 @@
 /**
  * SCANETH run state.
  *
- * In-memory counters and recent launch log. A restarted scanner should not
- * trust stale local state; it resumes from the chain head.
+ * In-memory counters and recent launch log. The copytrader persists its own
+ * last-processed block; this class only tracks runtime progress for healthchecks.
  */
 
 import type { ScanStats, TokenLaunch } from './scaneth/types';
