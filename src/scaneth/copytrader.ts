@@ -1668,6 +1668,49 @@ export class CopyTrader {
     return result;
   }
 
+  /**
+   * Per-wallet rolling 7-day stats. Returns realized PNL, cost basis,
+   * trade count, active days, and average trades per active day for ranking.
+   */
+  getWalletWeeklyStats(): Array<{
+    wallet: string;
+    realizedPnlUsd: number;
+    costBasisUsd: number;
+    trades: number;
+    activeDays: number;
+    tradesPerActiveDay: number;
+    clipUsd: number;
+  }> {
+    const cutoff = new Date(Date.now() - 7 * 86_400_000).toISOString().slice(0, 10);
+    const result: ReturnType<CopyTrader['getWalletWeeklyStats']> = [];
+    for (const wallet of this.watchedWallets) {
+      const days = this.walletDailyStats.get(wallet);
+      let realized = 0;
+      let costBasis = 0;
+      let trades = 0;
+      let activeDays = 0;
+      if (days) {
+        for (const [day, stats] of days) {
+          if (day < cutoff) continue;
+          realized += stats.realizedPnlUsd;
+          costBasis += stats.costBasisUsd;
+          trades += stats.trades;
+          if (stats.trades > 0) activeDays++;
+        }
+      }
+      result.push({
+        wallet,
+        realizedPnlUsd: realized,
+        costBasisUsd: costBasis,
+        trades,
+        activeDays,
+        tradesPerActiveDay: activeDays > 0 ? trades / activeDays : 0,
+        clipUsd: OWNER_CLIP_USD.get(wallet) ?? (this.premiumWallets.has(wallet) ? PREMIUM_BUY_USD : this.config.copytraderBuyAmountUsd),
+      });
+    }
+    return result.sort((a, b) => b.realizedPnlUsd - a.realizedPnlUsd);
+  }
+
   private async executePaperBuy(trade: CopyTrade): Promise<void> {
     const key = trade.tokenAddress.toLowerCase();
 

@@ -74,6 +74,7 @@ class ScanethBot {
       copytrader: this.copytrader,
       copytraderStats: () => this.copytrader?.getStats(),
       scoutStats: () => this.walletScout?.getStats(),
+      walletWeeklyStats: () => this.copytrader?.getWalletWeeklyStats() ?? [],
       positions: () => this.copytrader?.getOpenPositions() ?? [],
     });
 

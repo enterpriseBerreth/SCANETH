@@ -22,6 +22,7 @@ export interface ServerDeps {
   copytrader?: CopyTrader;
   copytraderStats?: () => CopyTraderStats | undefined;
   scoutStats?: () => ScoutStats | undefined;
+  walletWeeklyStats?: () => ReturnType<NonNullable<CopyTrader['getWalletWeeklyStats']>>;
   positions?: () => ReturnType<NonNullable<CopyTrader['getOpenPositions']>>;
 }
 
@@ -105,6 +106,7 @@ export function startServer(deps: ServerDeps): Server {
           state: deps.state.snapshot(),
           copytrader: deps.copytraderStats?.(),
           scout: deps.scoutStats?.(),
+          walletWeekly: deps.walletWeeklyStats?.(),
         }),
       );
       return;
