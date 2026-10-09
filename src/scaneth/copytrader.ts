@@ -50,7 +50,7 @@ const AUTO_TP_MIN_AGE_MS = 24 * 3_600_000;
  */
 const OWNER_CLIP_TIERS: ReadonlyArray<{ wallet: string; clipUsd: number }> = [
   { wallet: '0xc05ef5e1fd014267f66fa24b260f361af7d79122', clipUsd: 200 },
-  { wallet: '0xb51ff2f65b935142aab32abefa1c0e29a4161d31', clipUsd: 100 },
+  { wallet: '0xb51ff2f65b935142aab32abefa1c0e29a4161d31', clipUsd: 200 },
   { wallet: '0xae3c9dfd4dd4700d2382e985fb348b71b1341b5d', clipUsd: 100 },
 ];
 const OWNER_CLIP_USD = new Map(OWNER_CLIP_TIERS.map((t) => [t.wallet, t.clipUsd] as const));
