@@ -208,6 +208,7 @@ export class CopyTrader {
   private dayStartEquityUsd: number;
   private dayStartMstDay = currentMstDay();
   private running = false;
+  private cumulativeRealizedPnlUsd = 0;
   /**
    * Wallets eligible for premium copying. Owner clips come from
    * OWNER_CLIP_TIERS (see executePaperTrade); scout-promoted newcomers copy
@@ -340,7 +341,7 @@ export class CopyTrader {
         ? (totalPnl / this.config.copytraderStartingBudgetUsd) * 100
         : 0,
       totalCostBasisUsd: totalCostBasis,
-      totalRealizedPnlUsd: this.cashUsd + totalCostBasis - this.config.copytraderStartingBudgetUsd,
+      totalRealizedPnlUsd: this.cumulativeRealizedPnlUsd,
       totalUnrealizedPnlUsd: totalUnrealized,
       tradeCount: this.tradeCount,
     };
@@ -376,6 +377,8 @@ export class CopyTrader {
     }
     const state = JSON.parse(raw) as PersistedState;
     await this.restoreState(state);
+    await this.cleanupDustPositions();
+    await this.reconcileWalletPositions();
     log.info('paper state restored from disk', {
       path,
       positions: this.positions.size,
@@ -395,7 +398,7 @@ export class CopyTrader {
       version: 1,
       savedAt: Date.now(),
       cashUsd: this.cashUsd,
-      cumulativeRealizedUsd: this.getStats().totalRealizedPnlUsd,
+      cumulativeRealizedUsd: this.cumulativeRealizedPnlUsd,
       tradeCount: this.tradeCount,
       premiumWallets: [...this.premiumWallets],
       positions: [...this.positions.values()].map((pos) => ({
@@ -467,6 +470,7 @@ export class CopyTrader {
     }
     this.cashUsd = state.cashUsd;
     this.tradeCount = Number.isFinite(state.tradeCount) ? state.tradeCount : 0;
+    this.cumulativeRealizedPnlUsd = Number.isFinite(state.cumulativeRealizedUsd) ? state.cumulativeRealizedUsd : 0;
     // Restore scout-managed tiers from the persisted set, but always
     // re-assert the owner-designated premium wallets above whatever the
     // file says — persisted drift must never shrink owner clips.
@@ -716,9 +720,9 @@ export class CopyTrader {
       return true;
     }
 
-    // Already-processed blocks are skipped so restarts resume at the last
-    // persisted checkpoint rather than re-walking history.
-    if (blockNumber <= this.lastProcessedBlock) return true;
+    // Reprocess the last few blocks so short reorgs don't skip altered trades.
+    const REORG_WINDOW = 5;
+    if (blockNumber <= this.lastProcessedBlock - REORG_WINDOW) return true;
 
     try {
       // drpc "Unknown block" race right after the WS announcement: retry
@@ -1017,6 +1021,7 @@ export class CopyTrader {
 
       pos.balance = 0n;
       pos.realizedPnlUsd += pnlUsd;
+      this.cumulativeRealizedPnlUsd += pnlUsd;
       pos.costBasisUsd = 0;
       pos.updatedAt = Date.now();
       this.cashUsd += proceedsUsd;
@@ -1103,6 +1108,7 @@ export class CopyTrader {
 
       pos.balance = 0n;
       pos.realizedPnlUsd += pnlUsd;
+      this.cumulativeRealizedPnlUsd += pnlUsd;
       pos.costBasisUsd = 0;
       pos.updatedAt = Date.now();
       this.cashUsd += proceedsUsd;
@@ -1942,6 +1948,7 @@ export class CopyTrader {
 
     pos.balance -= ourSellAmount;
     pos.realizedPnlUsd += pnlUsd;
+    this.cumulativeRealizedPnlUsd += pnlUsd;
     pos.costBasisUsd = Math.max(0, pos.costBasisUsd - costBasisSold);
     pos.currentPriceUsd = sellPriceUsd;
     pos.updatedAt = trade.timestamp;
