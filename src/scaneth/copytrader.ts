@@ -1405,6 +1405,50 @@ export class CopyTrader {
     return midProceedsUsd * slipFactor * taxFactor;
   }
 
+  /** Exit every open paper position at current market price. */
+  async closeAllPositions(reason: string): Promise<{ closed: number; realizedPnlUsd: number; cashUsd: number }> {
+    if (this.positions.size === 0) return { closed: 0, realizedPnlUsd: 0, cashUsd: this.cashUsd };
+
+    await this.refreshPositionPrices();
+    let realized = 0;
+    let closed = 0;
+
+    for (const [key, pos] of [...this.positions]) {
+      if (pos.balance <= 0n) {
+        this.positions.delete(key);
+        continue;
+      }
+      const midProceedsUsd = (Number(pos.balance) / Math.pow(10, pos.decimals)) * pos.currentPriceUsd;
+      const proceeds = await this.settleExitProceeds(key, midProceedsUsd, false);
+      if (proceeds === null) {
+        log.warn('close-all skipped trapped token', { token: pos.symbol, reason });
+        continue;
+      }
+      const costBasisSold = pos.costBasisUsd;
+      const pnlUsd = proceeds - costBasisSold;
+      this.cashUsd += proceeds;
+      this.cumulativeRealizedPnlUsd += pnlUsd;
+      pos.balance = 0n;
+      pos.costBasisUsd = 0;
+      pos.realizedPnlUsd += pnlUsd;
+      pos.updatedAt = Date.now();
+      this.positions.delete(key);
+      this.tradeCount++;
+      realized += pnlUsd;
+      closed++;
+
+      log.info('close-all position exited', {
+        token: pos.symbol,
+        proceedsUsd: Number(proceeds.toFixed(2)),
+        pnlUsd: Number(pnlUsd.toFixed(2)),
+        reason,
+      });
+    }
+
+    await this.persistState();
+    return { closed, realizedPnlUsd: realized, cashUsd: this.cashUsd };
+  }
+
   /** Refresh current prices of open paper positions via DexScreener. */
   private async refreshPositionPrices(): Promise<void> {
     if (this.positions.size === 0) return;

@@ -46,7 +46,7 @@ export function startServer(deps: ServerDeps): Server {
   server.listen(deps.config.port, () => {
     log.info('http server listening', {
       port: deps.config.port,
-      routes: ['/health', '/stats', '/positions', '/alerts', '/dump', '/restore', '/exit', '/reset'],
+      routes: ['/health', '/stats', '/positions', '/alerts', '/dump', '/restore', '/exit', '/reset', '/close-all'],
     });
   });
 
@@ -126,7 +126,7 @@ export function startServer(deps: ServerDeps): Server {
 
     // --- Admin endpoints (require COPYTRADER_ADMIN_KEY) ---
 
-    if (['/dump', '/restore', '/exit', '/reset'].includes(url)) {
+    if (['/dump', '/restore', '/exit', '/reset', '/close-all'].includes(url)) {
       const key = parsed.searchParams.get('key') ?? '';
       if (!deps.config.copytraderAdminKey || key !== deps.config.copytraderAdminKey) {
         res.writeHead(403, { 'content-type': 'application/json' });
@@ -137,6 +137,19 @@ export function startServer(deps: ServerDeps): Server {
       if (!trader) {
         res.writeHead(503, { 'content-type': 'application/json' });
         res.end(json({ error: 'copytrader not enabled' }));
+        return;
+      }
+
+      if (url === '/close-all') {
+        if (req.method !== 'POST') {
+          res.writeHead(405, { 'content-type': 'application/json' });
+          res.end(json({ error: 'POST required' }));
+          return;
+        }
+        const result = await trader.closeAllPositions('manual-api');
+        log.warn('close-all executed via admin endpoint', { closed: result.closed, realizedPnlUsd: result.realizedPnlUsd });
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.end(json({ ok: true, ...result }));
         return;
       }
 
