@@ -51,7 +51,7 @@ const AUTO_TP_MIN_AGE_MS = 24 * 3_600_000;
 const OWNER_CLIP_TIERS: ReadonlyArray<{ wallet: string; clipUsd: number }> = [
   { wallet: '0xc05ef5e1fd014267f66fa24b260f361af7d79122', clipUsd: 200 },
   { wallet: '0xb51ff2f65b935142aab32abefa1c0e29a4161d31', clipUsd: 200 },
-  { wallet: '0xae3c9dfd4dd4700d2382e985fb348b71b1341b5d', clipUsd: 100 },
+  { wallet: '0xae3c9dfd4dd4700d2382e985fb348b71b1341b5d', clipUsd: 50 },
   { wallet: '0x2c1ca67fa77c30ef23a8a71f42ef7631252ce2e3', clipUsd: 50 },
   { wallet: '0xa02f1823ef1ea0b01c565ece6703d9e3e8be5a4f', clipUsd: 50 },
   { wallet: '0xf5e2ace82d04ab73b2d801fd82eaea227423f81e', clipUsd: 50 },
