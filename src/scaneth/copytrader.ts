@@ -704,6 +704,7 @@ export class CopyTrader {
     this.dayStartEquityUsd = this.cashUsd;
     this.dayStartMstDay = currentMstDay();
     this.tradeCount = 0;
+    this.cumulativeRealizedPnlUsd = 0;
     this.premiumWallets.clear();
     for (const w of PREMIUM_WALLETS) this.premiumWallets.add(w);
     await this.persistState();
