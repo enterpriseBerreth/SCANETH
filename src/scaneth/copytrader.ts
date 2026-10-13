@@ -52,6 +52,13 @@ const OWNER_CLIP_TIERS: ReadonlyArray<{ wallet: string; clipUsd: number }> = [
   { wallet: '0xc05ef5e1fd014267f66fa24b260f361af7d79122', clipUsd: 200 },
   { wallet: '0xb51ff2f65b935142aab32abefa1c0e29a4161d31', clipUsd: 200 },
   { wallet: '0xae3c9dfd4dd4700d2382e985fb348b71b1341b5d', clipUsd: 100 },
+  { wallet: '0x2c1ca67fa77c30ef23a8a71f42ef7631252ce2e3', clipUsd: 50 },
+  { wallet: '0xa02f1823ef1ea0b01c565ece6703d9e3e8be5a4f', clipUsd: 50 },
+  { wallet: '0xf5e2ace82d04ab73b2d801fd82eaea227423f81e', clipUsd: 50 },
+  { wallet: '0xfc7506d541ee119a64f0d75f907d21408b71a562', clipUsd: 50 },
+  { wallet: '0xc9ce3f407b40e1fb7061dbea0fca5dc7ffd18e99', clipUsd: 50 },
+  { wallet: '0xdf2968383a3872e5036cd73fb411d0dabb224253', clipUsd: 50 },
+  { wallet: '0x56311f46963d93eba214a95a5c55193d6bdaf4da', clipUsd: 50 },
 ];
 const OWNER_CLIP_USD = new Map(OWNER_CLIP_TIERS.map((t) => [t.wallet, t.clipUsd] as const));
 
