@@ -685,9 +685,9 @@ export class CopyTrader {
       `Token: <code>${pos.tokenAddress}</code>`,
       `Copied wallet: ${wallets}`,
       '',
-      `PNL: <b>${pnlSign}$${pnlUsd.toFixed(2)} (${pnlSign}${pnlPct.toFixed(2)}%)</b>`,
-      `Capital before trade: $${capitalBefore.toFixed(2)}`,
-      `Capital after trade: <b>$${endingCapital.toFixed(2)}</b>`,
+      `PNL: <b>${pnlSign}${fmtUsd(pnlUsd)} (${pnlSign}${fmtPct(pnlPct)}%)</b>`,
+      `Capital before trade: ${fmtUsd(capitalBefore, '$')}`,
+      `Capital after trade: <b>${fmtUsd(endingCapital, '$')}</b>`,
       '',
       `✋ Exited manually at market`,
     ];
@@ -934,7 +934,7 @@ export class CopyTrader {
       const emoji = w.totalPnlUsd >= 0 ? '🟢' : '🔴';
       return (
         `${idx + 1}. ${emoji} <code>${w.wallet}</code>\n` +
-        `   PNL: <b>${sign}$${w.totalPnlUsd.toFixed(2)} (${pctSign}${w.pnlPct.toFixed(2)}%)</b> · Trades: ${w.trades}`
+        `   PNL: <b>${sign}${fmtUsd(w.totalPnlUsd, '$')} (${pctSign}${fmtPct(w.pnlPct)}%)</b> · Trades: ${w.trades}`
       );
     });
 
@@ -944,14 +944,14 @@ export class CopyTrader {
     if (cutCandidates.length > 0) {
       cutSection =
         `\n\n<b>✂️ Cut candidates (negative PNL — scout will replace):</b>\n` +
-        cutCandidates.map((w) => `<code>${w.wallet}</code> (${w.totalPnlUsd.toFixed(2)})`).join('\n');
+        cutCandidates.map((w) => `<code>${w.wallet}</code> (${fmtUsd(w.totalPnlUsd)})`).join('\n');
     }
 
     const dayTotalsSign = dayTotalPnlUsd >= 0 ? '+' : '';
     const dayTotalsPctSign = dayTotalPnlPct >= 0 ? '+' : '';
     const dayTotalsSection =
       `\n\n<b>📊 Day totals (all trades combined)</b>\n` +
-      `PNL: <b>${dayTotalsSign}$${dayTotalPnlUsd.toFixed(2)} (${dayTotalsPctSign}${dayTotalPnlPct.toFixed(2)}%)</b>\n` +
+      `PNL: <b>${dayTotalsSign}${fmtUsd(dayTotalPnlUsd, '$')} (${dayTotalsPctSign}${fmtPct(dayTotalPnlPct)}%)</b>\n` +
       `Trades copied: ${dayTrades}`;
 
     const message =
@@ -1818,6 +1818,18 @@ export class CopyTrader {
     // observable at detection time — not the wallet's own earlier fill.
     const entryPriceUsd = market.priceUsd > 0 ? market.priceUsd : trade.tokenPriceUsd;
 
+    // Unanchored price (snapshot failed and no trade-side price): sizing
+    // would divide by zero — Infinity -> BigInt throws and stalls the whole
+    // block loop. Defer instead of crashing.
+    if (!(entryPriceUsd > 0) || !Number.isFinite(entryPriceUsd)) {
+      log.warn('paper buy deferred — no anchored price', {
+        token: trade.tokenAddress,
+        marketPrice: market.priceUsd,
+        tradePrice: trade.tokenPriceUsd,
+      });
+      return;
+    }
+
     // Live-execution reality 1: not every real fill succeeds. Anti-bot
     // launch windows, reverting buy taxes, and gas wars drop a share of
     // entries. Deterministic per-tx roll so restarts replay identically.
@@ -2074,9 +2086,15 @@ export class CopyTrader {
     }
 
     if (pos.decimals !== decimals) {
+      // Rescale the stored balance to the corrected decimal scale. Keeping
+      // the old-scale balance under a new decimals value would corrupt every
+      // downstream USD valuation by 10^x (the e+21 PNL class of bug).
+      const scale = Math.pow(10, pos.decimals - decimals);
       log.warn('wallet portfolio decimals corrected', {
         wallet: walletKey, token: tokenKey, stored: pos.decimals, trade: decimals,
+        balanceRescaled: scale !== 1,
       });
+      pos.balance = scale > 1 ? pos.balance / BigInt(scale) : pos.balance * BigInt(Math.pow(10, decimals - pos.decimals));
       pos.decimals = decimals;
     }
 
@@ -2258,9 +2276,9 @@ export class CopyTrader {
       `Token: <code>${trade.tokenAddress}</code>`,
       `Copied wallet: <code>${trade.wallet}</code>`,
       '',
-      `PNL: <b>${pnlSign}$${pnlUsd.toFixed(2)} (${pnlSign}${pnlPct.toFixed(2)}%)</b>`,
-      `Capital before trade: $${capitalBefore.toFixed(2)}`,
-      `Capital after trade: <b>$${endingCapital.toFixed(2)}</b>`,
+      `PNL: <b>${pnlSign}${fmtUsd(pnlUsd)} (${pnlSign}${fmtPct(pnlPct)}%)</b>`,
+      `Capital before trade: ${fmtUsd(capitalBefore, '$')}`,
+      `Capital after trade: <b>${fmtUsd(endingCapital, '$')}</b>`,
     ];
 
     const ok = await this.notifier.sendRaw(lines.join('\n'));
@@ -2324,6 +2342,28 @@ export class CopyTrader {
 /** Current MST day string YYYY-MM-DD. MST = UTC-7. */
 function currentMstDay(): string {
   return dayStringAtOffset(-7);
+}
+
+/**
+ * Format a USD amount for alerts. Guards against non-finite values leaking
+ * into Telegram as "NaN", "Infinity", or e+21-style exponent strings — the
+ * visible symptom of any upstream decimal/price corruption.
+ */
+function fmtUsd(value: number, prefix = ''): string {
+  if (!Number.isFinite(value)) {
+    log.error('non-finite usd value in alert', { value });
+    return `${prefix}0.00`;
+  }
+  return `${prefix}${value.toFixed(2)}`;
+}
+
+/** Format a percentage for alerts with the same non-finite guard. */
+function fmtPct(value: number): string {
+  if (!Number.isFinite(value)) {
+    log.error('non-finite pct value in alert', { value });
+    return '0.00';
+  }
+  return value.toFixed(2);
 }
 
 function previousMstDay(reportHourUtc: number): string {
