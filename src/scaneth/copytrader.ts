@@ -638,9 +638,9 @@ export class CopyTrader {
     }
     const impactFactor = this.exitImpactFactor(midProceedsUsd, market.liquidityUsd);
     const proceedsUsd = settled * impactFactor;
-    const capitalBefore = this.paperEquity();
     const gasPaid = this.takeGas();
     const pnlUsd = proceedsUsd - pos.costBasisUsd - gasPaid;
+    const costBasisSold = pos.costBasisUsd;
 
     pos.balance = 0n;
     pos.realizedPnlUsd += pnlUsd;
@@ -660,20 +660,20 @@ export class CopyTrader {
       reason,
     });
 
-    await this.sendManualExitAlert(pos, proceedsUsd, pnlUsd, capitalBefore);
+    await this.sendManualExitAlert(pos, costBasisSold, pnlUsd);
     return true;
   }
 
   /** Alert for a manual/admin exit (minimal format). */
   private async sendManualExitAlert(
     pos: PaperPosition,
-    proceedsUsd: number,
+    costBasisSold: number,
     pnlUsd: number,
-    capitalBefore: number,
   ): Promise<void> {
-    const pnlPct = (pnlUsd / Math.max(1e-9, proceedsUsd - pnlUsd)) * 100;
-    const pnlSign = pnlUsd >= 0 ? '+' : '';
     const endingCapital = this.paperEquity();
+    const capitalBefore = endingCapital - pnlUsd;
+    const pnlPct = (pnlUsd / Math.max(1e-9, costBasisSold)) * 100;
+    const pnlSign = pnlUsd >= 0 ? '+' : '';
     const wallets =
       pos.contributors.size > 0
         ? [...pos.contributors].map((w) => `<code>${w}</code>`).join(', ')
@@ -1031,7 +1031,7 @@ export class CopyTrader {
       const proceedsUsd = settled * impactFactor;
       const gasPaid = this.takeGas();
       const pnlUsd = proceedsUsd - pos.costBasisUsd - gasPaid;
-      const capitalBefore = this.paperEquity();
+      const costBasisSold = pos.costBasisUsd;
 
       pos.balance = 0n;
       pos.realizedPnlUsd += pnlUsd;
@@ -1054,20 +1054,20 @@ export class CopyTrader {
         pnlUsd,
       });
 
-      await this.sendStopLossAlert(pos, proceedsUsd, pnlUsd, capitalBefore);
+      await this.sendStopLossAlert(pos, costBasisSold, pnlUsd);
     }
   }
 
   /** Alert for a stop-loss exit of a paper position (minimal format). */
   private async sendStopLossAlert(
     pos: PaperPosition,
-    proceedsUsd: number,
+    costBasisSold: number,
     pnlUsd: number,
-    capitalBefore: number,
   ): Promise<void> {
-    const costBasisSold = Math.max(1e-9, proceedsUsd - pnlUsd);
-    const pnlPct = (pnlUsd / costBasisSold) * 100;
     const endingCapital = this.paperEquity();
+    const capitalBefore = endingCapital - pnlUsd;
+    const pnlPct = (pnlUsd / Math.max(1e-9, costBasisSold)) * 100;
+    const pnlSign = pnlUsd >= 0 ? '+' : '';
 
     const lines = [
       `<b>SCANETH — Paper copytrade SELL (stop-loss)</b>`,
@@ -1075,9 +1075,9 @@ export class CopyTrader {
       `Token: <code>${pos.tokenAddress}</code>`,
       `Copied wallet: ${[...pos.contributors].map((wallet) => `<code>${wallet}</code>`).join(', ')}`,
       '',
-      `PNL: <b>-$${Math.abs(pnlUsd).toFixed(2)} (-${Math.abs(pnlPct).toFixed(2)}%)</b>`,
-      `Capital before trade: $${capitalBefore.toFixed(2)}`,
-      `Capital after trade: <b>$${endingCapital.toFixed(2)}</b>`,
+      `PNL: <b>${pnlSign}${fmtUsd(pnlUsd)} (${pnlSign}${fmtPct(pnlPct)}%)</b>`,
+      `Capital before trade: ${fmtUsd(capitalBefore, '$')}`,
+      `Capital after trade: <b>${fmtUsd(endingCapital, '$')}</b>`,
       '',
       `⛔ Auto-exited at −${this.config.copytraderStopLossPct}% stop-loss`,
     ];
@@ -1118,7 +1118,7 @@ export class CopyTrader {
       const proceedsUsd = settled * impactFactor;
       const gasPaid = this.takeGas();
       const pnlUsd = proceedsUsd - pos.costBasisUsd - gasPaid;
-      const capitalBefore = this.paperEquity();
+      const costBasisSold = pos.costBasisUsd;
 
       pos.balance = 0n;
       pos.realizedPnlUsd += pnlUsd;
@@ -1141,20 +1141,20 @@ export class CopyTrader {
         heldHours: ((Date.now() - pos.openedAt) / 3_600_000).toFixed(1),
       });
 
-      await this.sendAutoTpAlert(pos, proceedsUsd, pnlUsd, capitalBefore);
+      await this.sendAutoTpAlert(pos, costBasisSold, pnlUsd);
     }
   }
 
   /** Alert for an auto-take-profit exit (same minimal format as wallet sells). */
   private async sendAutoTpAlert(
     pos: PaperPosition,
-    proceedsUsd: number,
+    costBasisSold: number,
     pnlUsd: number,
-    capitalBefore: number,
   ): Promise<void> {
-    const pnlPct = (pnlUsd / Math.max(1e-9, proceedsUsd - pnlUsd)) * 100;
-    const pnlSign = pnlUsd >= 0 ? '+' : '';
     const endingCapital = this.paperEquity();
+    const capitalBefore = endingCapital - pnlUsd;
+    const pnlPct = (pnlUsd / Math.max(1e-9, costBasisSold)) * 100;
+    const pnlSign = pnlUsd >= 0 ? '+' : '';
 
     const lines = [
       `<b>SCANETH — Paper copytrade SELL (auto-take-profit)</b>`,
@@ -1162,9 +1162,9 @@ export class CopyTrader {
       `Token: <code>${pos.tokenAddress}</code>`,
       `Copied wallet: ${[...pos.contributors].map((wallet) => `<code>${wallet}</code>`).join(', ')}`,
       '',
-      `PNL: <b>${pnlSign}$${pnlUsd.toFixed(2)} (${pnlSign}${pnlPct.toFixed(2)}%)</b>`,
-      `Capital before trade: $${capitalBefore.toFixed(2)}`,
-      `Capital after trade: <b>$${endingCapital.toFixed(2)}</b>`,
+      `PNL: <b>${pnlSign}${fmtUsd(pnlUsd)} (${pnlSign}${fmtPct(pnlPct)}%)</b>`,
+      `Capital before trade: ${fmtUsd(capitalBefore, '$')}`,
+      `Capital after trade: <b>${fmtUsd(endingCapital, '$')}</b>`,
       '',
       `📌 Exited: profitable and held >24h (wallet rule)`,
     ];
@@ -1432,14 +1432,18 @@ export class CopyTrader {
         this.positions.delete(key);
         continue;
       }
+      const market = await this.getMarketSnapshot(key);
       const midProceedsUsd = (Number(pos.balance) / Math.pow(10, pos.decimals)) * pos.currentPriceUsd;
-      const proceeds = await this.settleExitProceeds(key, midProceedsUsd, false);
-      if (proceeds === null) {
+      const settled = await this.settleExitProceeds(key, midProceedsUsd, false);
+      if (settled === null) {
         log.warn('close-all skipped trapped token', { token: pos.symbol, reason });
         continue;
       }
+      const impactFactor = this.exitImpactFactor(midProceedsUsd, market.liquidityUsd);
+      const proceeds = settled * impactFactor;
+      const gasPaid = this.takeGas();
       const costBasisSold = pos.costBasisUsd;
-      const pnlUsd = proceeds - costBasisSold;
+      const pnlUsd = proceeds - costBasisSold - gasPaid;
       this.cashUsd += proceeds;
       this.cumulativeRealizedPnlUsd += pnlUsd;
       pos.balance = 0n;
@@ -1454,9 +1458,12 @@ export class CopyTrader {
       log.info('close-all position exited', {
         token: pos.symbol,
         proceedsUsd: Number(proceeds.toFixed(2)),
+        gasPaid,
         pnlUsd: Number(pnlUsd.toFixed(2)),
         reason,
       });
+
+      await this.sendManualExitAlert(pos, costBasisSold, pnlUsd);
     }
 
     await this.persistState();
@@ -1956,8 +1963,6 @@ export class CopyTrader {
     }
 
     // Account snapshot before the trade (for the alert).
-    const capitalBefore = this.paperEquity();
-
     // Any watched wallet's exit counts: mirror the fraction of THEIR
     // position that they sold, applied to our aggregated position.
     // Use bigint math so full exits consume the entire position and leave no
@@ -2058,9 +2063,8 @@ export class CopyTrader {
         positionClosed: pos.balance <= 0n,
       },
       ourSellAmount,
-      proceedsUsd,
+      costBasisSold,
       pnlUsd,
-      capitalBefore,
     );
   }
 
@@ -2257,17 +2261,19 @@ export class CopyTrader {
    * Single alert per copied trade, sent AFTER the sell executes.
    * Contains only: token address, copied wallet, PNL $/%, capital
    * before and after the trade. Called AFTER paper state is updated.
+   * PNL% is computed against the cost basis actually sold (capital at
+   * risk), and Capital-before anchors to after − PNL so the three
+   * numbers always reconcile.
    */
   private async sendTradeAlert(
     trade: CopyTrade,
     _ourTokenAmount: bigint,
-    _ourUsdAmount: number,
+    costBasisSold: number,
     pnlUsd: number,
-    capitalBefore: number,
   ): Promise<void> {
     const endingCapital = this.paperEquity();
-    const costBasisSold = Math.max(1e-9, _ourUsdAmount - pnlUsd);
-    const pnlPct = (pnlUsd / costBasisSold) * 100;
+    const capitalBefore = endingCapital - pnlUsd;
+    const pnlPct = (pnlUsd / Math.max(1e-9, costBasisSold)) * 100;
     const pnlSign = pnlUsd >= 0 ? '+' : '';
 
     const lines = [
