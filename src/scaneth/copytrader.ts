@@ -105,6 +105,8 @@ export interface PersistedState {
   dayStartMstDay?: string;
   lastProcessedBlock?: number;
   processedTradeKeys?: string[];
+  walletPnlEvents?: Record<string, Array<{ ts: number; kind: 'buy' | 'sell'; pnlUsd: number; usdAmount: number }>>;
+  equitySamples?: Array<{ ts: number; equity: number }>;
 }
 
 export interface PaperPosition {
@@ -209,6 +211,10 @@ export class CopyTrader {
   private readonly walletBalances = new Map<string, Map<string, bigint>>(); // wallet -> token -> balance
   private readonly walletPortfolios = new Map<string, Map<string, WalletPosition>>(); // wallet -> token -> position
   private readonly walletDailyStats = new Map<string, Map<string, WalletDailyStats>>(); // wallet -> day -> stats
+  /** Timestamped PNL events per wallet — powers exact trailing-24h ranking alerts. */
+  private readonly walletPnlEvents = new Map<string, Array<{ ts: number; kind: 'buy' | 'sell'; pnlUsd: number; usdAmount: number }>>();
+  /** Periodic equity samples for trailing-24h account totals. */
+  private equitySamples: Array<{ ts: number; equity: number }> = [];
   private readonly positions = new Map<string, PaperPosition>(); // token -> aggregated position
   private tradeCount = 0;
   /** Trades observed per watched wallet (for scout ranking). */
@@ -455,6 +461,8 @@ export class CopyTrader {
       dayStartMstDay: this.dayStartMstDay,
       lastProcessedBlock: this.lastProcessedBlock,
       processedTradeKeys: [...this.processedTradeKeys],
+      walletPnlEvents: Object.fromEntries([...this.walletPnlEvents]),
+      equitySamples: this.equitySamples.slice(-2880),
     };
   }
 
@@ -520,6 +528,8 @@ export class CopyTrader {
     this.walletBalances.clear();
     this.walletPortfolios.clear();
     this.walletDailyStats.clear();
+    this.walletPnlEvents.clear();
+    this.equitySamples = [];
     this.walletTradeCounts.clear();
     this.positions.clear();
     for (const p of state.positions ?? []) {
@@ -594,6 +604,18 @@ export class CopyTrader {
     for (const key of state.processedTradeKeys ?? []) {
       if (typeof key === 'string') this.processedTradeKeys.add(key);
     }
+    this.walletPnlEvents.clear();
+    for (const [wallet, events] of Object.entries(state.walletPnlEvents ?? {})) {
+      if (!Array.isArray(events)) continue;
+      this.walletPnlEvents.set(
+        wallet.toLowerCase(),
+        events.filter((e) => e && Number.isFinite(e.ts) && Number.isFinite(e.pnlUsd)),
+      );
+    }
+    this.equitySamples = (state.equitySamples ?? []).filter(
+      (s) => s && Number.isFinite(s.ts) && Number.isFinite(s.equity),
+    );
+    this.pruneRollingWindows();
     await this.persistState();
   }
 
@@ -724,6 +746,8 @@ export class CopyTrader {
     this.walletBalances.clear();
     this.walletPortfolios.clear();
     this.walletDailyStats.clear();
+    this.walletPnlEvents.clear();
+    this.equitySamples = [];
     this.walletTradeCounts.clear();
     this.pendingBuys.clear();
     this.cashUsd = this.config.copytraderStartingBudgetUsd;
@@ -894,35 +918,54 @@ export class CopyTrader {
     }, Math.max(1_000, msUntil));
   }
 
+  /**
+   * Trailing-24h wallet ranking (sent daily at 12:00am MST).
+   * Uses the timestamped event log so the window is a true rolling 24h —
+   * not a calendar-day ledger — and positions/exits older than the window
+   * never leak in.
+   */
   private async sendDailyWalletReport(): Promise<void> {
-    const previousDay = previousMstDay(this.config.dailyReportHourUtc);
+    const windowMs = 24 * 3_600_000;
+    const cutoff = Date.now() - windowMs;
+    this.pruneRollingWindows();
+
     const walletPnls: Array<{ wallet: string; realizedUsd: number; unrealizedUsd: number; totalPnlUsd: number; pnlPct: number; trades: number; investedUsd: number }> = [];
 
     for (const wallet of this.watchedWallets) {
-      const dayStats = this.getWalletDayStats(wallet, previousDay);
-      const portfolio = this.walletPortfolios.get(wallet);
-
-      let unrealizedUsd = 0;
-      let openCostBasisUsd = 0;
-
-      if (portfolio) {
-        for (const [tokenLower, pos] of portfolio) {
-          if (pos.balance <= 0n) continue;
-          const currentPrice = await this.getCurrentTokenPrice(tokenLower);
-          if (!Number.isFinite(currentPrice) || currentPrice <= 0) continue;
-          const tokenQty = Number(pos.balance) / Math.pow(10, pos.decimals);
-          const marketValue = tokenQty * currentPrice;
-          const cost = tokenQty * pos.avgEntryPriceUsd;
-          unrealizedUsd += marketValue - cost;
-          openCostBasisUsd += cost;
+      const events = (this.walletPnlEvents.get(wallet) ?? []).filter((e) => e.ts >= cutoff);
+      let netRealizedUsd = 0;
+      let buys = 0;
+      let investedUsd = 0;
+      for (const e of events) {
+        netRealizedUsd += e.pnlUsd; // buys carry −gas, sells carry net PNL
+        if (e.kind === 'buy') {
+          buys++;
+          investedUsd += e.usdAmount;
         }
       }
 
-      // Net realized: sell PNL (already includes sell-side gas) minus
-      // buy-side gas, so wallet figures reconcile with account equity.
-      const netRealizedUsd = dayStats.realizedPnlUsd - dayStats.gasUsd;
+      // Unrealized from positions opened inside the window, attributed
+      // proportionally to this wallet's share of the deployment.
+      let unrealizedUsd = 0;
+      let openCostBasisUsd = 0;
+      for (const pos of this.positions.values()) {
+        if (pos.balance <= 0n || pos.openedAt < cutoff) continue;
+        const contributions = pos.contributionsUsd;
+        const myUsd = contributions?.get(wallet) ?? 0;
+        const totalUsd = contributions ? [...contributions.values()].reduce((sum, usd) => sum + usd, 0) : 0;
+        if (!(myUsd > 0) || !(totalUsd > 0)) continue;
+        const share = myUsd / totalUsd;
+        const currentPrice = await this.getCurrentTokenPrice(pos.tokenAddress);
+        if (!Number.isFinite(currentPrice) || currentPrice <= 0) continue;
+        const qty = Number(pos.balance) / Math.pow(10, pos.decimals);
+        const marketValue = qty * currentPrice * share;
+        const cost = qty * pos.avgEntryPriceUsd * share;
+        unrealizedUsd += marketValue - cost;
+        openCostBasisUsd += cost;
+      }
+
       const totalPnlUsd = netRealizedUsd + unrealizedUsd;
-      const invested = dayStats.costBasisUsd + openCostBasisUsd;
+      const invested = investedUsd + openCostBasisUsd;
       const pnlPct = invested > 0 ? (totalPnlUsd / invested) * 100 : 0;
 
       walletPnls.push({
@@ -931,21 +974,25 @@ export class CopyTrader {
         unrealizedUsd,
         totalPnlUsd,
         pnlPct,
-        trades: dayStats.trades,
+        trades: buys,
         investedUsd: invested,
       });
     }
 
     walletPnls.sort((a, b) => b.totalPnlUsd - a.totalPnlUsd);
 
-    // Day totals: all copied trades combined into one PNL figure.
-    const dayTotalPnlUsd = this.paperEquity() - this.dayStartEquityUsd;
-    const dayTotalPnlPct = this.dayStartEquityUsd > 0 ? (dayTotalPnlUsd / this.dayStartEquityUsd) * 100 : 0;
-    const dayTrades = walletPnls.reduce((sum, w) => sum + w.trades, 0);
+    // Trailing-24h account total: equity now vs the closest sample ≥24h ago.
+    const equityNow = this.paperEquity();
+    const baseline = this.equitySamples.find((s) => s.ts >= cutoff)
+      ?? this.equitySamples[0]
+      ?? { ts: Date.now(), equity: this.dayStartEquityUsd };
+    const windowTotalPnlUsd = equityNow - baseline.equity;
+    const windowTotalPnlPct = baseline.equity > 0 ? (windowTotalPnlUsd / baseline.equity) * 100 : 0;
+    const windowTrades = walletPnls.reduce((sum, w) => sum + w.trades, 0);
 
     if (walletPnls.length === 0) {
       const message =
-        `<b>SCANETH — Copied wallet rankings (${previousDay})</b>\n\n` +
+        `<b>SCANETH — Copied wallet rankings (last 24h)</b>\n\n` +
         `No wallets are being copied yet.`;
       await this.notifier.sendRaw(message);
       return;
@@ -961,7 +1008,7 @@ export class CopyTrader {
       );
     });
 
-    // Cut list: wallets with negative PNL for the day, worst first.
+    // Cut list: wallets with negative 24h PNL, worst first.
     const cutCandidates = [...walletPnls].reverse().filter((w) => w.totalPnlUsd < 0);
     let cutSection = '';
     if (cutCandidates.length > 0) {
@@ -970,27 +1017,27 @@ export class CopyTrader {
         cutCandidates.map((w) => `<code>${w.wallet}</code> (${fmtUsd(w.totalPnlUsd)})`).join('\n');
     }
 
-    const dayTotalsSign = dayTotalPnlUsd >= 0 ? '+' : '';
-    const dayTotalsPctSign = dayTotalPnlPct >= 0 ? '+' : '';
-    const dayTotalsSection =
-      `\n\n<b>📊 Day totals (all trades combined)</b>\n` +
-      `PNL: <b>${dayTotalsSign}${fmtUsd(dayTotalPnlUsd, '$')} (${dayTotalsPctSign}${fmtPct(dayTotalPnlPct)}%)</b>\n` +
-      `Trades copied: ${dayTrades}`;
+    const windowSign = windowTotalPnlUsd >= 0 ? '+' : '';
+    const windowPctSign = windowTotalPnlPct >= 0 ? '+' : '';
+    const windowTotalsSection =
+      `\n\n<b>📊 Last 24h totals (all trades combined)</b>\n` +
+      `PNL: <b>${windowSign}${fmtUsd(windowTotalPnlUsd, '$')} (${windowPctSign}${fmtPct(windowTotalPnlPct)}%)</b>\n` +
+      `Trades copied: ${windowTrades}`;
 
     const message =
-      `<b>SCANETH — Copied wallet rankings (${previousDay})</b>\n\n` +
+      `<b>SCANETH — Copied wallet rankings (last 24h)</b>\n\n` +
       lines.join('\n\n') +
       cutSection +
-      dayTotalsSection;
+      windowTotalsSection;
 
     const ok = await this.notifier.sendRaw(message);
     if (ok) {
       this.dayStartEquityUsd = this.paperEquity();
       this.dayStartMstDay = currentMstDay();
       await this.persistState();
-      log.info('wallet ranking report sent', { previousDay, wallets: walletPnls.length });
+      log.info('wallet ranking report sent', { window: '24h', wallets: walletPnls.length });
     } else {
-      log.warn('wallet ranking report failed', { previousDay });
+      log.warn('wallet ranking report failed', { window: '24h' });
     }
   }
 
@@ -1008,6 +1055,8 @@ export class CopyTrader {
       }
 
       await this.refreshPositionPrices();
+      this.sampleEquity();
+      this.pruneRollingWindows();
       await this.cleanupDustPositions();
       await this.retryPendingBuys();
       await this.enforceAutoTakeProfit();
@@ -1957,6 +2006,7 @@ export class CopyTrader {
     dayStats.gasUsd += gasPaid;
     dayStats.trades++;
     this.tradeCount++;
+    this.recordWalletPnlEvent(trade.wallet, 'buy', -gasPaid, buyAmountUsd);
 
     // Record the contributor's deployed USD for proportional exit attribution.
     pos.contributors.add(walletKey);
@@ -2073,6 +2123,7 @@ export class CopyTrader {
     dayStats.realizedPnlUsd += pnlUsd;
     dayStats.trades++;
     this.tradeCount++;
+    this.recordWalletPnlEvent(trade.wallet, 'sell', pnlUsd, 0);
 
     if (pos.balance <= 0n) this.positions.delete(key);
     await this.persistState();
@@ -2182,6 +2233,35 @@ export class CopyTrader {
     return stats;
   }
 
+  /** Append a timestamped PNL event (buys carry −gas) and cap the log. */
+  private recordWalletPnlEvent(wallet: string, kind: 'buy' | 'sell', pnlUsd: number, usdAmount: number): void {
+    const key = wallet.toLowerCase();
+    let events = this.walletPnlEvents.get(key);
+    if (!events) {
+      events = [];
+      this.walletPnlEvents.set(key, events);
+    }
+    events.push({ ts: Date.now(), kind, pnlUsd, usdAmount });
+    if (events.length > 600) this.walletPnlEvents.set(key, events.slice(-500));
+  }
+
+  /** Drop events/samples older than 48h — beyond any ranking window we need. */
+  private pruneRollingWindows(): void {
+    const cutoff = Date.now() - 48 * 3_600_000;
+    for (const [wallet, events] of this.walletPnlEvents) {
+      const kept = events.filter((e) => e.ts >= cutoff);
+      if (kept.length === 0) this.walletPnlEvents.delete(wallet);
+      else this.walletPnlEvents.set(wallet, kept);
+    }
+    this.equitySamples = this.equitySamples.filter((s) => s.ts >= cutoff);
+  }
+
+  /** Snapshot current equity for trailing-24h account totals. */
+  private sampleEquity(): void {
+    this.equitySamples.push({ ts: Date.now(), equity: this.paperEquity() });
+    if (this.equitySamples.length > 3000) this.equitySamples = this.equitySamples.slice(-2500);
+  }
+
   /**
    * Attribute a non-wallet-triggered exit (stop-loss, auto-TP, manual,
    * close-all) to the position's contributor wallets, split proportionally
@@ -2198,6 +2278,7 @@ export class CopyTrader {
       const share = pnlUsd / wallets.length;
       for (const wallet of wallets) {
         this.getWalletDayStats(wallet, day).realizedPnlUsd += share;
+        this.recordWalletPnlEvent(wallet, 'sell', share, 0);
       }
       return;
     }
@@ -2207,6 +2288,7 @@ export class CopyTrader {
     for (const [wallet, usd] of contributions) {
       const share = pnlUsd * (usd / totalContributed);
       this.getWalletDayStats(wallet, day).realizedPnlUsd += share;
+      this.recordWalletPnlEvent(wallet, 'sell', share, 0);
     }
   }
 
