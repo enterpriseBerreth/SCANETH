@@ -81,6 +81,8 @@ export interface PersistedPosition {
   openedAt: number;
   updatedAt: number;
   contributors: string[];
+  /** USD each contributor deployed into the position (for proportional exit attribution). */
+  contributionsUsd?: Record<string, number>;
 }
 
 /** Full serializable paper-account state. */
@@ -126,6 +128,8 @@ export interface PaperPosition {
   updatedAt: number;
   /** Watched wallets that bought into this position (lowercase). */
   contributors: Set<string>;
+  /** USD each contributor deployed (lowercase wallet -> usd), for proportional exit attribution. */
+  contributionsUsd?: Map<string, number>;
 }
 
 interface WalletPosition {
@@ -140,6 +144,8 @@ interface WalletDailyStats {
   realizedPnlUsd: number;
   costBasisUsd: number;
   trades: number;
+  /** Buy-side gas paid out of cash. Sell-side gas is already inside realizedPnlUsd. */
+  gasUsd: number;
 }
 
 export interface CopyTrade {
@@ -427,6 +433,9 @@ export class CopyTrader {
         openedAt: pos.openedAt,
         updatedAt: pos.updatedAt,
         contributors: [...pos.contributors],
+        contributionsUsd: pos.contributionsUsd
+          ? Object.fromEntries(pos.contributionsUsd)
+          : undefined,
       })),
       scoutWallets: [...this.watchedWallets].filter((wallet) => !this.userWallets.has(wallet)),
       shadowStats: [...this.shadowStats.values()],
@@ -542,6 +551,9 @@ export class CopyTrader {
         openedAt: p.openedAt ?? Date.now(),
         updatedAt: p.updatedAt ?? Date.now(),
         contributors: new Set((p.contributors ?? []).map((w) => w.toLowerCase())),
+        contributionsUsd: p.contributionsUsd
+          ? new Map(Object.entries(p.contributionsUsd).map(([w, usd]) => [w.toLowerCase(), usd]))
+          : undefined,
       };
       this.positions.set(token, pos);
       if (!state.walletBalances) await this.seedWalletTrackingFromChain(token, pos);
@@ -556,7 +568,14 @@ export class CopyTrader {
         [token, { ...pos, balance: BigInt(pos.balance) }])));
     }
     for (const [wallet, days] of Object.entries(state.walletDailyStats ?? {})) {
-      if (this.watchedWallets.has(wallet)) this.walletDailyStats.set(wallet, new Map(Object.entries(days)));
+      if (!this.watchedWallets.has(wallet)) continue;
+      const normalized = new Map<string, WalletDailyStats>();
+      for (const [day, stats] of Object.entries(days)) {
+        // Older persisted stats predate gasUsd — default it so net-of-gas
+        // displays never produce NaN.
+        normalized.set(day, { ...stats, gasUsd: Number.isFinite(stats?.gasUsd) ? stats.gasUsd : 0 });
+      }
+      this.walletDailyStats.set(wallet, normalized);
     }
     for (const [wallet, count] of Object.entries(state.walletTradeCounts ?? {})) {
       if (this.watchedWallets.has(wallet)) this.walletTradeCounts.set(wallet, count);
@@ -649,6 +668,7 @@ export class CopyTrader {
     this.cashUsd += proceedsUsd;
     this.positions.delete(key);
     this.tradeCount++;
+    this.attributeExitToContributors(pos, pnlUsd);
     await this.persistState();
 
     log.warn('manual exit executed', {
@@ -898,13 +918,16 @@ export class CopyTrader {
         }
       }
 
-      const totalPnlUsd = dayStats.realizedPnlUsd + unrealizedUsd;
+      // Net realized: sell PNL (already includes sell-side gas) minus
+      // buy-side gas, so wallet figures reconcile with account equity.
+      const netRealizedUsd = dayStats.realizedPnlUsd - dayStats.gasUsd;
+      const totalPnlUsd = netRealizedUsd + unrealizedUsd;
       const invested = dayStats.costBasisUsd + openCostBasisUsd;
       const pnlPct = invested > 0 ? (totalPnlUsd / invested) * 100 : 0;
 
       walletPnls.push({
         wallet,
-        realizedUsd: dayStats.realizedPnlUsd,
+        realizedUsd: netRealizedUsd,
         unrealizedUsd,
         totalPnlUsd,
         pnlPct,
@@ -1041,6 +1064,7 @@ export class CopyTrader {
       this.cashUsd += proceedsUsd;
       this.positions.delete(key);
       this.tradeCount++;
+      this.attributeExitToContributors(pos, pnlUsd);
       await this.persistState();
 
       log.warn('stop-loss triggered', {
@@ -1128,6 +1152,7 @@ export class CopyTrader {
       this.cashUsd += proceedsUsd;
       this.positions.delete(key);
       this.tradeCount++;
+      this.attributeExitToContributors(pos, pnlUsd);
       await this.persistState();
 
       log.info('auto-take-profit exit', {
@@ -1452,6 +1477,7 @@ export class CopyTrader {
       pos.updatedAt = Date.now();
       this.positions.delete(key);
       this.tradeCount++;
+      this.attributeExitToContributors(pos, pnlUsd);
       realized += pnlUsd;
       closed++;
 
@@ -1716,7 +1742,7 @@ export class CopyTrader {
       let realized = 0;
       const days = this.walletDailyStats.get(wallet);
       if (days) {
-        for (const stats of days.values()) realized += stats.realizedPnlUsd;
+        for (const stats of days.values()) realized += stats.realizedPnlUsd - (stats.gasUsd ?? 0);
       }
 
       let unrealized = 0;
@@ -1763,7 +1789,7 @@ export class CopyTrader {
       if (days) {
         for (const [day, stats] of days) {
           if (day < cutoff) continue;
-          realized += stats.realizedPnlUsd;
+          realized += stats.realizedPnlUsd - (stats.gasUsd ?? 0);
           costBasis += stats.costBasisUsd;
           trades += stats.trades;
           if (stats.trades > 0) activeDays++;
@@ -1928,8 +1954,15 @@ export class CopyTrader {
     const day = currentMstDay();
     const dayStats = this.getWalletDayStats(trade.wallet, day);
     dayStats.costBasisUsd += buyAmountUsd;
+    dayStats.gasUsd += gasPaid;
     dayStats.trades++;
     this.tradeCount++;
+
+    // Record the contributor's deployed USD for proportional exit attribution.
+    pos.contributors.add(walletKey);
+    if (!pos.contributionsUsd) pos.contributionsUsd = new Map();
+    pos.contributionsUsd.set(walletKey, (pos.contributionsUsd.get(walletKey) ?? 0) + buyAmountUsd);
+
     await this.persistState();
 
     log.info('paper buy executed', {
@@ -2143,10 +2176,38 @@ export class CopyTrader {
 
     let stats = days.get(day);
     if (!stats) {
-      stats = { realizedPnlUsd: 0, costBasisUsd: 0, trades: 0 };
+      stats = { realizedPnlUsd: 0, costBasisUsd: 0, trades: 0, gasUsd: 0 };
       days.set(day, stats);
     }
     return stats;
+  }
+
+  /**
+   * Attribute a non-wallet-triggered exit (stop-loss, auto-TP, manual,
+   * close-all) to the position's contributor wallets, split proportionally
+   * by the USD each deployed. Keeps the per-wallet daily ledger reconciled
+   * with account equity so Telegram rankings match the alert PNL math.
+   */
+  private attributeExitToContributors(pos: PaperPosition, pnlUsd: number): void {
+    const day = currentMstDay();
+    const contributions = pos.contributionsUsd;
+    if (!contributions || contributions.size === 0) {
+      // Fallback: equal split across known contributors.
+      const wallets = [...pos.contributors];
+      if (wallets.length === 0) return;
+      const share = pnlUsd / wallets.length;
+      for (const wallet of wallets) {
+        this.getWalletDayStats(wallet, day).realizedPnlUsd += share;
+      }
+      return;
+    }
+
+    const totalContributed = [...contributions.values()].reduce((sum, usd) => sum + usd, 0);
+    if (!(totalContributed > 0)) return;
+    for (const [wallet, usd] of contributions) {
+      const share = pnlUsd * (usd / totalContributed);
+      this.getWalletDayStats(wallet, day).realizedPnlUsd += share;
+    }
   }
 
   private async getCurrentTokenPrice(tokenAddress: string): Promise<number> {
