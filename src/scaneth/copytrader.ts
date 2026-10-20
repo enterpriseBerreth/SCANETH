@@ -49,8 +49,8 @@ const AUTO_TP_MIN_AGE_MS = 24 * 3_600_000;
  * persisted state can never shrink them.
  */
 const OWNER_CLIP_TIERS: ReadonlyArray<{ wallet: string; clipUsd: number }> = [
-  { wallet: '0xc05ef5e1fd014267f66fa24b260f361af7d79122', clipUsd: 200 },
-  { wallet: '0xb51ff2f65b935142aab32abefa1c0e29a4161d31', clipUsd: 200 },
+  { wallet: '0xc05ef5e1fd014267f66fa24b260f361af7d79122', clipUsd: 100 },
+  { wallet: '0xb51ff2f65b935142aab32abefa1c0e29a4161d31', clipUsd: 100 },
   { wallet: '0xae3c9dfd4dd4700d2382e985fb348b71b1341b5d', clipUsd: 50 },
   { wallet: '0x2c1ca67fa77c30ef23a8a71f42ef7631252ce2e3', clipUsd: 100 },
   { wallet: '0xa02f1823ef1ea0b01c565ece6703d9e3e8be5a4f', clipUsd: 100 },
@@ -65,6 +65,9 @@ const OWNER_CLIP_TIERS: ReadonlyArray<{ wallet: string; clipUsd: number }> = [
   { wallet: '0xb0e379de25d1e7a4b09178f5fd521f6f00f6da10', clipUsd: 50 },
 ];
 const OWNER_CLIP_USD = new Map(OWNER_CLIP_TIERS.map((t) => [t.wallet, t.clipUsd] as const));
+
+/** Consecutive losing round-trips before a wallet is auto-demoted one tier. */
+const AUTO_DEMOTE_LOSS_STREAK = 3;
 
 /** Wallets whose buys are copied at a premium clip (strongest performers). */
 const PREMIUM_WALLETS = new Set(OWNER_CLIP_TIERS.map((t) => t.wallet));
@@ -111,6 +114,7 @@ export interface PersistedState {
   processedTradeKeys?: string[];
   walletPnlEvents?: Record<string, Array<{ ts: number; kind: 'buy' | 'sell'; pnlUsd: number; usdAmount: number }>>;
   equitySamples?: Array<{ ts: number; equity: number }>;
+  walletConsecutiveLosses?: Record<string, number>;
 }
 
 export interface PaperPosition {
@@ -219,6 +223,8 @@ export class CopyTrader {
   private readonly walletPnlEvents = new Map<string, Array<{ ts: number; kind: 'buy' | 'sell'; pnlUsd: number; usdAmount: number }>>();
   /** Periodic equity samples for trailing-24h account totals. */
   private equitySamples: Array<{ ts: number; equity: number }> = [];
+  /** Consecutive losing round-trips per wallet — drives auto-demotion. */
+  private readonly walletConsecutiveLosses = new Map<string, number>();
   private readonly positions = new Map<string, PaperPosition>(); // token -> aggregated position
   private tradeCount = 0;
   /** Trades observed per watched wallet (for scout ranking). */
@@ -467,6 +473,7 @@ export class CopyTrader {
       processedTradeKeys: [...this.processedTradeKeys],
       walletPnlEvents: Object.fromEntries([...this.walletPnlEvents]),
       equitySamples: this.equitySamples.slice(-2880),
+      walletConsecutiveLosses: Object.fromEntries(this.walletConsecutiveLosses),
     };
   }
 
@@ -534,6 +541,7 @@ export class CopyTrader {
     this.walletDailyStats.clear();
     this.walletPnlEvents.clear();
     this.equitySamples = [];
+    this.walletConsecutiveLosses.clear();
     this.walletTradeCounts.clear();
     this.positions.clear();
     for (const p of state.positions ?? []) {
@@ -619,6 +627,10 @@ export class CopyTrader {
     this.equitySamples = (state.equitySamples ?? []).filter(
       (s) => s && Number.isFinite(s.ts) && Number.isFinite(s.equity),
     );
+    this.walletConsecutiveLosses.clear();
+    for (const [wallet, losses] of Object.entries(state.walletConsecutiveLosses ?? {})) {
+      if (Number.isFinite(losses) && losses > 0) this.walletConsecutiveLosses.set(wallet.toLowerCase(), losses);
+    }
     this.pruneRollingWindows();
     await this.persistState();
   }
@@ -752,6 +764,7 @@ export class CopyTrader {
     this.walletDailyStats.clear();
     this.walletPnlEvents.clear();
     this.equitySamples = [];
+    this.walletConsecutiveLosses.clear();
     this.walletTradeCounts.clear();
     this.pendingBuys.clear();
     this.cashUsd = this.config.copytraderStartingBudgetUsd;
@@ -1830,6 +1843,8 @@ export class CopyTrader {
     activeDays: number;
     tradesPerActiveDay: number;
     clipUsd: number;
+    effectiveClipUsd: number;
+    consecutiveLosses: number;
   }> {
     const cutoff = new Date(Date.now() - 7 * 86_400_000).toISOString().slice(0, 10);
     const result: ReturnType<CopyTrader['getWalletWeeklyStats']> = [];
@@ -1856,6 +1871,8 @@ export class CopyTrader {
         activeDays,
         tradesPerActiveDay: activeDays > 0 ? trades / activeDays : 0,
         clipUsd: OWNER_CLIP_USD.get(wallet) ?? (this.premiumWallets.has(wallet) ? PREMIUM_BUY_USD : this.config.copytraderBuyAmountUsd),
+        effectiveClipUsd: this.effectiveClipUsd(wallet),
+        consecutiveLosses: this.walletConsecutiveLosses.get(wallet) ?? 0,
       });
     }
     return result.sort((a, b) => b.realizedPnlUsd - a.realizedPnlUsd);
@@ -1873,13 +1890,11 @@ export class CopyTrader {
 
     /**
      * Per-wallet buy sizing: owner-designated tiers first (OWNER_CLIP_TIERS),
-     * then scout-promoted premium wallets, then the default clip.
+     * then scout-promoted premium wallets, then the default clip — reduced
+     * one ladder step while the wallet is on a 3+ losing streak.
      */
     const walletKey = trade.wallet.toLowerCase();
-    const buyAmountUsd = OWNER_CLIP_USD.get(walletKey)
-      ?? (this.premiumWallets.has(walletKey)
-        ? PREMIUM_BUY_USD
-        : this.config.copytraderBuyAmountUsd);
+    const buyAmountUsd = this.effectiveClipUsd(walletKey);
 
     // Respect the paper cash budget (gas included — real trades pay both).
     const gasEstimate = this.config.copytraderGasFeeUsd;
@@ -2128,6 +2143,7 @@ export class CopyTrader {
     dayStats.trades++;
     this.tradeCount++;
     this.recordWalletPnlEvent(trade.wallet, 'sell', pnlUsd, 0);
+    this.recordRoundTripResult(trade.wallet, pnlUsd);
 
     if (pos.balance <= 0n) this.positions.delete(key);
     await this.persistState();
@@ -2267,6 +2283,46 @@ export class CopyTrader {
   }
 
   /**
+   * Record a round-trip result for a wallet and maintain its consecutive-loss
+   * streak. A win resets the streak (restoring full clip); a loss increments
+   * it. Used by wallet-sell exits and proportional attributed exits.
+   */
+  private recordRoundTripResult(wallet: string, pnlUsd: number): void {
+    if (!Number.isFinite(pnlUsd) || pnlUsd === 0) return;
+    const key = wallet.toLowerCase();
+    if (pnlUsd > 0) {
+      if ((this.walletConsecutiveLosses.get(key) ?? 0) >= AUTO_DEMOTE_LOSS_STREAK) {
+        log.info('wallet restored to full clip after winning round-trip', { wallet: key });
+      }
+      this.walletConsecutiveLosses.set(key, 0);
+      return;
+    }
+    const streak = (this.walletConsecutiveLosses.get(key) ?? 0) + 1;
+    this.walletConsecutiveLosses.set(key, streak);
+    if (streak === AUTO_DEMOTE_LOSS_STREAK) {
+      log.warn('wallet auto-demoted one clip tier', {
+        wallet: key,
+        consecutiveLosses: streak,
+        newClipUsd: this.effectiveClipUsd(key),
+      });
+    }
+  }
+
+  /**
+   * Clip actually used for the next buy: the base tier, demoted one ladder
+   * step while the wallet is on a >=3 consecutive-loss streak. Ladder:
+   * 200 -> 100 -> 50 (floor). A winning round-trip restores the base tier.
+   */
+  private effectiveClipUsd(walletKey: string): number {
+    const base = OWNER_CLIP_USD.get(walletKey)
+      ?? (this.premiumWallets.has(walletKey) ? PREMIUM_BUY_USD : this.config.copytraderBuyAmountUsd);
+    if ((this.walletConsecutiveLosses.get(walletKey) ?? 0) < AUTO_DEMOTE_LOSS_STREAK) return base;
+    if (base >= 200) return 100;
+    if (base >= 100) return 50;
+    return base; // $50 floor
+  }
+
+  /**
    * Attribute a non-wallet-triggered exit (stop-loss, auto-TP, manual,
    * close-all) to the position's contributor wallets, split proportionally
    * by the USD each deployed. Keeps the per-wallet daily ledger reconciled
@@ -2283,6 +2339,7 @@ export class CopyTrader {
       for (const wallet of wallets) {
         this.getWalletDayStats(wallet, day).realizedPnlUsd += share;
         this.recordWalletPnlEvent(wallet, 'sell', share, 0);
+        this.recordRoundTripResult(wallet, share);
       }
       return;
     }
@@ -2293,6 +2350,7 @@ export class CopyTrader {
       const share = pnlUsd * (usd / totalContributed);
       this.getWalletDayStats(wallet, day).realizedPnlUsd += share;
       this.recordWalletPnlEvent(wallet, 'sell', share, 0);
+      this.recordRoundTripResult(wallet, share);
     }
   }
 
