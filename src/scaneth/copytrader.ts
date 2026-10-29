@@ -74,6 +74,21 @@ const PREMIUM_WALLETS = new Set(OWNER_CLIP_TIERS.map((t) => t.wallet));
 /** Clip for scout-promoted (non-owner) premium wallets. */
 const PREMIUM_BUY_USD = 100;
 
+/**
+ * Owner overrides applied on top of env config after every (re)load. Deploys
+ * flow through git while env access does not, so watch/shadow membership is
+ * pinned here. Force-shadow wallets are observed, never copied. Force-watch
+ * wallets are promoted out of shadow at their OWNER_CLIP_TIERS clip.
+ */
+const OWNER_FORCE_SHADOW = new Set([
+  '0xb51ff2f65b935142aab32abefa1c0e29a4161d31',
+  '0xed9ba0bf79e04f8aff7c1ab74aacb67bf0fd9075',
+  '0xb0e379de25d1e7a4b09178f5fd521f6f00f6da10',
+]);
+const OWNER_FORCE_WATCH = new Set([
+  '0x56311f46963d93eba214a95a5c55193d6bdaf4da',
+]);
+
 /** Serialized paper position (bigint balance as string). */
 export interface PersistedPosition {
   tokenAddress: string;
@@ -306,6 +321,36 @@ export class CopyTrader {
     }
     this.cashUsd = config.copytraderStartingBudgetUsd;
     this.dayStartEquityUsd = this.cashUsd;
+    this.applyOwnerOverrides();
+  }
+
+  /**
+   * Pin watch/shadow membership to the owner's current decisions. Must run
+   * after every constructor/restore path that (re)builds the watch sets.
+   */
+  private applyOwnerOverrides(): void {
+    for (const key of OWNER_FORCE_SHADOW) {
+      this.watchedWallets.delete(key);
+      if (!this.shadowWallets.has(key)) {
+        this.shadowWallets.add(key);
+        this.shadowStats.set(key, {
+          wallet: key, tradesObserved: 0, buys: 0, sells: 0,
+          lastTradeAt: null, lastTradeSummary: null,
+        });
+      }
+    }
+    for (const key of OWNER_FORCE_WATCH) {
+      this.shadowWallets.delete(key);
+      this.shadowStats.delete(key);
+      this.watchedWallets.add(key);
+      this.userWallets.add(key);
+    }
+    if (OWNER_FORCE_SHADOW.size > 0 || OWNER_FORCE_WATCH.size > 0) {
+      log.info('owner watch/shadow overrides applied', {
+        shadow: [...OWNER_FORCE_SHADOW],
+        watch: [...OWNER_FORCE_WATCH],
+      });
+    }
   }
 
   /** Open paper positions with full marking detail (for /positions). */
@@ -632,6 +677,7 @@ export class CopyTrader {
       if (Number.isFinite(losses) && losses > 0) this.walletConsecutiveLosses.set(wallet.toLowerCase(), losses);
     }
     this.pruneRollingWindows();
+    this.applyOwnerOverrides();
     await this.persistState();
   }
 
