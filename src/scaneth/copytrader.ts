@@ -35,13 +35,13 @@ const WETH_WITHDRAWAL_TOPIC = '0x7fcf532c15f0a6db0bd6d0e038bea71d30d808c7d98cb3b
 
 /**
  * Auto-take-profit rule: positions bought ONLY by these wallets are exited at
- * the current mark once they are profitable and have been held >24h — they
+ * the current mark once they are profitable and have been held >12h — they
  * no longer wait for the source wallet to exit.
  */
 const AUTO_TP_WALLETS = new Set([
   '0xb51ff2f65b935142aab32abefa1c0e29a4161d31',
 ]);
-const AUTO_TP_MIN_AGE_MS = 24 * 3_600_000;
+const AUTO_TP_MIN_AGE_MS = 12 * 3_600_000;
 
 /**
  * Owner-designated clip tiers (USD copied per buy). Tier order is by proven
@@ -54,20 +54,20 @@ const OWNER_CLIP_TIERS: ReadonlyArray<{ wallet: string; clipUsd: number }> = [
   { wallet: '0xae3c9dfd4dd4700d2382e985fb348b71b1341b5d', clipUsd: 50 },
   { wallet: '0x2c1ca67fa77c30ef23a8a71f42ef7631252ce2e3', clipUsd: 100 },
   { wallet: '0xa02f1823ef1ea0b01c565ece6703d9e3e8be5a4f', clipUsd: 100 },
-  { wallet: '0xf5e2ace82d04ab73b2d801fd82eaea227423f81e', clipUsd: 50 },
-  { wallet: '0xfc7506d541ee119a64f0d75f907d21408b71a562', clipUsd: 50 },
-  { wallet: '0xc9ce3f407b40e1fb7061dbea0fca5dc7ffd18e99', clipUsd: 50 },
+  { wallet: '0xf5e2ace82d04ab73b2d801fd82eaea227423f81e', clipUsd: 100 },
+  { wallet: '0xfc7506d541ee119a64f0d75f907d21408b71a562', clipUsd: 100 },
+  { wallet: '0xc9ce3f407b40e1fb7061dbea0fca5dc7ffd18e99', clipUsd: 100 },
   { wallet: '0xdf2968383a3872e5036cd73fb411d0dabb224253', clipUsd: 100 },
   { wallet: '0x56311f46963d93eba214a95a5c55193d6bdaf4da', clipUsd: 50 },
   { wallet: '0x6f36b27633c7b98660249fcdbb4b2f93f30823a4', clipUsd: 50 },
-  { wallet: '0x2be4bab73870589cc749a4f257aafb94c37a1e50', clipUsd: 50 },
-  { wallet: '0xed9ba0bf79e04f8aff7c1ab74aacb67bf0fd9075', clipUsd: 50 },
-  { wallet: '0xb0e379de25d1e7a4b09178f5fd521f6f00f6da10', clipUsd: 50 },
+  { wallet: '0x2be4bab73870589cc749a4f257aafb94c37a1e50', clipUsd: 100 },
+  { wallet: '0xed9ba0bf79e04f8aff7c1ab74aacb67bf0fd9075', clipUsd: 100 },
+  { wallet: '0xb0e379de25d1e7a4b09178f5fd521f6f00f6da10', clipUsd: 100 },
 ];
 const OWNER_CLIP_USD = new Map(OWNER_CLIP_TIERS.map((t) => [t.wallet, t.clipUsd] as const));
 
 /** Consecutive losing round-trips before a wallet is auto-demoted one tier. */
-const AUTO_DEMOTE_LOSS_STREAK = 3;
+const AUTO_DEMOTE_LOSS_STREAK = 2;
 
 /** Wallets whose buys are copied at a premium clip (strongest performers). */
 const PREMIUM_WALLETS = new Set(OWNER_CLIP_TIERS.map((t) => t.wallet));
@@ -1180,7 +1180,7 @@ export class CopyTrader {
 
   /**
    * Positions bought ONLY by the AUTO_TP_WALLETS wallets are exited at the
-   * current mark once profitable and held >24h, instead of waiting for a
+   * current mark once profitable and held >12h, instead of waiting for a
    * source-wallet exit that may never come. Runs after every mark-to-market
    * cycle. Positions shared with any other watched wallet are left alone.
    */
@@ -1257,7 +1257,7 @@ export class CopyTrader {
       `Capital before trade: ${fmtUsd(capitalBefore, '$')}`,
       `Capital after trade: <b>${fmtUsd(endingCapital, '$')}</b>`,
       '',
-      `📌 Exited: profitable and held >24h (wallet rule)`,
+      `📌 Exited: profitable and held >12h (wallet rule)`,
     ];
 
     const ok = await this.notifier.sendRaw(lines.join('\n'));
